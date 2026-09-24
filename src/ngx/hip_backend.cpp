@@ -534,6 +534,10 @@ bool CandidateInputCapture() {
     const Config& cfg = Cfg();
     if (cfg.candidateInputCapturePath.empty() || s.candidateInputCaptureAttempted)
         return true;
+    const std::wstring trigger = cfg.candidateInputCapturePath + L".go";
+    if (cfg.candidateInputCaptureTrigger &&
+        GetFileAttributesW(trigger.c_str()) == INVALID_FILE_ATTRIBUTES)
+        return true;
     s.candidateInputCaptureAttempted = true;
     if (!s.usable || !s.ptrIn || !s.w || !s.h ||
         (s.bpp != 4 && s.bpp != 8) || s.w > 4096 || s.h > 4096 ||
@@ -581,6 +585,9 @@ bool CandidateInputCapture() {
     LOGI("hip: candidate input captured %ux%u bpp=%u pitch=%llu bytes=%llu at %ls",
          s.w, s.h, s.bpp, (unsigned long long)s.pitch,
          (unsigned long long)s.bytes, cfg.candidateInputCapturePath.c_str());
+    if (cfg.candidateInputCaptureTrigger && !DeleteFileW(trigger.c_str()))
+        LOGW("hip: candidate input capture could not remove trigger %ls",
+             trigger.c_str());
     return true;
 }
 

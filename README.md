@@ -131,5 +131,8 @@ followed by the exact pitched rows. The converter accepts RGBA8 and FP16;
 its crop/color contract is a diagnostic candidate and has **not** been
 validated against the original NVIDIA frontend. The PNG is 8-bit and is not
 an exact substitute for the linear `.f32` boundary.
+Set `CandidateInputCaptureTrigger=1` to wait for a file named
+`<capture.bin>.go` before capturing; create that file once the desired scene
+is visible. The shim removes the trigger after saving the capture.
 
 Source code here is experimental. No NVIDIA binaries or weights are bundled.

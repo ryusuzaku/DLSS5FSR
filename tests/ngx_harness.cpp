@@ -508,6 +508,7 @@ struct IniValues {
     int hipFeTransition = 0;
     std::string candidatePreviewPath;
     std::string candidateInputCapturePath;
+    int candidateInputCaptureTrigger = 0;
     // S231 step 3: the default is the SHIPPED reading (2, our map), so a green run
     // means the path the game runs is right. Only the c256f2 check consults this --
     // it is the one staged check that applies the same un-permutation the live
@@ -551,6 +552,7 @@ static bool WriteIni(const std::string& dir, const IniValues& v) {
             "HipFeTransition=%d\n"
             "CandidatePreviewPath=%s\n"
             "CandidateInputCapturePath=%s\n"
+            "CandidateInputCaptureTrigger=%d\n"
             "HipFfnTranspose=%d\n"
             "DumpField=%d\n",
             v.nrPasses, v.hipBackend, v.hipWeightsDir.c_str(),
@@ -562,6 +564,7 @@ static bool WriteIni(const std::string& dir, const IniValues& v) {
             v.passthrough, v.debugView, v.dumpFrames, v.dumpEvery,
             v.hipFeLive, v.hipFeTransition, v.candidatePreviewPath.c_str(),
             v.candidateInputCapturePath.c_str(),
+            v.candidateInputCaptureTrigger,
             v.hipFfnTranspose, v.dumpField);
     fclose(f);
     return true;
@@ -607,6 +610,7 @@ struct PassResult {
     Readback rb;
     int evalFailures = 0;
     bool created = false;
+    bool triggerWrote = false;
 };
 
 // Init -> create -> evaluate -> read back -> release -> shutdown, with a fresh
@@ -662,6 +666,12 @@ static PassResult RunPass(Ngx& ngx, D3D& d, const std::string& iniDir,
             NVSDK_NGX_Result_Success)
             ++pr.evalFailures;
         D3DSubmit(d);
+        if (i == 1 && v.candidateInputCaptureTrigger &&
+            !v.candidateInputCapturePath.empty()) {
+            const std::string trigger = v.candidateInputCapturePath + ".go";
+            FILE* f = fopen(trigger.c_str(), "wb");
+            if (f) { pr.triggerWrote = fwrite("go", 1, 2, f) == 2; fclose(f); }
+        }
     }
 
     DownloadPixels(d, output, pr.rb);
@@ -1332,12 +1342,19 @@ int main(int argc, char** argv) {
     if (captureEnv && *captureEnv) {
         printf("\n-- pass 10: candidate input capture --\n");
         remove(captureEnv);
+        const std::string captureTrigger = std::string(captureEnv) + ".go";
+        remove(captureTrigger.c_str());
         IniValues capture;
         capture.candidateInputCapturePath = captureEnv;
+        capture.candidateInputCaptureTrigger = EnvInt("DLSS5_CANDIDATE_INPUT_TRIGGER", 0);
         PassResult cp = RunPass(ngx, d, iniDir, capture, color.Get(),
                                 output.Get(), SRC_W, SRC_H, DST_W, DST_H,
                                 kFrames);
         Check(cp.evalFailures == 0, "candidate input capture frame evaluates");
+        if (capture.candidateInputCaptureTrigger)
+            Check(cp.triggerWrote &&
+                  GetFileAttributesA(captureTrigger.c_str()) == INVALID_FILE_ATTRIBUTES,
+                  "candidate capture waits for and consumes the scene trigger");
         FILE* raw = fopen(captureEnv, "rb");
         bool valid = raw != nullptr;
         unsigned char header[36]{};

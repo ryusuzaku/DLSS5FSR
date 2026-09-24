@@ -160,6 +160,7 @@ struct Config {
     // Diagnostic one-shot capture of the completed staged proxy. This is the
     // input boundary for a future full-frame candidate, not a model output.
     std::wstring candidateInputCapturePath;
+    bool candidateInputCaptureTrigger = false;  // wait for <path>.go
 
     // Scene value the game's tonemapper calls white. Everything the encode
     // does is relative to it, and getting it wrong is not a subtle error: the
