@@ -75,7 +75,7 @@ __global__ void k_c64_projection_linear(const float* context,const float* weight
 
 __global__ void k_c64_projection_residual(const float* context,const float* feature,
                                             const float* weight,const float* skip,
-                                            float* output,int tokens) {
+                                            float* output,int tokens,bool raw_output=false) {
     int id=blockIdx.x*blockDim.x+threadIdx.x;
     if(id>=tokens*64)return;
     int token=id/64,row=id%64;
@@ -86,5 +86,5 @@ __global__ void k_c64_projection_residual(const float* context,const float* feat
         for(int col=0;col<32;++col)part+=x[base+col]*w[base+col];
         acc=split512_half(acc+part);
     }
-    output[id]=split512_fp8(acc);
+    output[id]=raw_output?acc:split512_fp8(acc);
 }

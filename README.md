@@ -93,4 +93,11 @@ baseline but compares worse to the public FP16 graph than the branch starting
 at public block14. Measurements and replay commands are in
 [CANDIDATE_IMAGE_CHAIN.md](CANDIDATE_IMAGE_CHAIN.md).
 
+The latest branch starts at the public block4 downsample, runs AMD encoder5–8
+with measured C64 maps, and carries its block8 downsample and skip through the
+same connected encoder, ViT, decoder, and full-frame head. All declared
+HIP/scalar stages and handoffs pass exactly. The public-gain blended frame has
+0.005367 MAE against the same-image public FP16 output; see
+[CANDIDATE_IMAGE_CHAIN.md](CANDIDATE_IMAGE_CHAIN.md) for replay and limits.
+
 Source code here is experimental. No NVIDIA binaries or weights are bundled.

@@ -89,7 +89,7 @@ def decode(raw):
 
 def run(case='seeded',first_window=False,block=56,width=WIDTH,height=HEIGHT,
         previous=None,output_root=None):
-    if case not in ('seeded','zero','image_fp8','image_from_block48','image_from39','image_from38','image_encoder_skip30','image_candidate_vit16','image_candidate_encoder22','image_candidate_encoder14'):raise ValueError('unknown skip case')
+    if case not in ('seeded','zero','image_fp8','image_from_block48','image_from39','image_from38','image_encoder_skip30','image_candidate_vit16','image_candidate_encoder22','image_candidate_encoder14','image_candidate_encoder8'):raise ValueError('unknown skip case')
     if block not in (*range(9,15),*range(56,62)):
         raise ValueError('block must be 9..14 or 56..61')
     if first_window and block!=56:raise ValueError('first-window mode is only for block56')
@@ -106,7 +106,7 @@ def run(case='seeded',first_window=False,block=56,width=WIDTH,height=HEIGHT,
         raise ValueError('C128 PTX residual address transfer failed')
     if previous is not None:
         source=Path(previous)
-    elif case in ('image_from39','image_from38','image_encoder_skip30','image_candidate_vit16','image_candidate_encoder22','image_candidate_encoder14'):
+    elif case in ('image_from39','image_from38','image_encoder_skip30','image_candidate_vit16','image_candidate_encoder22','image_candidate_encoder14','image_candidate_encoder8'):
         source=(FROM39/f'upsample56_{case.removeprefix("image_")}'/'merged_device.f32' if block==56 else
                 FROM39/f'peer_decoder56_{case.removeprefix("image_")}'/f'block{block-1}/output/output_device.f32')
     elif block==56:
@@ -124,7 +124,7 @@ def run(case='seeded',first_window=False,block=56,width=WIDTH,height=HEIGHT,
     windows=padded.reshape(hh//8,8,ww//8,8,CHANNELS).transpose(0,2,1,3,4).reshape(-1,64,CHANNELS)
     if output_root is not None:
         root=Path(output_root)
-    elif case in ('image_from39','image_from38','image_encoder_skip30','image_candidate_vit16','image_candidate_encoder22','image_candidate_encoder14'):
+    elif case in ('image_from39','image_from38','image_encoder_skip30','image_candidate_vit16','image_candidate_encoder22','image_candidate_encoder14','image_candidate_encoder8'):
         root=FROM39/f'peer_decoder56_{case.removeprefix("image_")}'/f'block{block}'
     elif block==56:
         root=ROOT/'build'/('block56_candidate_first_window' if first_window else 'block56_candidate')/case
@@ -183,7 +183,7 @@ def run(case='seeded',first_window=False,block=56,width=WIDTH,height=HEIGHT,
                 output_device_sha256=digest(output_device),
                 raw_output_device_sha256=digest(raw_device) if raw_device else None,
                 input_provenance=str(source.resolve()),
-                encoder14_skip=('candidate same-image encoder14 device output' if case=='image_candidate_encoder14' else
+                encoder14_skip=('candidate same-image encoder14 device output' if case in ('image_candidate_encoder14','image_candidate_encoder8') else
                                 'public same-image FP8-boundary control' if case in ('image_fp8','image_from_block48','image_from39','image_from38','image_encoder_skip30','image_candidate_vit16','image_candidate_encoder22') else 'synthetic control') if block>=56 else None,
                 map_status='measured C128 FFN/matrix/bias maps; candidate attention residual order',
                 original_kernel_executed=False,original_runtime_validation=False)
@@ -194,7 +194,7 @@ def run(case='seeded',first_window=False,block=56,width=WIDTH,height=HEIGHT,
 
 if __name__=='__main__':
     p=argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--case',choices=('seeded','zero','image_fp8','image_from_block48','image_from39','image_from38','image_encoder_skip30','image_candidate_vit16','image_candidate_encoder22','image_candidate_encoder14'),default='seeded')
+    p.add_argument('--case',choices=('seeded','zero','image_fp8','image_from_block48','image_from39','image_from38','image_encoder_skip30','image_candidate_vit16','image_candidate_encoder22','image_candidate_encoder14','image_candidate_encoder8'),default='seeded')
     p.add_argument('--first-window',action='store_true')
     p.add_argument('--block',type=int,choices=(*range(9,15),*range(56,62)),default=56)
     p.add_argument('--width',type=int,default=WIDTH)

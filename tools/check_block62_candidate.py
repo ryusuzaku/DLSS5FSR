@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Check the C64 body of block62 from the block61 device output.
+"""Check a C64 encoder or decoder body from its preceding device output.
 
-The encoder8 skip is synthetic. FFN/matrix/bias maps follow the measured
-C64 rules; the attention residual channel order is a PTX-supported candidate.
+FFN/matrix/bias maps follow the measured C64 rules; the attention residual
+channel order is a PTX-supported candidate. Decoder skip provenance depends
+on the selected case.
 """
 from pathlib import Path
 import argparse
@@ -37,10 +38,10 @@ def decode(raw):
     if raw.size==70048:
         ffn_offset,qkv_offset,bias_offset,scale_offset,projection_offset,attention_offset=(
             0x9000,0x9100,0xc100,0x10100,0x10110,0x11110)
-    elif raw.size==61760:
+    elif raw.size in (61760,69936):
         ffn_offset,qkv_offset,bias_offset,scale_offset,projection_offset,attention_offset=(
             0x7010,0x70a0,0xa0a0,0xe0a0,0xe0b0,0xf0b0)
-    else:raise ValueError('C64 record must be 70048 or 61760 bytes')
+    else:raise ValueError('C64 record must be 70048, 69936 or 61760 bytes')
     c=64;d=6;group=list(range(12,d+7));count=4*c*c
     maps=dict(w1_input=bits(count,[1,0,4,5,2]+group),
               w1_hidden=bits(count,[3,6,7,8,9,10,11]+list(range(d+7,2*d+2))),
@@ -85,26 +86,35 @@ def decode(raw):
     return (*matrices,ffn_skip,np.stack(qkv),bias,scales,projection,attention_skip)
 
 
-def run(case='seeded',first_window=False,block=62,width=WIDTH,height=HEIGHT):
-    if case not in ('seeded','zero','image_half','image_fp8','from56_fp8','from48_fp8','from39_fp8','from38_fp8','from_encoder_skip30_fp8','from_candidate_vit16_fp8','from_candidate_encoder22_fp8','from_candidate_encoder14_fp8'):raise ValueError('unknown skip case')
-    if block not in range(62,66):raise ValueError('block must be 62..65')
+def run(case='seeded',first_window=False,block=62,width=WIDTH,height=HEIGHT,
+        previous=None,output_root=None):
+    if case not in ('seeded','zero','image_half','image_fp8','from56_fp8','from48_fp8','from39_fp8','from38_fp8','from_encoder_skip30_fp8','from_candidate_vit16_fp8','from_candidate_encoder22_fp8','from_candidate_encoder14_fp8','from_candidate_encoder8_fp8'):raise ValueError('unknown skip case')
+    if block not in (*range(5,9),*range(62,66)):
+        raise ValueError('block must be 5..8 or 62..65')
     if first_window and block!=62:raise ValueError('first-window mode is only for block62')
+    if block<9 and (previous is None or output_root is None):
+        raise ValueError('encoder C64 blocks need explicit input and output root')
     if width<8 or height<8 or width%8 or height%8:
         raise ValueError('C64 extent must be multiples of 8')
-    shifts={62:0,63:3,64:1,65:2}
+    shifts={5:0,6:3,7:1,8:2,62:0,63:3,64:1,65:2}
     shift=shifts[block]
     evidence=audit_ptx()
     if not next(item for item in evidence['measured_width_cross_checks']
                 if '_2h_64_2_' in item['entry'])['same_relative_addresses']:
         raise ValueError('C64 PTX residual address transfer failed')
     offload=Path.home()/'DLSS5FSR-build-offload'
-    suffix='encoder_skip30' if case=='from_encoder_skip30_fp8' else 'candidate_vit16' if case=='from_candidate_vit16_fp8' else 'candidate_encoder22' if case=='from_candidate_encoder22_fp8' else 'candidate_encoder14' if case=='from_candidate_encoder14_fp8' else case.removesuffix('_fp8')
-    source=((offload/f'upsample62_{suffix}'/'merged_device.f32' if block==62 else
-             offload/f'peer_decoder62_{suffix}'/f'block{block-1}/output/output_device.f32')
-            if case in ('from39_fp8','from38_fp8','from_encoder_skip30_fp8','from_candidate_vit16_fp8','from_candidate_encoder22_fp8','from_candidate_encoder14_fp8') else
-            ROOT/'build/upsample62_prefix_derived'/case/'merged_device.f32' if block==62
-            else ROOT/'build/block62_candidate'/case/'output'/'output_device.f32' if block==63
-            else ROOT/'build'/f'decoder{block-1}_candidate_derived'/case/'output'/'output_device.f32')
+    suffix='encoder_skip30' if case=='from_encoder_skip30_fp8' else 'candidate_vit16' if case=='from_candidate_vit16_fp8' else 'candidate_encoder22' if case=='from_candidate_encoder22_fp8' else 'candidate_encoder14' if case=='from_candidate_encoder14_fp8' else 'candidate_encoder8' if case=='from_candidate_encoder8_fp8' else case.removesuffix('_fp8')
+    if previous is not None:
+        source=Path(previous)
+    elif case in ('from39_fp8','from38_fp8','from_encoder_skip30_fp8','from_candidate_vit16_fp8','from_candidate_encoder22_fp8','from_candidate_encoder14_fp8','from_candidate_encoder8_fp8'):
+        source=(offload/f'upsample62_{suffix}'/'merged_device.f32' if block==62 else
+                offload/f'peer_decoder62_{suffix}'/f'block{block-1}/output/output_device.f32')
+    elif block==62:
+        source=ROOT/'build/upsample62_prefix_derived'/case/'merged_device.f32'
+    elif block==63:
+        source=ROOT/'build/block62_candidate'/case/'output'/'output_device.f32'
+    else:
+        source=ROOT/'build'/f'decoder{block-1}_candidate_derived'/case/'output'/'output_device.f32'
     if source.read_bytes()!=source.with_name('merged.f32' if block==62 else 'output.f32').read_bytes():
         raise ValueError(f'block{block} input device handoff differs')
     x=np.fromfile(source,'<f4').reshape(height,width,CHANNELS)
@@ -112,9 +122,14 @@ def run(case='seeded',first_window=False,block=62,width=WIDTH,height=HEIGHT):
     ww=((width+px+7)//8)*8;hh=((height+py+7)//8)*8
     padded=np.pad(x,((py,hh-height-py),(px,ww-width-px),(0,0)))
     windows=padded.reshape(hh//8,8,ww//8,8,CHANNELS).transpose(0,2,1,3,4).reshape(-1,64,CHANNELS)
-    root=(offload/f'peer_decoder62_{suffix}'/f'block{block}' if case in ('from39_fp8','from38_fp8','from_encoder_skip30_fp8','from_candidate_vit16_fp8','from_candidate_encoder22_fp8','from_candidate_encoder14_fp8') else
-          ROOT/'build'/('block62_candidate_first_window' if first_window else 'block62_candidate')/case
-          if block==62 else ROOT/'build'/f'decoder{block}_candidate_derived'/case)
+    if output_root is not None:
+        root=Path(output_root)
+    elif case in ('from39_fp8','from38_fp8','from_encoder_skip30_fp8','from_candidate_vit16_fp8','from_candidate_encoder22_fp8','from_candidate_encoder14_fp8','from_candidate_encoder8_fp8'):
+        root=offload/f'peer_decoder62_{suffix}'/f'block{block}'
+    elif block==62:
+        root=ROOT/'build'/('block62_candidate_first_window' if first_window else 'block62_candidate')/case
+    else:
+        root=ROOT/'build'/f'decoder{block}_candidate_derived'/case
     spatial=root/'spatial';save(spatial,dict(input=x,windows=windows))
     subprocess.run([str(ROOT/'build/spatial64_test.exe'),str(spatial),str(width),str(height),str(shift)],cwd=ROOT,check=True)
     if (spatial/'windows_device.f32').read_bytes()!=(spatial/'windows.f32').read_bytes():
@@ -132,13 +147,15 @@ def run(case='seeded',first_window=False,block=62,width=WIDTH,height=HEIGHT):
     if feature_path.read_bytes()!=(ffn_folder/'feature.f32').read_bytes():
         raise AssertionError('C64 FFN feature differs')
     feature=np.fromfile(feature_path,'<f4').reshape(-1,CHANNELS)
-    chunks=[attention_reference(feature[i:i+64],qkv,bias,scales,projection,attention_skip)
+    chunks=[attention_reference(feature[i:i+64],qkv,bias,scales,projection,attention_skip,
+                                raw_output=block==8)
             for i in range(0,len(feature),64)]
     stages={name:np.concatenate([part[name] for part in chunks],axis=0) for name in chunks[0]}
     attn_folder=root/'attention'
     save(attn_folder,dict(feature=feature,qkv_weights=qkv,bias=bias,scales=scales,
                           projection_weights=projection,attention_skip=attention_skip,**stages))
-    subprocess.run([str(ROOT/'build/c64_attention_candidate_test.exe'),str(attn_folder),str(len(chunks))],cwd=ROOT,check=True)
+    subprocess.run([str(ROOT/'build/c64_attention_candidate_test.exe'),str(attn_folder),str(len(chunks)),
+                    *(['raw'] if block==8 else [])],cwd=ROOT,check=True)
     residual_path=attn_folder/'projection_residual_device.f32'
     if residual_path.read_bytes()!=(attn_folder/'projection_residual.f32').read_bytes():
         raise AssertionError('C64 attention residual differs')
@@ -151,23 +168,39 @@ def run(case='seeded',first_window=False,block=62,width=WIDTH,height=HEIGHT):
         if output_device.read_bytes()!=(out/'output.f32').read_bytes():
             raise AssertionError('C64 scatter differs')
     else:output_device=residual_path
+    raw_device=None
+    if block==8:
+        raw_windows=np.fromfile(attn_folder/'projection_raw_device.f32','<f4').reshape(hh//8,ww//8,8,8,CHANNELS)
+        raw_image=raw_windows.transpose(0,2,1,3,4).reshape(hh,ww,CHANNELS)[py:py+height,px:px+width]
+        raw_folder=root/'raw_output';save(raw_folder,dict(windows=raw_windows,output=raw_image))
+        subprocess.run([str(ROOT/'build/spatial64_output_test.exe'),str(raw_folder),
+                        str(width),str(height),str(shift)],cwd=ROOT,check=True)
+        raw_device=raw_folder/'output_device.f32'
+        if raw_device.read_bytes()!=(raw_folder/'output.f32').read_bytes():
+            raise AssertionError('C64 raw scatter differs')
     report=dict(block=block,case=case,shift=shift,extent=[width,height,CHANNELS],
                 windows=len(chunks),tensor_sha256=digest(raw_path),input_device_sha256=digest(source),
                 output_device_sha256=digest(output_device),
+                raw_output_device_sha256=digest(raw_device) if raw_device else None,
+                input_provenance=str(source.resolve()),
                 encoder8_skip=('public same-image half-boundary control' if case=='image_half' else
+                               'candidate same-image encoder8 device output' if case=='from_candidate_encoder8_fp8' else
                                'public same-image FP8-boundary control' if case in ('image_fp8','from56_fp8','from48_fp8','from39_fp8','from38_fp8','from_encoder_skip30_fp8','from_candidate_vit16_fp8','from_candidate_encoder22_fp8','from_candidate_encoder14_fp8') else
-                               'synthetic control'),
+                               'synthetic control') if block>=62 else None,
                 map_status='measured C64 FFN/matrix/bias maps; candidate attention residual order',
                 original_kernel_executed=False,original_runtime_validation=False)
     (root/'manifest.json').write_text(json.dumps(report,indent=2)+'\n')
     print(json.dumps(report,indent=2))
+    return output_device
 
 
 if __name__=='__main__':
     p=argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--case',choices=('seeded','zero','image_half','image_fp8','from56_fp8','from48_fp8','from39_fp8','from38_fp8','from_encoder_skip30_fp8','from_candidate_vit16_fp8','from_candidate_encoder22_fp8','from_candidate_encoder14_fp8'),default='seeded')
+    p.add_argument('--case',choices=('seeded','zero','image_half','image_fp8','from56_fp8','from48_fp8','from39_fp8','from38_fp8','from_encoder_skip30_fp8','from_candidate_vit16_fp8','from_candidate_encoder22_fp8','from_candidate_encoder14_fp8','from_candidate_encoder8_fp8'),default='seeded')
     p.add_argument('--first-window',action='store_true')
-    p.add_argument('--block',type=int,choices=range(62,66),default=62)
+    p.add_argument('--block',type=int,choices=(*range(5,9),*range(62,66)),default=62)
     p.add_argument('--width',type=int,default=WIDTH)
     p.add_argument('--height',type=int,default=HEIGHT)
-    a=p.parse_args();run(a.case,a.first_window,a.block,a.width,a.height)
+    p.add_argument('--input',type=Path)
+    p.add_argument('--output-root',type=Path)
+    a=p.parse_args();run(a.case,a.first_window,a.block,a.width,a.height,a.input,a.output_root)

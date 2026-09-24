@@ -37,7 +37,7 @@ def metrics(a,b):
 
 
 def run(case):
-    if case not in ('image_half','image_fp8','from62_fp8','from56_fp8','from48_fp8','from39_fp8','from38_fp8','from_encoder_skip30_fp8','from_candidate_vit16_fp8','from_candidate_encoder22_fp8','from_candidate_encoder14_fp8'):raise ValueError('bad case')
+    if case not in ('image_half','image_fp8','from62_fp8','from56_fp8','from48_fp8','from39_fp8','from38_fp8','from_encoder_skip30_fp8','from_candidate_vit16_fp8','from_candidate_encoder22_fp8','from_candidate_encoder14_fp8','from_candidate_encoder8_fp8'):raise ValueError('bad case')
     audit_basis(verbose=False)
     src=json.loads((SOURCE/'manifest.json').read_text())
     for name in ('block65','skip4','merge66'):
@@ -46,21 +46,21 @@ def run(case):
     xpeer=np.fromfile(SOURCE/'block65_peer.f32','<f4').reshape(64,64,64)
     speer=np.fromfile(SOURCE/'skip4_peer.f32','<f4').reshape(128,128,32)
     if case=='image_fp8':xpeer=F(xpeer);speer=F(speer)
-    if case in ('from62_fp8','from56_fp8','from48_fp8','from39_fp8','from38_fp8','from_encoder_skip30_fp8','from_candidate_vit16_fp8','from_candidate_encoder22_fp8','from_candidate_encoder14_fp8'):speer=F(speer)
+    if case in ('from62_fp8','from56_fp8','from48_fp8','from39_fp8','from38_fp8','from_encoder_skip30_fp8','from_candidate_vit16_fp8','from_candidate_encoder22_fp8','from_candidate_encoder14_fp8','from_candidate_encoder8_fp8'):speer=F(speer)
     p64=peer_to_native_multihead(np.arange(64))
     p32=peer_to_native(np.arange(32))
     x=np.empty_like(xpeer);x[...,p64]=xpeer
     upstream=None
-    if case in ('from62_fp8','from56_fp8','from48_fp8','from39_fp8','from38_fp8','from_encoder_skip30_fp8','from_candidate_vit16_fp8','from_candidate_encoder22_fp8','from_candidate_encoder14_fp8'):
+    if case in ('from62_fp8','from56_fp8','from48_fp8','from39_fp8','from38_fp8','from_encoder_skip30_fp8','from_candidate_vit16_fp8','from_candidate_encoder22_fp8','from_candidate_encoder14_fp8','from_candidate_encoder8_fp8'):
         upstream_case='image_fp8' if case=='from62_fp8' else case
         audit_dir=('peer_decoder62_tail_audit' if case=='from62_fp8' else
                    'peer_decoder62_tail_audit_from56' if case=='from56_fp8' else
                    'peer_decoder62_tail_audit_from48' if case=='from48_fp8' else
-                   f'peer_decoder62_tail_audit_{"encoder_skip30" if case=="from_encoder_skip30_fp8" else "candidate_vit16" if case=="from_candidate_vit16_fp8" else "candidate_encoder22" if case=="from_candidate_encoder22_fp8" else "candidate_encoder14" if case=="from_candidate_encoder14_fp8" else case.removesuffix("_fp8")}')
+                   f'peer_decoder62_tail_audit_{"encoder_skip30" if case=="from_encoder_skip30_fp8" else "candidate_vit16" if case=="from_candidate_vit16_fp8" else "candidate_encoder22" if case=="from_candidate_encoder22_fp8" else "candidate_encoder14" if case=="from_candidate_encoder14_fp8" else "candidate_encoder8" if case=="from_candidate_encoder8_fp8" else case.removesuffix("_fp8")}')
         audit_path=ROOT/'build'/audit_dir/'manifest.json'
         audit=json.loads(audit_path.read_text())
-        input_path=(FROM39/f'peer_decoder62_{"encoder_skip30" if case=="from_encoder_skip30_fp8" else "candidate_vit16" if case=="from_candidate_vit16_fp8" else "candidate_encoder22" if case=="from_candidate_encoder22_fp8" else "candidate_encoder14" if case=="from_candidate_encoder14_fp8" else case.removesuffix("_fp8")}'/'block65/output/output_device.f32'
-                    if case in ('from39_fp8','from38_fp8','from_encoder_skip30_fp8','from_candidate_vit16_fp8','from_candidate_encoder22_fp8','from_candidate_encoder14_fp8') else
+        input_path=(FROM39/f'peer_decoder62_{"encoder_skip30" if case=="from_encoder_skip30_fp8" else "candidate_vit16" if case=="from_candidate_vit16_fp8" else "candidate_encoder22" if case=="from_candidate_encoder22_fp8" else "candidate_encoder14" if case=="from_candidate_encoder14_fp8" else "candidate_encoder8" if case=="from_candidate_encoder8_fp8" else case.removesuffix("_fp8")}'/'block65/output/output_device.f32'
+                    if case in ('from39_fp8','from38_fp8','from_encoder_skip30_fp8','from_candidate_vit16_fp8','from_candidate_encoder22_fp8','from_candidate_encoder14_fp8','from_candidate_encoder8_fp8') else
                     ROOT/'build/decoder65_candidate_derived'/upstream_case/'output/output_device.f32')
         if audit['source_model_sha256']!=src['model_sha256'] or \
            audit['source_image_sha256']!=src['image_sha256'] or \
@@ -69,7 +69,9 @@ def run(case):
         x=np.fromfile(input_path,'<f4').reshape(64,64,64)
         upstream=dict(audit_sha256=digest(audit_path),
                       block65_native_sha256=digest(input_path),
-                      boundary=('AMD candidate encoder9-30, ViT31-38 and decoder39-65; encoder14 skip candidate, encoder8/4 skips public'
+                      boundary=('AMD candidate encoder5-30, ViT31-38 and decoder39-65; encoder14/8 skips candidate, encoder4 skip public'
+                                if case=='from_candidate_encoder8_fp8' else
+                                'AMD candidate encoder9-30, ViT31-38 and decoder39-65; encoder14 skip candidate, encoder8/4 skips public'
                                 if case=='from_candidate_encoder14_fp8' else
                                 'AMD candidate encoder15-30, ViT31-38 and decoder39-65; encoder14/8/4 skips public'
                                 if case=='from_candidate_encoder22_fp8' else
@@ -102,8 +104,8 @@ def run(case):
     scale[order]=raw[0x2860:0x28a0].view('<f2').astype(np.float32)
     low=multiply(x,weights)
     merged=H(np.repeat(np.repeat(low,2,axis=0),2,axis=1)+skip*scale)
-    out=(FROM39/f'upsample66_{"encoder_skip30" if case=="from_encoder_skip30_fp8" else "candidate_vit16" if case=="from_candidate_vit16_fp8" else "candidate_encoder22" if case=="from_candidate_encoder22_fp8" else "candidate_encoder14" if case=="from_candidate_encoder14_fp8" else case.removesuffix("_fp8")}'
-         if case in ('from39_fp8','from38_fp8','from_encoder_skip30_fp8','from_candidate_vit16_fp8','from_candidate_encoder22_fp8','from_candidate_encoder14_fp8') else
+    out=(FROM39/f'upsample66_{"encoder_skip30" if case=="from_encoder_skip30_fp8" else "candidate_vit16" if case=="from_candidate_vit16_fp8" else "candidate_encoder22" if case=="from_candidate_encoder22_fp8" else "candidate_encoder14" if case=="from_candidate_encoder14_fp8" else "candidate_encoder8" if case=="from_candidate_encoder8_fp8" else case.removesuffix("_fp8")}'
+         if case in ('from39_fp8','from38_fp8','from_encoder_skip30_fp8','from_candidate_vit16_fp8','from_candidate_encoder22_fp8','from_candidate_encoder14_fp8','from_candidate_encoder8_fp8') else
          ROOT/'build/upsample66_prefix_derived'/case)
     out.mkdir(parents=True,exist_ok=True)
     for name,array in dict(input=x,weights=weights,scale=scale,skip=skip,
@@ -139,5 +141,5 @@ def run(case):
 
 if __name__=='__main__':
     p=argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--case',choices=('image_half','image_fp8','from62_fp8','from56_fp8','from48_fp8','from39_fp8','from38_fp8','from_encoder_skip30_fp8','from_candidate_vit16_fp8','from_candidate_encoder22_fp8','from_candidate_encoder14_fp8'),default='image_half')
+    p.add_argument('--case',choices=('image_half','image_fp8','from62_fp8','from56_fp8','from48_fp8','from39_fp8','from38_fp8','from_encoder_skip30_fp8','from_candidate_vit16_fp8','from_candidate_encoder22_fp8','from_candidate_encoder14_fp8','from_candidate_encoder8_fp8'),default='image_half')
     a=p.parse_args();run(a.case)

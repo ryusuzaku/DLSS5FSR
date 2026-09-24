@@ -20,7 +20,7 @@ def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-def run(output_root, last_block=14):
+def run(output_root, last_block=14, candidate_block8_down=None):
     if last_block not in range(9, 15):
         raise ValueError('last block must be 9..14')
     source = json.loads((SOURCE / 'manifest.json').read_text())
@@ -31,9 +31,26 @@ def run(output_root, last_block=14):
             raise ValueError(f'public {name} hash differs')
     p128 = peer_to_native_multihead(np.arange(128))
     public = np.fromfile(SOURCE / 'block8_down_peer.f32', '<f4').reshape(32, 32, 128)
-    native = np.empty_like(public)
-    native[..., p128] = public
-    native = F(native)
+    if candidate_block8_down is None:
+        native = np.empty_like(public)
+        native[..., p128] = public
+        native = F(native)
+        boundary_source = 'same-image public block8 downsample rounded to native FP8'
+        candidate_parent = None
+    else:
+        candidate = Path(candidate_block8_down).resolve()
+        parent = json.loads((candidate.parent / 'report.json').read_text())
+        if (parent['source_model_sha256'] != source['model_sha256'] or
+                parent['source_image_sha256'] != source['image_sha256'] or
+                not parent['hip_scalar_exact'] or
+                digest(candidate) != parent['block8_down_device_sha256'] or
+                candidate.read_bytes() != candidate.with_name('output.f32').read_bytes()):
+            raise ValueError('candidate block8 downsample ancestry/hash differs')
+        native = np.fromfile(candidate, '<f4').reshape(32, 32, 128)
+        boundary_source = 'connected candidate AMD encoder8 downsample'
+        candidate_parent = dict(report_path=str(candidate.parent / 'report.json'),
+                                block8_down_device_sha256=digest(candidate),
+                                block8_skip_device_sha256=parent['block8_skip_device_sha256'])
     out = Path(output_root).resolve()
     boundary = out / 'boundary8'
     boundary.mkdir(parents=True, exist_ok=True)
@@ -64,6 +81,8 @@ def run(output_root, last_block=14):
                   source_block8_down_sha256=source['tensor_sha256']['block8_down'],
                   boundary_device_sha256=digest(boundary / 'output_device.f32'),
                   final_device_sha256=digest(previous),
+                  boundary_source=boundary_source,
+                  candidate_block8_parent=candidate_parent,
                   blocks=blocks, comparisons=comparisons,
                   schedule='native front-chain 0,3,1,2,0,3',
                   basis='measured C128 coefficient maps; PTX-supported candidate residual order',
@@ -79,5 +98,6 @@ if __name__ == '__main__':
     parser.add_argument('--output-root', type=Path,
                         default=Path.home() / 'DLSS5FSR-build-offload' / 'peer_encoder128_candidate')
     parser.add_argument('--last-block', type=int, default=14)
+    parser.add_argument('--candidate-block8-down', type=Path)
     args = parser.parse_args()
-    run(args.output_root, args.last_block)
+    run(args.output_root, args.last_block, args.candidate_block8_down)

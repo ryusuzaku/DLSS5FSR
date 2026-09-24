@@ -1,5 +1,76 @@
 # Same-image candidate decoder chain (2026-09-24)
 
+## Connected experimental encoder5–head branch
+
+The newest branch starts at the pinned public block4 downsample. One ONNX
+extraction supplies encoder5–7, the block8 skip, and block8 downsample; both
+block8 outputs match earlier independent extractions byte for byte. On AMD,
+candidate C64 encoder5–8 uses the upstream measured coefficient maps and the
+native front-chain shifts 0,3,1,2. Block8 now emits both the FP8 decoder skip
+and a separately half-rounded raw body output for 2×2 pooling. The measured
+C64→C128 downsample map runs on AMD. All C64 body stages, raw pool, projection,
+and interblock handoffs are byte-exact against the declared scalar candidate.
+
+The block8 skip has 0.40924 MAE/0.99074 correlation against the public FP16
+skip; its downsample has 0.23605/0.99711. The connected block8 downsample runs
+through candidate encoder9–30, ViT31–38, and decoder39–69. Hash checks ensure
+that decoder48/56/62 consume skips from the same encoder22/14/8 lineage.
+Block62's C128→C64 projection and skip merge are exact between HIP and scalar.
+Block69 has 1.05861 MAE/0.99027 correlation against public FP16.
+
+The full 256×256 head and a separate direct GPU-buffer replay pass exact
+HIP/scalar checks. At the public gain, blended RGB has 0.005367 MAE and
+0.999141 correlation against the public FP16 frame. The earlier branch
+starting at public block8 downsample gave 0.006031/0.998972; the input-image
+baseline is 0.008050 MAE. The branch still uses the public block4 skip,
+preblock skip, and color. Original C256/C32 maps, the ViT16 reduction order,
+the physical ViT bridge, and runtime game wiring are not independently
+validated. Public FP16 differences do not establish original-kernel parity.
+
+After building `tools/build_split512_block.sh` and preparing the same-image
+fixtures used by the earlier branch, replay the new source-only path with:
+
+```powershell
+$py = 'build/peer_onnx_venv/Scripts/python.exe'
+$off = Join-Path $env:USERPROFILE 'DLSS5FSR-build-offload'
+& $py tools/extract_peer_encoder64_inputs.py
+& $py tools/check_encoder64_peer_image.py
+& $py tools/check_encoder8_downsample_peer_image.py
+$enc128 = Join-Path $off 'peer_encoder128_from8_candidate'
+& $py tools/check_encoder128_peer_image.py --candidate-block8-down (Join-Path $off 'peer_encoder8_down_candidate/output_device.f32') --output-root $enc128
+& $py tools/check_encoder14_downsample_peer_image.py --encoder-root $enc128 --output-root (Join-Path $off 'peer_encoder14_down_from8_candidate')
+$enc256 = Join-Path $off 'peer_encoder256_from8_candidate'
+& $py tools/check_encoder256_peer_image.py --candidate-block14-down (Join-Path $off 'peer_encoder14_down_from8_candidate/output_device.f32') --output-root $enc256
+& $py tools/check_decoder49_candidate.py --block 22 --input (Join-Path $enc256 'block21/output/output_device.f32') --width 16 --height 16 --output-root (Join-Path $enc256 'block22')
+& $py tools/check_encoder22_downsample_peer_image.py --encoder-root $enc256 --output-root (Join-Path $off 'peer_encoder22_down_from8_candidate')
+$enc512 = Join-Path $off 'peer_split512_encoder_from8_candidate'
+& $py tools/check_split512_encoder_peer_image.py --candidate-block22-down (Join-Path $off 'peer_encoder22_down_from8_candidate') --output-root $enc512
+$vit31 = Join-Path $off 'peer_vit31_from8_candidate'
+& $py tools/check_vit31_peer_image.py --encoder-root $enc512 --output-root $vit31
+$vit38 = Join-Path $off 'peer_vit16_from8_candidate'
+& $py tools/check_vit16_peer_image_chain.py --vit31-root $vit31 --output-root $vit38
+$dec39 = Join-Path $off 'decoder39_from8_candidate'
+& $py tools/check_decoder39_peer_image.py --candidate-skip30 $enc512 --candidate-vit38 $vit38 --output-root $dec39
+$dec512 = Join-Path $off 'peer_split512_decoder_from8_candidate'
+& $py tools/check_split512_peer_image.py --amd-block39 --amd-block39-dir $dec39 --output-root $dec512
+$up48 = Join-Path $off 'upsample48_from8_candidate'
+& $py tools/check_upsample48_peer_image.py --chain-report (Join-Path $dec512 'report.json') --block39-dir $dec39 --candidate-skip22 (Join-Path $off 'peer_encoder22_down_from8_candidate') --output-root $up48
+$dec256 = Join-Path $off 'peer_decoder48_from8_candidate'
+& $py tools/check_decoder48_55_peer_image.py --candidate-encoder22 --prefix-root $up48 --output-root $dec256
+& $py tools/check_upsample56_peer_image.py --candidate-encoder22 --candidate-skip14 (Join-Path $off 'peer_encoder14_down_from8_candidate') --candidate-encoder22-down (Join-Path $off 'peer_encoder22_down_from8_candidate') --candidate-encoder8-down (Join-Path $off 'peer_encoder8_down_candidate') --chain-root $dec256 --output-root (Join-Path $off 'upsample56_candidate_encoder8')
+foreach ($b in 56..61) { & $py tools/check_block56_candidate.py --case image_candidate_encoder8 --block $b --width 32 --height 32 }
+& $py tools/audit_peer_decoder56_tail.py --case image_candidate_encoder8
+& $py tools/check_upsample62_peer_image.py --case from_candidate_encoder8_fp8 --candidate-encoder8-down (Join-Path $off 'peer_encoder8_down_candidate')
+foreach ($b in 62..65) { & $py tools/check_block62_candidate.py --case from_candidate_encoder8_fp8 --block $b --width 64 --height 64 }
+& $py tools/audit_peer_decoder62_tail.py --case from_candidate_encoder8_fp8
+& $py tools/check_upsample66_peer_image.py --case from_candidate_encoder8_fp8
+foreach ($b in 66..69) { & $py tools/check_block66_peer_candidate.py --case from_candidate_encoder8_fp8 --block $b --width 128 --height 128 }
+& $py tools/audit_peer_decoder66_tail.py --case from_candidate_encoder8_fp8
+$frame = Join-Path $off 'peer_head_frame_256_from_candidate_encoder8_fp8'
+& $py tools/check_head70_peer_frame.py --latent-case from_candidate_encoder8_fp8 --output-root $frame
+& $py tools/check_head70_peer_gpu_chain.py --latent-case from_candidate_encoder8_fp8 --frame-dir $frame --output-dir (Join-Path $off 'peer_head_frame_256_from_candidate_encoder8_fp8_connected_gpu')
+```
+
 ## Upstream experimental encoder8–22 branch
 
 `tools/extract_peer_encoder128_inputs.py` extracts public block8 downsample,

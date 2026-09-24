@@ -37,13 +37,16 @@ def metrics(a,b):
 
 def run(candidate_block55=False, from39=False, output_root=None, chain_root=None,
         from38=False, encoder_skip30=False, candidate_vit16=False,
-        candidate_encoder22=False, candidate_skip14=None, candidate_encoder22_down=None):
+        candidate_encoder22=False, candidate_skip14=None, candidate_encoder22_down=None,
+        candidate_encoder8_down=None):
     if (encoder_skip30 or candidate_vit16 or candidate_encoder22 or candidate_skip14 is not None) and (chain_root is None or output_root is None):
         raise ValueError('custom candidate requires explicit chain/output roots')
     if (candidate_skip14 is None) != (candidate_encoder22_down is None):
         raise ValueError('candidate skip14 needs its matching candidate encoder22 downsample')
     if candidate_skip14 is not None and not candidate_encoder22:
         raise ValueError('candidate skip14 requires a connected candidate encoder22 chain')
+    if candidate_encoder8_down is not None and candidate_skip14 is None:
+        raise ValueError('candidate encoder8 needs the connected encoder14 skip')
     if from39 or from38 or encoder_skip30 or candidate_vit16 or candidate_encoder22:
         candidate_block55=True
     src=json.loads((SOURCE/'manifest.json').read_text())
@@ -78,6 +81,8 @@ def run(candidate_block55=False, from39=False, output_root=None, chain_root=None
         x=np.empty_like(xpeer);x[...,p256]=xpeer
     candidate_skip14_sha256=None
     candidate_down14_sha256=None
+    candidate_down8_sha256=None
+    candidate_skip8_sha256=None
     if candidate_skip14 is None:
         skip=np.empty_like(speer);skip[...,p128]=speer
     else:
@@ -107,6 +112,24 @@ def run(candidate_block55=False, from39=False, output_root=None, chain_root=None
         skip=np.fromfile(skip_path,'<f4').reshape(32,32,128)
         candidate_skip14_sha256=digest(skip_path)
         candidate_down14_sha256=down14['block14_down_device_sha256']
+        if candidate_encoder8_down is not None:
+            down8_root=Path(candidate_encoder8_down).resolve()
+            down8=json.loads((down8_root/'report.json').read_text())
+            c128_root=Path(down14['block14_skip_device_path']).parents[2]
+            c128=json.loads((c128_root/'report.json').read_text())
+            parent8=c128.get('candidate_block8_parent')
+            skip8_path=Path(down8['block8_skip_device_path'])
+            if (down8['source_model_sha256']!=src['model_sha256'] or
+                    down8['source_image_sha256']!=src['image_sha256'] or
+                    not down8['hip_scalar_exact'] or
+                    digest(down8_root/'output_device.f32')!=down8['block8_down_device_sha256'] or
+                    digest(skip8_path)!=down8['block8_skip_device_sha256'] or
+                    parent8 is None or
+                    parent8['block8_down_device_sha256']!=down8['block8_down_device_sha256'] or
+                    parent8['block8_skip_device_sha256']!=down8['block8_skip_device_sha256']):
+                raise ValueError('candidate block8-to-block14-to-block22 ancestry differs')
+            candidate_down8_sha256=down8['block8_down_device_sha256']
+            candidate_skip8_sha256=down8['block8_skip_device_sha256']
     raw_path=ROOT/'dlss5-analysis/tensors/tensor_133.bin'
     raw=np.fromfile(raw_path,np.uint8)
     if raw.size!=230176:raise ValueError('wrong block56 tensor size')
@@ -137,7 +160,8 @@ def run(candidate_block55=False, from39=False, output_root=None, chain_root=None
     if (out/'merged_device.f32').read_bytes()!=(out/'merged.f32').read_bytes():
         raise AssertionError('prefix HIP/scalar merge differs')
     public=np.fromfile(SOURCE/'merge56_peer.f32','<f4').reshape(32,32,128)
-    report=dict(case=('image_candidate_encoder14' if candidate_skip14 is not None else
+    report=dict(case=('image_candidate_encoder8' if candidate_encoder8_down is not None else
+                      'image_candidate_encoder14' if candidate_skip14 is not None else
                       'image_candidate_encoder22' if candidate_encoder22 else
                       'image_candidate_vit16' if candidate_vit16 else
                       'image_encoder_skip30' if encoder_skip30 else
@@ -150,6 +174,8 @@ def run(candidate_block55=False, from39=False, output_root=None, chain_root=None
                 source_skip14_peer_sha256=src['tensor_sha256']['skip14'],
                 candidate_skip14_device_sha256=candidate_skip14_sha256,
                 candidate_block14_down_device_sha256=candidate_down14_sha256,
+                candidate_block8_down_device_sha256=candidate_down8_sha256,
+                candidate_skip8_device_sha256=candidate_skip8_sha256,
                 block56_tensor_sha256=digest(raw_path),
                 input_native_sha256=digest(out/'input.f32'),
                 input_from_candidate_block48_chain=candidate_block55,
@@ -175,9 +201,10 @@ if __name__=='__main__':
     parser.add_argument('--candidate-encoder22',action='store_true',help='use the candidate encoder22 C256 chain')
     parser.add_argument('--candidate-skip14',type=Path,help='candidate encoder14 downsample fixture, including its matching skip')
     parser.add_argument('--candidate-encoder22-down',type=Path,help='matching candidate encoder22 downsample fixture')
+    parser.add_argument('--candidate-encoder8-down',type=Path,help='matching candidate encoder8 downsample and skip fixture')
     parser.add_argument('--output-root',type=Path)
     parser.add_argument('--chain-root',type=Path,help='C256 block48–55 fixture directory')
     args=parser.parse_args()
     run(args.candidate_block55,args.from39,args.output_root,args.chain_root,
         args.from38,args.encoder_skip30,args.candidate_vit16,args.candidate_encoder22,
-        args.candidate_skip14,args.candidate_encoder22_down)
+        args.candidate_skip14,args.candidate_encoder22_down,args.candidate_encoder8_down)
