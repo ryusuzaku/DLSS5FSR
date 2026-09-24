@@ -36,11 +36,14 @@ def metrics(a, b):
                 correlation=float(np.corrcoef(a.ravel(), b.ravel())[0, 1]))
 
 
-def run(split512=False, output_root=None, amd_block39=False, chain_report=None, block39_dir=None):
+def run(split512=False, output_root=None, amd_block39=False, chain_report=None,
+        block39_dir=None, candidate_skip22=None):
     if chain_report is not None:
         if block39_dir is None or output_root is None:
             raise ValueError('custom chain requires --block39-dir and --output-root')
         amd_block39=True
+    if candidate_skip22 is not None and chain_report is None:
+        raise ValueError('candidate encoder22 skip requires a custom C512 chain report')
     if amd_block39:
         split512=True
     src = json.loads((SOURCE / 'manifest.json').read_text())
@@ -83,7 +86,23 @@ def run(split512=False, output_root=None, amd_block39=False, chain_report=None, 
             raise ValueError('split512 block47 device hash differs')
         x = np.fromfile(candidate, '<f4').reshape(8, 8, 512)
         source_block47_native_sha256 = digest(candidate)
-    skip = np.empty_like(speer); skip[..., p256] = speer
+    candidate_skip_sha256 = None
+    if candidate_skip22 is None:
+        skip = np.empty_like(speer); skip[..., p256] = speer
+    else:
+        upstream = Path(candidate_skip22).resolve()
+        ancestry = json.loads((upstream / 'report.json').read_text())
+        candidate = Path(ancestry['block22_skip_device_path'])
+        if (ancestry['source_model_sha256'] != src['model_sha256'] or
+                ancestry['source_image_sha256'] != src['image_sha256'] or
+                not ancestry['hip_scalar_exact'] or
+                chain['source_case'] != 'AMD block39 from candidate ViT38/candidate encoder skip30'):
+            raise ValueError('candidate encoder22 skip ancestry differs')
+        if (digest(candidate) != ancestry['block22_skip_device_sha256'] or
+                ancestry['block22_down_device_sha256'] != entry.get('candidate_block22_down_device_sha256')):
+            raise ValueError('candidate encoder22 skip/downsample device hash differs')
+        skip = np.fromfile(candidate, '<f4').reshape(16, 16, 256)
+        candidate_skip_sha256 = digest(candidate)
 
     raw_path = ROOT / 'dlss5-analysis/tensors/tensor_124.bin'
     raw = np.fromfile(raw_path, np.uint8)
@@ -120,7 +139,8 @@ def run(split512=False, output_root=None, amd_block39=False, chain_report=None, 
     if (out / 'merged_device.f32').read_bytes() != (out / 'merged.f32').read_bytes():
         raise AssertionError('prefix HIP/scalar merge differs')
     public = np.fromfile(SOURCE / 'merge48_peer.f32', '<f4').reshape(16, 16, 256)
-    report = dict(case=('image_fp8_candidate_vit16' if chain_report is not None and
+    report = dict(case='image_fp8_candidate_encoder22' if candidate_skip22 is not None else
+                  ('image_fp8_candidate_vit16' if chain_report is not None and
                         chain['source_case'] == 'AMD block39 from candidate ViT38/candidate encoder skip30' else
                         'image_fp8_encoder_skip30') if chain_report is not None else
                   'image_fp8_from38' if amd_block39 else 'image_fp8_from39' if split512 else 'image_fp8', input_extent=[8, 8, 512],
@@ -129,6 +149,7 @@ def run(split512=False, output_root=None, amd_block39=False, chain_report=None, 
                   source_block47_peer_sha256=src['tensor_sha256']['block47'],
                   source_block47_native_sha256=source_block47_native_sha256,
                   source_skip22_peer_sha256=src['tensor_sha256']['skip22'],
+                  candidate_skip22_device_sha256=candidate_skip_sha256,
                   block48_tensor_sha256=digest(raw_path),
                   peer_native_projection_indices_exact=count,
                   input_native_sha256=digest(out / 'input.f32'),
@@ -156,7 +177,10 @@ if __name__ == '__main__':
                         help='custom C512 chain report, e.g. one using a candidate encoder skip')
     parser.add_argument('--block39-dir', type=Path,
                         help='AMD block39 fixture that supplied the custom chain')
+    parser.add_argument('--candidate-skip22', type=Path,
+                        help='candidate block22 downsample fixture root; its body supplies the decoder skip')
     args = parser.parse_args()
     if (args.split512 or args.amd_block39) and args.output_root is None:
         args.output_root = Path.home() / 'DLSS5FSR-build-offload' / ('upsample48_from38' if args.amd_block39 else 'upsample48_from39')
-    run(args.split512, args.output_root, args.amd_block39, args.chain_report, args.block39_dir)
+    run(args.split512, args.output_root, args.amd_block39, args.chain_report,
+        args.block39_dir, args.candidate_skip22)

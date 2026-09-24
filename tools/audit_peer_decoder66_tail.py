@@ -41,14 +41,14 @@ def run(cases=None):
                 original_runtime_validation=False,
                 production_wiring=False)
     for case in (cases or ('image_half','image_fp8','from62_fp8','from56_fp8')):
-        suffix='encoder_skip30' if case=='from_encoder_skip30_fp8' else 'candidate_vit16' if case=='from_candidate_vit16_fp8' else case.removesuffix('_fp8')
-        prefix=(FROM39/f'upsample66_{suffix}' if case in ('from39_fp8','from38_fp8','from_encoder_skip30_fp8','from_candidate_vit16_fp8') else
+        suffix='encoder_skip30' if case=='from_encoder_skip30_fp8' else 'candidate_vit16' if case=='from_candidate_vit16_fp8' else 'candidate_encoder22' if case=='from_candidate_encoder22_fp8' else case.removesuffix('_fp8')
+        prefix=(FROM39/f'upsample66_{suffix}' if case in ('from39_fp8','from38_fp8','from_encoder_skip30_fp8','from_candidate_vit16_fp8','from_candidate_encoder22_fp8') else
                 ROOT/'build/upsample66_prefix_derived'/case)
         p=json.loads((prefix/'manifest.json').read_text())
         if not p['hip_projection_merge_exact'] or \
            digest(prefix/'merged_device.f32')!=p['output_device_sha256']:
             raise ValueError('prefix not exact/hash valid')
-        if case in ('from62_fp8','from56_fp8','from48_fp8','from39_fp8','from38_fp8','from_encoder_skip30_fp8','from_candidate_vit16_fp8'):
+        if case in ('from62_fp8','from56_fp8','from48_fp8','from39_fp8','from38_fp8','from_encoder_skip30_fp8','from_candidate_vit16_fp8','from_candidate_encoder22_fp8'):
             audit_dir=('peer_decoder62_tail_audit' if case=='from62_fp8' else
                        'peer_decoder62_tail_audit_from56' if case=='from56_fp8' else
                        'peer_decoder62_tail_audit_from48' if case=='from48_fp8' else
@@ -62,7 +62,7 @@ def run(cases=None):
         stages={}
         previous=prefix/'merged_device.f32'
         for block in range(66,70):
-            root=(FROM39/f'peer_decoder66_{suffix}'/f'block{block}' if case in ('from39_fp8','from38_fp8','from_encoder_skip30_fp8','from_candidate_vit16_fp8') else
+            root=(FROM39/f'peer_decoder66_{suffix}'/f'block{block}' if case in ('from39_fp8','from38_fp8','from_encoder_skip30_fp8','from_candidate_vit16_fp8','from_candidate_encoder22_fp8') else
                   ROOT/'build/block66_peer_candidate'/case if block==66 else
                   ROOT/'build'/f'decoder{block}_peer_candidate'/case)
             m=json.loads((root/'manifest.json').read_text())
@@ -83,7 +83,7 @@ def run(cases=None):
                                    block_output_stages=stages,
                                    exact_device_handoffs=4,
                                    scalar_hip_stages_exact=True)
-    out=(ROOT/'build'/f'peer_decoder66_tail_audit_{"encoder_skip30" if cases==["from_encoder_skip30_fp8"] else "candidate_vit16" if cases==["from_candidate_vit16_fp8"] else cases[0].removesuffix("_fp8")}' if cases in (['from39_fp8'],['from38_fp8'],['from_encoder_skip30_fp8'],['from_candidate_vit16_fp8']) else
+    out=(ROOT/'build'/f'peer_decoder66_tail_audit_{"encoder_skip30" if cases==["from_encoder_skip30_fp8"] else "candidate_vit16" if cases==["from_candidate_vit16_fp8"] else "candidate_encoder22" if cases==["from_candidate_encoder22_fp8"] else cases[0].removesuffix("_fp8")}' if cases in (['from39_fp8'],['from38_fp8'],['from_encoder_skip30_fp8'],['from_candidate_vit16_fp8'],['from_candidate_encoder22_fp8']) else
          OUT if cases is None else ROOT/'build/peer_decoder66_tail_audit_from48')
     out.mkdir(parents=True,exist_ok=True)
     (out/'manifest.json').write_text(json.dumps(report,indent=2)+'\n')
@@ -92,6 +92,6 @@ def run(cases=None):
 
 if __name__=='__main__':
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--case',choices=('from48_fp8','from39_fp8','from38_fp8','from_encoder_skip30_fp8','from_candidate_vit16_fp8'))
+    parser.add_argument('--case',choices=('from48_fp8','from39_fp8','from38_fp8','from_encoder_skip30_fp8','from_candidate_vit16_fp8','from_candidate_encoder22_fp8'))
     args=parser.parse_args()
     run([args.case] if args.case else None)

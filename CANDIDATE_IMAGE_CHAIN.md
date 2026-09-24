@@ -82,6 +82,69 @@ python tools/check_head70_peer_frame.py --latent-case from_candidate_vit16_fp8 -
 python tools/check_head70_peer_gpu_chain.py --latent-case from_candidate_vit16_fp8 --frame-dir "$offload/peer_head_frame_256_candidate_vit16" --output-dir "$offload/peer_head_frame_256_candidate_vit16_gpu"
 ```
 
+## Candidate C256 encoder22 boundary
+
+`tools/extract_peer_encoder256_inputs.py` extracts public block14 downsample,
+blocks15–21, block22 skip, and block22 downsample from one pinned blue-marble
+inference. The two block22 outputs are byte-exact with the earlier independent
+split-encoder and decoder extractions. `tools/check_encoder256_peer_image.py`
+starts at the public block14 C256 boundary and runs AMD blocks15–21 using the
+native 0,3,1,2 schedule. `check_decoder49_candidate.py --block 22` then runs
+the distinct block22 body, retaining its pre-FP8 raw projection; the new
+`check_encoder22_downsample_peer_image.py` performs the 2×2 pool and C256→C512
+projection on AMD. Every body, spatial, pool and projection stage and device
+handoff agrees exactly with its scalar candidate. The block22 skip has
+0.75429 MAE/0.97224 correlation against public FP16; the block22 downsample
+has 0.45211/0.98795. Its skip and downsample feed the *same* downstream run,
+with device hashes and model/image ancestry checked at block39 and block48.
+
+The connected AMD candidate now covers encoder15–30, ViT31–38, and
+decoder39–69 plus the 256² head. It still starts at the public block14
+downsample and uses public encoder14/8/4 skips, preblock skip, and color.
+Block69 has 1.04862 MAE/0.99121 correlation against public FP16. All 1,024
+head windows and the separate GPU-buffer merge/body/RGB comparisons pass
+exactly against the scalar candidate. At public gain, blended RGB has 0.00493
+MAE/0.99924 correlation against the public FP16 final image; the input-color
+baseline is 0.00805 MAE. The image is finite and visually coherent.
+
+This is **candidate arithmetic**, not original NVIDIA parity. The C256 body
+and downsample logical maps extend independently measured C64/C128 patterns;
+the local workspace has no independent C256 logical assets or original-kernel
+run. The 16-token attention reduction and physical C512/ViT bridge remain
+unverified. The public FP16 graph also uses different activation precision and
+window shifts, so its error metrics are diagnostics rather than an acceptance
+oracle. No production game wiring was changed.
+
+After the public extractions and `tools/build_split512_block.sh`, replay with
+large fixtures on a spacious drive:
+
+```powershell
+$py = 'build/peer_onnx_venv/Scripts/python.exe'
+$offload = Join-Path $HOME 'DLSS5FSR-build-offload'
+& $py tools/extract_peer_encoder256_inputs.py
+& $py tools/check_encoder256_peer_image.py --output-root "$offload/peer_encoder256_candidate"
+& $py tools/check_decoder49_candidate.py --block 22 --input "$offload/peer_encoder256_candidate/block21/output/output_device.f32" --width 16 --height 16 --output-root "$offload/peer_encoder256_candidate/block22"
+& $py tools/check_encoder22_downsample_peer_image.py --encoder-root "$offload/peer_encoder256_candidate" --output-root "$offload/peer_encoder22_down_candidate"
+& $py tools/check_split512_encoder_peer_image.py --candidate-block22-down "$offload/peer_encoder22_down_candidate" --output-root "$offload/peer_split512_encoder_from22"
+& $py tools/check_vit31_peer_image.py --encoder-root "$offload/peer_split512_encoder_from22" --output-root "$offload/peer_vit31_from22"
+& $py tools/check_vit16_peer_image_chain.py --vit31-root "$offload/peer_vit31_from22" --output-root "$offload/peer_vit16_from22"
+& $py tools/check_decoder39_peer_image.py --candidate-vit38 "$offload/peer_vit16_from22" --candidate-skip30 "$offload/peer_split512_encoder_from22" --output-root "$offload/decoder39_from22"
+& $py tools/check_split512_peer_image.py --amd-block39 --amd-block39-dir "$offload/decoder39_from22" --output-root "$offload/peer_split512_from22"
+& $py tools/check_upsample48_peer_image.py --chain-report "$offload/peer_split512_from22/report.json" --block39-dir "$offload/decoder39_from22" --candidate-skip22 "$offload/peer_encoder22_down_candidate" --output-root "$offload/upsample48_from22"
+& $py tools/check_decoder48_55_peer_image.py --candidate-encoder22 --prefix-root "$offload/upsample48_from22" --output-root "$offload/peer_decoder48_from22"
+& $py tools/check_upsample56_peer_image.py --candidate-encoder22 --chain-root "$offload/peer_decoder48_from22" --output-root "$offload/upsample56_candidate_encoder22"
+foreach ($b in 56..61) { & $py tools/check_block56_candidate.py --case image_candidate_encoder22 --block $b --width 32 --height 32 }
+& $py tools/audit_peer_decoder56_tail.py --case image_candidate_encoder22
+& $py tools/check_upsample62_peer_image.py --case from_candidate_encoder22_fp8
+foreach ($b in 62..65) { & $py tools/check_block62_candidate.py --case from_candidate_encoder22_fp8 --block $b --width 64 --height 64 }
+& $py tools/audit_peer_decoder62_tail.py --case from_candidate_encoder22_fp8
+& $py tools/check_upsample66_peer_image.py --case from_candidate_encoder22_fp8
+foreach ($b in 66..69) { & $py tools/check_block66_peer_candidate.py --case from_candidate_encoder22_fp8 --block $b --width 128 --height 128 }
+& $py tools/audit_peer_decoder66_tail.py --case from_candidate_encoder22_fp8
+& $py tools/check_head70_peer_frame.py --latent-case from_candidate_encoder22_fp8 --output-root "$offload/peer_head_frame_256_candidate_encoder22"
+& $py tools/check_head70_peer_gpu_chain.py --latent-case from_candidate_encoder22_fp8 --frame-dir "$offload/peer_head_frame_256_candidate_encoder22" --output-dir "$offload/peer_head_frame_256_candidate_encoder22_gpu"
+```
+
 A separate decoder continuation combines the public *logical* ViT38 with the
 candidate AMD block30 skip. `check_decoder39_peer_image.py --candidate-skip30`
 then feeds AMD blocks39–69 and the full 256² head via case-specific fixtures.

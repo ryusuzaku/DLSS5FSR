@@ -77,4 +77,11 @@ gives the continuation through block39–69 and the full-frame head. The 16-toke
 attention reduction is experimental: its original-kernel order and physical
 ViT bridge remain unverified.
 
+The newer same-image branch begins at the public block14 downsample, runs
+candidate AMD encoder15–22, and feeds both its block22 downsample and skip
+through the connected ViT/decoder/head chain. Its source, replay commands,
+RGB measurements, and original-map limits are in
+[CANDIDATE_IMAGE_CHAIN.md](CANDIDATE_IMAGE_CHAIN.md). The C256 maps remain
+candidate extensions pending independent logical assets or an original oracle.
+
 Source code here is experimental. No NVIDIA binaries or weights are bundled.

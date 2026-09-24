@@ -36,10 +36,11 @@ def metrics(a,b):
 
 
 def run(candidate_block55=False, from39=False, output_root=None, chain_root=None,
-        from38=False, encoder_skip30=False, candidate_vit16=False):
-    if (encoder_skip30 or candidate_vit16) and (chain_root is None or output_root is None):
+        from38=False, encoder_skip30=False, candidate_vit16=False,
+        candidate_encoder22=False):
+    if (encoder_skip30 or candidate_vit16 or candidate_encoder22) and (chain_root is None or output_root is None):
         raise ValueError('custom candidate requires explicit chain/output roots')
-    if from39 or from38 or encoder_skip30 or candidate_vit16:
+    if from39 or from38 or encoder_skip30 or candidate_vit16 or candidate_encoder22:
         candidate_block55=True
     src=json.loads((SOURCE/'manifest.json').read_text())
     for name in ('block55','skip14','merge56'):
@@ -56,6 +57,8 @@ def run(candidate_block55=False, from39=False, output_root=None, chain_root=None
             raise ValueError('candidate encoder skip ancestry differs')
         if candidate_vit16 and chain['case']!='image_candidate_vit16':
             raise ValueError('candidate ViT16 ancestry differs')
+        if candidate_encoder22 and chain['case']!='image_candidate_encoder22':
+            raise ValueError('candidate encoder22 ancestry differs')
         if chain['blocks'][-1]['block']!=55 or digest(native_path)!=chain['final_device_sha256']:
             raise ValueError('same-image candidate block55 handoff differs')
         if (chain['source_model_sha256']!=src['model_sha256'] or
@@ -100,7 +103,8 @@ def run(candidate_block55=False, from39=False, output_root=None, chain_root=None
     if (out/'merged_device.f32').read_bytes()!=(out/'merged.f32').read_bytes():
         raise AssertionError('prefix HIP/scalar merge differs')
     public=np.fromfile(SOURCE/'merge56_peer.f32','<f4').reshape(32,32,128)
-    report=dict(case=('image_candidate_vit16' if candidate_vit16 else
+    report=dict(case=('image_candidate_encoder22' if candidate_encoder22 else
+                      'image_candidate_vit16' if candidate_vit16 else
                       'image_encoder_skip30' if encoder_skip30 else
                       'image_from38' if from38 else 'image_from39' if from39 else
                       'image_from_block48' if candidate_block55 else 'image_fp8'),
@@ -130,8 +134,9 @@ if __name__=='__main__':
     parser.add_argument('--from38',action='store_true',help='use the AMD block39-derived C256 block55 candidate')
     parser.add_argument('--encoder-skip30',action='store_true',help='use the candidate encoder-skip C256 chain')
     parser.add_argument('--candidate-vit16',action='store_true',help='use the 16-token candidate ViT C256 chain')
+    parser.add_argument('--candidate-encoder22',action='store_true',help='use the candidate encoder22 C256 chain')
     parser.add_argument('--output-root',type=Path)
     parser.add_argument('--chain-root',type=Path,help='C256 block48–55 fixture directory')
     args=parser.parse_args()
     run(args.candidate_block55,args.from39,args.output_root,args.chain_root,
-        args.from38,args.encoder_skip30,args.candidate_vit16)
+        args.from38,args.encoder_skip30,args.candidate_vit16,args.candidate_encoder22)

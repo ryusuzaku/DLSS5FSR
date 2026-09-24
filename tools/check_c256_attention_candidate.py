@@ -43,7 +43,7 @@ def decode_attention(raw,maps):
     if len(raw)==820784:
         qkv_offset,bias_offset,scale_offset,projection_offset,skip_offset=(
             0x78400,0xa8400,0xb8400,0xb8420,0xc8420)
-    elif len(raw)==689232:
+    elif len(raw) in (689232,820288):
         qkv_offset,bias_offset,scale_offset,projection_offset,skip_offset=(
             0x58220,0x88220,0x98220,0x98240,0xa8240)
     else:raise ValueError('wrong C256 tensor size')
@@ -67,7 +67,7 @@ def decode_attention(raw,maps):
     return np.stack(qkv),bias,scales,projection,skip
 
 
-def reference(feature,weights,bias,scales,projection,skip):
+def reference(feature,weights,bias,scales,projection,skip,raw_output=False):
     channels=feature.shape[-1]
     heads=channels//32
     qkv=np.stack([multiply(feature,weights[m]) for m in range(3)],axis=1)
@@ -91,10 +91,13 @@ def reference(feature,weights,bias,scales,projection,skip):
         prob=F(H(exp*H(1/denominator(exp))))
         probabilities[head]=prob
         context[:,sl]=F(H(H(prob[:,:32]@v[:32])+prob[:,32:]@v[32:]))
-    return dict(qkv=qkv,normalized=normalized,scores=scores,exponents=exponents,
+    raw=multiply(context,projection,H(feature*skip))
+    result=dict(qkv=qkv,normalized=normalized,scores=scores,exponents=exponents,
                 probabilities=probabilities,context=context,
                 projection_linear=multiply(context,projection),
-                projection_residual=F(multiply(context,projection,H(feature*skip))))
+                projection_residual=F(raw))
+    if raw_output:result['projection_raw']=raw
+    return result
 
 
 def run(derived=False,all_windows=False):

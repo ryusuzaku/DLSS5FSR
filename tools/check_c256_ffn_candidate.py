@@ -50,7 +50,7 @@ def candidate_ffn_maps():
 
 def decode_ffn(raw,maps):
     if len(raw)==820784:skip_offset=0x78000  # block48 upsample
-    elif len(raw)==689232:skip_offset=0x58010  # ordinary C256 block
+    elif len(raw) in (689232,820288):skip_offset=0x58010  # ordinary or encoder22 DS block
     else:raise ValueError('wrong C256 tensor size')
     result=[]
     for begin,end,shape,row_key,col_key in (

@@ -25,6 +25,8 @@ MSYS_NO_PATHCONV=1 "$ROCM/bin/hipcc.exe" -std=c++17 -O2 -ffp-contract=off -D_CRT
 MSYS_NO_PATHCONV=1 "$ROCM/bin/hipcc.exe" -std=c++17 -O2 -ffp-contract=off -D_CRT_SECURE_NO_WARNINGS \
   --offload-arch=gfx1201 hip/mvp1/c256_attention_candidate_test.hip -o build/c256_attention_candidate_test.exe
 MSYS_NO_PATHCONV=1 "$ROCM/bin/hipcc.exe" -std=c++17 -O2 -ffp-contract=off -D_CRT_SECURE_NO_WARNINGS \
+  --offload-arch=gfx1201 hip/mvp1/encoder256_downsample_test.hip -o build/encoder256_downsample_test.exe
+MSYS_NO_PATHCONV=1 "$ROCM/bin/hipcc.exe" -std=c++17 -O2 -ffp-contract=off -D_CRT_SECURE_NO_WARNINGS \
   --offload-arch=gfx1201 hip/mvp1/spatial256_output_test.hip -o build/spatial256_output_test.exe
 MSYS_NO_PATHCONV=1 "$ROCM/bin/hipcc.exe" -std=c++17 -O2 -ffp-contract=off -D_CRT_SECURE_NO_WARNINGS \
   --offload-arch=gfx1201 hip/mvp1/upsample56_prefix_test.hip -o build/upsample56_prefix_test.exe

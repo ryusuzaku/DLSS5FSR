@@ -63,6 +63,7 @@ def run(output_root=None, candidate_skip30=None, candidate_vit38=None):
     if candidate_skip30 is None:
         skip = np.empty_like(peer_skip); skip[..., p512] = peer_skip; skip = F(skip)
         candidate_skip_sha256 = None
+        candidate_block22_down_sha256 = None
     else:
         encoder = Path(candidate_skip30).resolve()
         ancestry = json.loads((encoder / 'report.json').read_text())
@@ -74,6 +75,12 @@ def run(output_root=None, candidate_skip30=None, candidate_vit38=None):
             raise ValueError('candidate encoder skip device hash differs')
         skip = np.fromfile(candidate, '<f4').reshape(8, 8, 512)
         candidate_skip_sha256 = digest(candidate)
+        candidate_block22_down_sha256 = ancestry.get('candidate_block22_down_device_sha256')
+        if candidate_vit38 is not None:
+            vit_head = json.loads((Path(candidate_vit38).resolve() / 'report.json').read_text()).get(
+                'encoder_head_device_sha256')
+            if vit_head is not None and vit_head != ancestry['head30_device_sha256']:
+                raise ValueError('candidate ViT38 and encoder skip30 have different heads')
     count = 512 * 1024
     rows = bits(count, [3, 6, 7, 8, 9, 10, 11, 12, 13])
     cols = bits(count, [1, 0, 4, 5, 2, 14, 15, 16, 17, 18])
@@ -126,6 +133,7 @@ def run(output_root=None, candidate_skip30=None, candidate_vit38=None):
                   candidate_vit38_inverse_device_sha256=candidate_vit_sha256,
                   source_skip30_peer_sha256=src['tensor_sha256']['skip30'],
                   candidate_skip30_device_sha256=candidate_skip_sha256,
+                  candidate_block22_down_device_sha256=candidate_block22_down_sha256,
                   block39_tensor_sha256=digest(raw_path),
                   peer_native_projection_indices_exact=count,
                   input_vit_native_sha256=digest(out / 'main.f32'),

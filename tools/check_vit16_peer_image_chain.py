@@ -70,6 +70,7 @@ def run(vit31_root, output_root):
     comparison = metrics(native[:, p1024], public)
     result = dict(source_model_sha256=prior['source_model_sha256'],
                   source_image_sha256=prior['source_image_sha256'],
+                  encoder_head_device_sha256=prior['encoder_head_device_sha256'],
                   vit31_projection_device_sha256=prior['vit31_projection_device_sha256'],
                   vit38_projection_device_sha256=digest(previous),
                   vit38_inverse_device_sha256=digest(case / 'device.f32'),
