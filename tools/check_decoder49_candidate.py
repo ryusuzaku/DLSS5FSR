@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Continue a derived C256 device output through one ordinary decoder block.
+"""Continue a derived C256 device output through one decoder block.
 
-This is a candidate chain: encoder22 skip is synthetic and C256 logical
-coefficient coordinates remain an extrapolation of measured C64/C128 maps.
+The default fixture has a synthetic encoder22 skip. A caller can supply a
+same-image block48 prefix and extent. C256 logical coefficient coordinates
+remain an extrapolation of measured C64/C128 maps.
 """
 from pathlib import Path
 import argparse
@@ -31,28 +32,29 @@ def save(folder,values):
         array.tofile(folder/f'{name}.f32')
 
 
-def run(block=49,previous=None):
-    if block not in range(49,56):raise ValueError('ordinary C256 decoder block must be 49..55')
-    shift=SHIFTS[block-49]
+def run(block=49,previous=None,width=WIDTH,height=HEIGHT,output_root=None):
+    if block not in range(48,56):raise ValueError('C256 decoder block must be 48..55')
+    if width<8 or height<8 or width%8 or height%8:raise ValueError('extent must be divisible by eight')
+    shift=0 if block==48 else SHIFTS[block-49]
     evidence=audit_residual_ptx()
     if not evidence['ordinary_c256_block_check']['same_relative_addresses']:
         raise ValueError('ordinary C256 PTX residual transfer failed')
     previous=Path(previous) if previous is not None else ROOT/'build/block48_candidate_output_derived/output_device.f32'
-    expected_previous=previous.with_name('output.f32')
+    expected_previous=previous.with_name('merged.f32' if block==48 else 'output.f32')
     if not previous.is_file():raise FileNotFoundError(f'input for block{block} missing: {previous}')
     if previous.read_bytes()!=expected_previous.read_bytes():
         raise ValueError(f'input device output for block{block} differs from reference')
-    root=ROOT/'build'/f'decoder{block}_candidate_derived'
-    x=np.fromfile(previous,'<f4').reshape(HEIGHT,WIDTH,CHANNELS)
+    root=Path(output_root) if output_root is not None else ROOT/'build'/f'decoder{block}_candidate_derived'
+    x=np.fromfile(previous,'<f4').reshape(height,width,CHANNELS)
     px=4 if shift&1 else 0;py=4 if shift&2 else 0
-    ww=((WIDTH+px+7)//8)*8;hh=((HEIGHT+py+7)//8)*8
-    padded=np.pad(x,((py,hh-HEIGHT-py),(px,ww-WIDTH-px),(0,0)))
+    ww=((width+px+7)//8)*8;hh=((height+py+7)//8)*8
+    padded=np.pad(x,((py,hh-height-py),(px,ww-width-px),(0,0)))
     windows=padded.reshape(hh//8,8,ww//8,8,CHANNELS).transpose(0,2,1,3,4).reshape(-1,64,CHANNELS)
     tokens=len(windows)*64
     spatial=root/'spatial'
     save(spatial,dict(input=x,windows=windows))
     subprocess.run([str(ROOT/'build/spatial256_window_test.exe'),str(spatial),
-                    str(WIDTH),str(HEIGHT),str(shift)],cwd=ROOT,check=True)
+                    str(width),str(height),str(shift)],cwd=ROOT,check=True)
     if (spatial/'windows_device.f32').read_bytes()!=(spatial/'windows.f32').read_bytes():
         raise AssertionError('block49 spatial device input differs')
 
@@ -86,20 +88,21 @@ def run(block=49,previous=None):
         raise AssertionError('block49 device attention output differs')
 
     output_windows=np.fromfile(residual_path,'<f4').reshape(hh//8,ww//8,8,8,CHANNELS)
-    image=output_windows.transpose(0,2,1,3,4).reshape(hh,ww,CHANNELS)[py:py+HEIGHT,px:px+WIDTH]
+    image=output_windows.transpose(0,2,1,3,4).reshape(hh,ww,CHANNELS)[py:py+height,px:px+width]
     out_folder=root/'output'
     save(out_folder,dict(windows=output_windows,output=image))
     subprocess.run([str(ROOT/'build/spatial256_output_test.exe'),str(out_folder),
-                    str(WIDTH),str(HEIGHT),str(shift)],cwd=ROOT,check=True)
+                    str(width),str(height),str(shift)],cwd=ROOT,check=True)
     output_device=out_folder/'output_device.f32'
     if output_device.read_bytes()!=(out_folder/'output.f32').read_bytes():
         raise AssertionError('block49 device spatial output differs')
-    report=dict(block=block,shift=shift,extent=[WIDTH,HEIGHT,CHANNELS],windows=len(windows),tokens=tokens,
+    report=dict(block=block,shift=shift,extent=[width,height,CHANNELS],windows=len(windows),tokens=tokens,
                 tensor_sha256=digest(raw_path),input_device_sha256=digest(previous),
                 output_device_sha256=digest(output_device),
                 exact_stage_checks=['spatial gather/scatter','FFN x4','attention x8','output scatter'],
                 input_provenance=str(previous.relative_to(ROOT)),
-                encoder22_skip='synthetic control inherited from block48',
+                encoder22_skip=('same-image public FP16 converted to candidate native FP8'
+                                if output_root is not None else 'synthetic control inherited from block48'),
                 map_status='candidate C256 extension and PTX-supported residual order transfer',
                 original_kernel_executed=False,original_runtime_validation=False)
     (root/'manifest.json').write_text(json.dumps(report,indent=2)+'\n')

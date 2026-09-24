@@ -82,8 +82,9 @@ weights from the DLL alone on our AMD host.
 
 ## What we can do without either source
 
-We can keep extending the same-image AMD candidate boundary to
-block48/encoder22. Existing raw-index audits compare our C256 candidate
+The same-image AMD candidate now spans block47/encoder22 through block55 and
+the block56 prefix; see [CANDIDATE_IMAGE_CHAIN.md](CANDIDATE_IMAGE_CHAIN.md).
+Existing raw-index audits compare our C256 candidate
 against the public decoder (655,360 exact positions) and another author's
 host decoder against the public decoder (671,744 exact C32/C256 positions).
 These are valuable packing checks, while public ONNX activations differ from

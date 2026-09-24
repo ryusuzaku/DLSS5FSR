@@ -5,6 +5,7 @@ This is a candidate C256 basis extension with native-style FP8 input
 boundaries, not an original NVIDIA-kernel oracle.
 """
 from pathlib import Path
+import argparse
 import hashlib
 import json
 import subprocess
@@ -34,16 +35,24 @@ def metrics(a,b):
                 correlation=float(np.corrcoef(a.ravel(),b.ravel())[0,1]))
 
 
-def run():
+def run(candidate_block55=False):
     src=json.loads((SOURCE/'manifest.json').read_text())
     for name in ('block55','skip14','merge56'):
         if digest(SOURCE/f'{name}_peer.f32')!=src['tensor_sha256'][name]:
             raise ValueError(f'source {name} hash differs')
-    xpeer=F(np.fromfile(SOURCE/'block55_peer.f32','<f4').reshape(16,16,256))
+    if candidate_block55:
+        native_path=ROOT/'build/peer_decoder48_candidate/block55/output/output_device.f32'
+        chain=json.loads((ROOT/'build/peer_decoder48_candidate/manifest.json').read_text())
+        if chain['blocks'][-1]['block']!=55 or digest(native_path)!=chain['final_device_sha256']:
+            raise ValueError('same-image candidate block55 handoff differs')
+        x=np.fromfile(native_path,'<f4').reshape(16,16,256)
+    else:
+        xpeer=F(np.fromfile(SOURCE/'block55_peer.f32','<f4').reshape(16,16,256))
     speer=F(np.fromfile(SOURCE/'skip14_peer.f32','<f4').reshape(32,32,128))
     p256=peer_to_native_multihead(np.arange(256))
     p128=peer_to_native_multihead(np.arange(128))
-    x=np.empty_like(xpeer);x[...,p256]=xpeer
+    if not candidate_block55:
+        x=np.empty_like(xpeer);x[...,p256]=xpeer
     skip=np.empty_like(speer);skip[...,p128]=speer
     raw_path=ROOT/'dlss5-analysis/tensors/tensor_133.bin'
     raw=np.fromfile(raw_path,np.uint8)
@@ -59,7 +68,7 @@ def run():
     low=multiply(x,weights)
     merged_half=H(np.repeat(np.repeat(low,2,axis=0),2,axis=1)+skip*scale)
     merged=F(merged_half)
-    out=ROOT/'build/upsample56_prefix_derived/image_fp8'
+    out=ROOT/'build/upsample56_prefix_derived'/('image_from_block48' if candidate_block55 else 'image_fp8')
     out.mkdir(parents=True,exist_ok=True)
     for name,array in dict(input=x,weights=weights,scale=scale,skip=skip,
                            low=low,merged=merged).items():
@@ -72,12 +81,14 @@ def run():
     if (out/'merged_device.f32').read_bytes()!=(out/'merged.f32').read_bytes():
         raise AssertionError('prefix HIP/scalar merge differs')
     public=np.fromfile(SOURCE/'merge56_peer.f32','<f4').reshape(32,32,128)
-    report=dict(case='image_fp8',input_extent=[16,16,256],output_extent=[32,32,128],
+    report=dict(case=('image_from_block48' if candidate_block55 else 'image_fp8'),
+                input_extent=[16,16,256],output_extent=[32,32,128],
                 source_model_sha256=src['model_sha256'],
                 source_block55_peer_sha256=src['tensor_sha256']['block55'],
                 source_skip14_peer_sha256=src['tensor_sha256']['skip14'],
                 block56_tensor_sha256=digest(raw_path),
                 input_native_sha256=digest(out/'input.f32'),
+                input_from_candidate_block48_chain=candidate_block55,
                 skip_native_sha256=digest(out/'skip.f32'),
                 output_device_sha256=digest(out/'merged_device.f32'),
                 hip_projection_merge_exact=True,
@@ -90,4 +101,7 @@ def run():
     print(json.dumps(report,indent=2))
 
 
-if __name__=='__main__':run()
+if __name__=='__main__':
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--candidate-block55',action='store_true')
+    run(parser.parse_args().candidate_block55)

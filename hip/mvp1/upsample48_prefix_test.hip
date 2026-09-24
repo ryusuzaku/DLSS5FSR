@@ -4,7 +4,7 @@
 int main(int argc,char** argv) {
     if(argc!=4){fprintf(stderr,"usage: upsample48_prefix_test dir width height\n");return 2;}
     std::string dir=argv[1];int width=atoi(argv[2]),height=atoi(argv[3]);
-    if(width!=32||height!=8)return 2;
+    if((width!=32||height!=8)&&(width!=8||height!=8))return 2;
     auto input=read(dir,"input",size_t(width)*height*512);
     auto weights=read(dir,"weights",256*512);
     auto scale=read(dir,"scale",256);
