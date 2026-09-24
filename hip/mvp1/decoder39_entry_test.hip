@@ -4,7 +4,7 @@
 int main(int argc,char** argv) {
     if(argc!=4){fprintf(stderr,"usage: decoder39_entry_test dir width height\n");return 2;}
     std::string dir=argv[1];int width=atoi(argv[2]),height=atoi(argv[3]);
-    if(width!=16||height!=4)return 2;
+    if(!((width==16&&height==4)||(width==4&&height==4)))return 2;
     int tokens=width*height,count=tokens*1024;
     auto vit=read(dir,"vit",count),main=read(dir,"main",count);
     auto weights=read(dir,"weights",512*1024),scale=read(dir,"scale",512);

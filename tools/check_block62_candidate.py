@@ -86,7 +86,7 @@ def decode(raw):
 
 
 def run(case='seeded',first_window=False,block=62,width=WIDTH,height=HEIGHT):
-    if case not in ('seeded','zero','image_half','image_fp8','from56_fp8','from48_fp8','from39_fp8'):raise ValueError('unknown skip case')
+    if case not in ('seeded','zero','image_half','image_fp8','from56_fp8','from48_fp8','from39_fp8','from38_fp8'):raise ValueError('unknown skip case')
     if block not in range(62,66):raise ValueError('block must be 62..65')
     if first_window and block!=62:raise ValueError('first-window mode is only for block62')
     if width<8 or height<8 or width%8 or height%8:
@@ -98,9 +98,9 @@ def run(case='seeded',first_window=False,block=62,width=WIDTH,height=HEIGHT):
                 if '_2h_64_2_' in item['entry'])['same_relative_addresses']:
         raise ValueError('C64 PTX residual address transfer failed')
     offload=Path.home()/'DLSS5FSR-build-offload'
-    source=((offload/'upsample62_from39/merged_device.f32' if block==62 else
-             offload/'peer_decoder62_from39'/f'block{block-1}/output/output_device.f32')
-            if case=='from39_fp8' else
+    source=((offload/f'upsample62_{case.removesuffix("_fp8")}'/'merged_device.f32' if block==62 else
+             offload/f'peer_decoder62_{case.removesuffix("_fp8")}'/f'block{block-1}/output/output_device.f32')
+            if case in ('from39_fp8','from38_fp8') else
             ROOT/'build/upsample62_prefix_derived'/case/'merged_device.f32' if block==62
             else ROOT/'build/block62_candidate'/case/'output'/'output_device.f32' if block==63
             else ROOT/'build'/f'decoder{block-1}_candidate_derived'/case/'output'/'output_device.f32')
@@ -111,7 +111,7 @@ def run(case='seeded',first_window=False,block=62,width=WIDTH,height=HEIGHT):
     ww=((width+px+7)//8)*8;hh=((height+py+7)//8)*8
     padded=np.pad(x,((py,hh-height-py),(px,ww-width-px),(0,0)))
     windows=padded.reshape(hh//8,8,ww//8,8,CHANNELS).transpose(0,2,1,3,4).reshape(-1,64,CHANNELS)
-    root=(offload/'peer_decoder62_from39'/f'block{block}' if case=='from39_fp8' else
+    root=(offload/f'peer_decoder62_{case.removesuffix("_fp8")}'/f'block{block}' if case in ('from39_fp8','from38_fp8') else
           ROOT/'build'/('block62_candidate_first_window' if first_window else 'block62_candidate')/case
           if block==62 else ROOT/'build'/f'decoder{block}_candidate_derived'/case)
     spatial=root/'spatial';save(spatial,dict(input=x,windows=windows))
@@ -154,7 +154,7 @@ def run(case='seeded',first_window=False,block=62,width=WIDTH,height=HEIGHT):
                 windows=len(chunks),tensor_sha256=digest(raw_path),input_device_sha256=digest(source),
                 output_device_sha256=digest(output_device),
                 encoder8_skip=('public same-image half-boundary control' if case=='image_half' else
-                               'public same-image FP8-boundary control' if case in ('image_fp8','from56_fp8','from48_fp8','from39_fp8') else
+                               'public same-image FP8-boundary control' if case in ('image_fp8','from56_fp8','from48_fp8','from39_fp8','from38_fp8') else
                                'synthetic control'),
                 map_status='measured C64 FFN/matrix/bias maps; candidate attention residual order',
                 original_kernel_executed=False,original_runtime_validation=False)
@@ -164,7 +164,7 @@ def run(case='seeded',first_window=False,block=62,width=WIDTH,height=HEIGHT):
 
 if __name__=='__main__':
     p=argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--case',choices=('seeded','zero','image_half','image_fp8','from56_fp8','from48_fp8','from39_fp8'),default='seeded')
+    p.add_argument('--case',choices=('seeded','zero','image_half','image_fp8','from56_fp8','from48_fp8','from39_fp8','from38_fp8'),default='seeded')
     p.add_argument('--first-window',action='store_true')
     p.add_argument('--block',type=int,choices=range(62,66),default=62)
     p.add_argument('--width',type=int,default=WIDTH)

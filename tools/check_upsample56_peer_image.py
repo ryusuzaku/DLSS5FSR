@@ -35,8 +35,8 @@ def metrics(a,b):
                 correlation=float(np.corrcoef(a.ravel(),b.ravel())[0,1]))
 
 
-def run(candidate_block55=False, from39=False, output_root=None, chain_root=None):
-    if from39:
+def run(candidate_block55=False, from39=False, output_root=None, chain_root=None, from38=False):
+    if from39 or from38:
         candidate_block55=True
     src=json.loads((SOURCE/'manifest.json').read_text())
     for name in ('block55','skip14','merge56'):
@@ -44,6 +44,7 @@ def run(candidate_block55=False, from39=False, output_root=None, chain_root=None
             raise ValueError(f'source {name} hash differs')
     if candidate_block55:
         candidate_root=(Path(chain_root) if chain_root is not None else
+                        Path.home()/'DLSS5FSR-build-offload'/'peer_decoder48_from38' if from38 else
                         Path.home()/'DLSS5FSR-build-offload'/'peer_decoder48_from39' if from39
                         else ROOT/'build/peer_decoder48_candidate')
         native_path=candidate_root/'block55/output/output_device.f32'
@@ -77,8 +78,9 @@ def run(candidate_block55=False, from39=False, output_root=None, chain_root=None
     merged_half=H(np.repeat(np.repeat(low,2,axis=0),2,axis=1)+skip*scale)
     merged=F(merged_half)
     out=(Path(output_root) if output_root is not None else
+         (Path.home()/'DLSS5FSR-build-offload'/'upsample56_from38' if from38 else
          (Path.home()/'DLSS5FSR-build-offload'/'upsample56_from39' if from39 else
-          ROOT/'build/upsample56_prefix_derived'/('image_from_block48' if candidate_block55 else 'image_fp8')))
+          ROOT/'build/upsample56_prefix_derived'/('image_from_block48' if candidate_block55 else 'image_fp8'))))
     out.mkdir(parents=True,exist_ok=True)
     for name,array in dict(input=x,weights=weights,scale=scale,skip=skip,
                            low=low,merged=merged).items():
@@ -91,7 +93,7 @@ def run(candidate_block55=False, from39=False, output_root=None, chain_root=None
     if (out/'merged_device.f32').read_bytes()!=(out/'merged.f32').read_bytes():
         raise AssertionError('prefix HIP/scalar merge differs')
     public=np.fromfile(SOURCE/'merge56_peer.f32','<f4').reshape(32,32,128)
-    report=dict(case=('image_from39' if from39 else 'image_from_block48' if candidate_block55 else 'image_fp8'),
+    report=dict(case=('image_from38' if from38 else 'image_from39' if from39 else 'image_from_block48' if candidate_block55 else 'image_fp8'),
                 input_extent=[16,16,256],output_extent=[32,32,128],
                 source_model_sha256=src['model_sha256'],
                 source_block55_peer_sha256=src['tensor_sha256']['block55'],
@@ -115,7 +117,8 @@ if __name__=='__main__':
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--candidate-block55',action='store_true')
     parser.add_argument('--from39',action='store_true',help='use the C512-derived C256 block55 candidate')
+    parser.add_argument('--from38',action='store_true',help='use the AMD block39-derived C256 block55 candidate')
     parser.add_argument('--output-root',type=Path)
     parser.add_argument('--chain-root',type=Path,help='C256 block48–55 fixture directory')
     args=parser.parse_args()
-    run(args.candidate_block55,args.from39,args.output_root,args.chain_root)
+    run(args.candidate_block55,args.from39,args.output_root,args.chain_root,args.from38)

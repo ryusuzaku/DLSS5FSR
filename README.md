@@ -24,7 +24,8 @@ the same tool checks all 14 ordinary C256 blocks without fitting C256 maps.
 local checks and which are attributed to other projects.
 
 [CANDIDATE_IMAGE_CHAIN.md](CANDIDATE_IMAGE_CHAIN.md) records same-image
-block39→head and block47→head candidate runs. The matching encoder22 skip is used at block48;
+block39→head and block47→head candidate runs, plus an AMD block39→head path
+started from public ViT38 and split-encoder30 tensors. The matching encoder22 skip is used at block48;
 its AMD/scalar checks are exact, while comparisons to the public FP16 ONNX
 model are approximate because the candidate rounds activations to FP8.
 The same-image candidate has also been propagated through blocks56–69 and
@@ -52,7 +53,8 @@ FP16 ONNX model and its blue-marble example from
 `extract_peer_preblock0_skip.py`, `extract_peer_coherent_head_inputs.py`,
 `extract_peer_decoder66_inputs.py`, `extract_peer_decoder62_inputs.py`,
 `extract_peer_decoder56_inputs.py`, then
-`extract_peer_decoder48_inputs.py`, then `extract_peer_split512_inputs.py`.
+`extract_peer_decoder48_inputs.py`, `extract_peer_split512_inputs.py`, then
+`extract_peer_decoder39_inputs.py`.
 Run `check_split512_peer_image.py --teacher-forced` for the native C512
 window schedule and `check_split512_peer_image.py --unshifted-control
 --teacher-forced` for the public ONNX window control. The public model's C512

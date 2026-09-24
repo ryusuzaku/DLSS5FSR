@@ -36,7 +36,9 @@ def metrics(a, b):
                 correlation=float(np.corrcoef(a.ravel(), b.ravel())[0, 1]))
 
 
-def run(split512=False, output_root=None):
+def run(split512=False, output_root=None, amd_block39=False):
+    if amd_block39:
+        split512=True
     src = json.loads((SOURCE / 'manifest.json').read_text())
     for name in ('block47', 'skip22', 'merge48'):
         if digest(SOURCE / f'{name}_peer.f32') != src['tensor_sha256'][name]:
@@ -48,9 +50,16 @@ def run(split512=False, output_root=None):
     x = np.empty_like(xpeer); x[..., p512] = xpeer
     source_block47_native_sha256 = None
     if split512:
-        chain = json.loads((ROOT / 'build/split512_peer_image_report.json').read_text())
+        chain_report=(ROOT / 'build/split512_peer_image_from38_report.json' if amd_block39 else
+                      ROOT / 'build/split512_peer_image_report.json')
+        chain = json.loads(chain_report.read_text())
         if chain['source_model_sha256'] != src['model_sha256'] or chain['source_image_sha256'] != src['image_sha256']:
             raise ValueError('split512 source model/image differs')
+        if amd_block39:
+            entry = json.loads((Path.home() / 'DLSS5FSR-build-offload' /
+                                'decoder39_peer_image/manifest.json').read_text())
+            if chain['source_block39_native_sha256'] != entry['output_device_sha256']:
+                raise ValueError('AMD block39 handoff differs')
         candidate = Path(chain['output_root']) / 'block47-8x8-s2' / 'final_device.f32'
         if digest(candidate) != chain['final_device_sha256']:
             raise ValueError('split512 block47 device hash differs')
@@ -93,7 +102,7 @@ def run(split512=False, output_root=None):
     if (out / 'merged_device.f32').read_bytes() != (out / 'merged.f32').read_bytes():
         raise AssertionError('prefix HIP/scalar merge differs')
     public = np.fromfile(SOURCE / 'merge48_peer.f32', '<f4').reshape(16, 16, 256)
-    report = dict(case='image_fp8_from39' if split512 else 'image_fp8', input_extent=[8, 8, 512],
+    report = dict(case='image_fp8_from38' if amd_block39 else 'image_fp8_from39' if split512 else 'image_fp8', input_extent=[8, 8, 512],
                   output_extent=[16, 16, 256],
                   source_model_sha256=src['model_sha256'],
                   source_block47_peer_sha256=src['tensor_sha256']['block47'],
@@ -118,9 +127,11 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--split512', action='store_true',
                         help='use the connected C512 candidate block47 device output')
+    parser.add_argument('--amd-block39', action='store_true',
+                        help='use the C512 chain started from AMD block39')
     parser.add_argument('--output-root', type=Path,
                         help='fixture directory (use a spacious drive for --split512)')
     args = parser.parse_args()
-    if args.split512 and args.output_root is None:
-        args.output_root = Path.home() / 'DLSS5FSR-build-offload' / 'upsample48_from39'
-    run(args.split512, args.output_root)
+    if (args.split512 or args.amd_block39) and args.output_root is None:
+        args.output_root = Path.home() / 'DLSS5FSR-build-offload' / ('upsample48_from38' if args.amd_block39 else 'upsample48_from39')
+    run(args.split512, args.output_root, args.amd_block39)

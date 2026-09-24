@@ -24,15 +24,17 @@ def metrics(a, b):
                 correlation=float(np.corrcoef(a.ravel(), b.ravel())[0, 1]))
 
 
-def run(last_block=55, split512=False, output_root=None, prefix_root=None):
+def run(last_block=55, split512=False, output_root=None, prefix_root=None, amd_block39=False):
+    if amd_block39:
+        split512=True
     if last_block not in range(48, 56):
         raise ValueError('last block must be 48..55')
     src = json.loads((SOURCE / 'manifest.json').read_text())
     prefix = (Path(prefix_root) if prefix_root is not None else
-              Path.home() / 'DLSS5FSR-build-offload' / 'upsample48_from39' if split512
+              Path.home() / 'DLSS5FSR-build-offload' / ('upsample48_from38' if amd_block39 else 'upsample48_from39') if split512
               else ROOT / 'build/upsample48_prefix_derived/image_fp8')
     prefix_report = json.loads((prefix / 'manifest.json').read_text())
-    if prefix_report['case'] != ('image_fp8_from39' if split512 else 'image_fp8'):
+    if prefix_report['case'] != ('image_fp8_from38' if amd_block39 else 'image_fp8_from39' if split512 else 'image_fp8'):
         raise ValueError('block48 prefix case differs')
     if prefix_report['source_model_sha256'] != src['model_sha256']:
         raise ValueError('block48 prefix model differs')
@@ -44,7 +46,7 @@ def run(last_block=55, split512=False, output_root=None, prefix_root=None):
         raise ValueError('block48 prefix device hash differs')
     p256 = peer_to_native_multihead(np.arange(256))
     out = (Path(output_root) if output_root is not None else
-           (Path.home() / 'DLSS5FSR-build-offload' / 'peer_decoder48_from39' if split512 else OUT))
+           (Path.home() / 'DLSS5FSR-build-offload' / ('peer_decoder48_from38' if amd_block39 else 'peer_decoder48_from39') if split512 else OUT))
     blocks = []
     for block in range(48, last_block + 1):
         first_hash = digest(previous)
@@ -65,7 +67,7 @@ def run(last_block=55, split512=False, output_root=None, prefix_root=None):
     summary = dict(blocks=blocks, source_model_sha256=src['model_sha256'],
                    source_image_sha256=src['image_sha256'],
                    block48_prefix_sha256=prefix_report['output_device_sha256'],
-                   case='image_from39' if split512 else 'image_from47',
+                   case='image_from38' if amd_block39 else 'image_from39' if split512 else 'image_from47',
                    output_root=str(out.resolve()),
                    final_device_sha256=digest(previous),
                    candidate_basis='C256 extension of measured C64/C128 maps',
@@ -81,7 +83,9 @@ if __name__ == '__main__':
     parser.add_argument('--last-block', type=int, choices=range(48, 56), default=55)
     parser.add_argument('--split512', action='store_true',
                         help='consume the C512 candidate-derived block48 prefix')
+    parser.add_argument('--amd-block39', action='store_true',
+                        help='consume block48 derived from AMD block39')
     parser.add_argument('--output-root', type=Path, help='candidate block fixture directory')
     parser.add_argument('--prefix-root', type=Path, help='block48 prefix fixture directory')
     args = parser.parse_args()
-    run(args.last_block, args.split512, args.output_root, args.prefix_root)
+    run(args.last_block, args.split512, args.output_root, args.prefix_root, args.amd_block39)

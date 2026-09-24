@@ -61,7 +61,7 @@ def save(folder,values):
 
 def run(block=66,case='seeded',first_window=False,width=WIDTH,height=HEIGHT):
     if block not in range(66,70):raise ValueError('block must be 66..69')
-    if case not in ('seeded','zero','image_half','image_fp8','from62_fp8','from56_fp8','from48_fp8','from39_fp8'):
+    if case not in ('seeded','zero','image_half','image_fp8','from62_fp8','from56_fp8','from48_fp8','from39_fp8','from38_fp8'):
         raise ValueError('unknown skip case')
     if first_window and block!=66:raise ValueError('first-window mode only supports block66')
     if width<8 or height<8 or width%8 or height%8:
@@ -70,9 +70,9 @@ def run(block=66,case='seeded',first_window=False,width=WIDTH,height=HEIGHT):
     shifts={66:0,67:3,68:1,69:2}
     shift=shifts[block]
     offload=Path.home()/'DLSS5FSR-build-offload'
-    source=((offload/'upsample66_from39/merged_device.f32' if block==66 else
-             offload/'peer_decoder66_from39'/f'block{block-1}/output/output_device.f32')
-            if case=='from39_fp8' else
+    source=((offload/f'upsample66_{case.removesuffix("_fp8")}'/'merged_device.f32' if block==66 else
+             offload/f'peer_decoder66_{case.removesuffix("_fp8")}'/f'block{block-1}/output/output_device.f32')
+            if case in ('from39_fp8','from38_fp8') else
             ROOT/'build/upsample66_prefix_derived'/case/'merged_device.f32' if block==66
             else ROOT/'build/block66_peer_candidate'/case/'output'/'output_device.f32' if block==67
             else ROOT/'build'/f'decoder{block-1}_peer_candidate'/case/'output'/'output_device.f32')
@@ -85,7 +85,7 @@ def run(block=66,case='seeded',first_window=False,width=WIDTH,height=HEIGHT):
     peer=native[...,map32]
     padded=np.pad(peer,((py,hh-height-py),(px,ww-width-px),(0,0)))
     windows=padded.reshape(hh//8,8,ww//8,8,CHANNELS).transpose(0,2,1,3,4).reshape(-1,64,CHANNELS)
-    root=(offload/'peer_decoder66_from39'/f'block{block}' if case=='from39_fp8' else
+    root=(offload/f'peer_decoder66_{case.removesuffix("_fp8")}'/f'block{block}' if case in ('from39_fp8','from38_fp8') else
           ROOT/'build'/('block66_peer_first_window' if first_window else 'block66_peer_candidate')/case
           if block==66 else ROOT/'build'/f'decoder{block}_peer_candidate'/case)
     spatial=root/'spatial';save(spatial,dict(input=native,windows=windows))
@@ -122,7 +122,7 @@ def run(block=66,case='seeded',first_window=False,width=WIDTH,height=HEIGHT):
                 input_device_sha256=digest(source),output_device_sha256=digest(output_device),
                 basis_audit='build/peer_native_c32_basis_audit.json',
                 map_status='public QMMA C32 candidate in exact block66 transition basis; no native C32 body map oracle',
-                encoder_skips=('public same-image block4 skip' if case.startswith('image_') or case in ('from62_fp8','from56_fp8','from48_fp8','from39_fp8') else
+                encoder_skips=('public same-image block4 skip' if case.startswith('image_') or case in ('from62_fp8','from56_fp8','from48_fp8','from39_fp8','from38_fp8') else
                                'synthetic controls inherited from blocks48/56/62/66'),
                 original_kernel_executed=False,original_runtime_validation=False)
     (root/'manifest.json').write_text(json.dumps(report,indent=2)+'\n')
@@ -133,7 +133,7 @@ def run(block=66,case='seeded',first_window=False,width=WIDTH,height=HEIGHT):
 if __name__=='__main__':
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--block',type=int,choices=range(66,70),default=66)
-    p.add_argument('--case',choices=('seeded','zero','image_half','image_fp8','from62_fp8','from56_fp8','from48_fp8','from39_fp8'),default='seeded')
+    p.add_argument('--case',choices=('seeded','zero','image_half','image_fp8','from62_fp8','from56_fp8','from48_fp8','from39_fp8','from38_fp8'),default='seeded')
     p.add_argument('--first-window',action='store_true')
     p.add_argument('--width',type=int,default=WIDTH)
     p.add_argument('--height',type=int,default=HEIGHT)

@@ -6,6 +6,43 @@ skip, block48 merge, and blocks48–55. Its block55 bytes match the earlier
 independently extracted block55 boundary exactly. The ONNX model SHA256 is
 `7aa891c46f90f3d0a4539701ba009131ac333602634a62ad8675da90d0f8a173`.
 
+## Same-image AMD block39 boundary
+
+`tools/extract_peer_decoder39_inputs.py` extracts public ViT38, split-encoder30
+skip, block39 merge, and block39 output from the same optimized FP16 inference.
+The block39 bytes match the separate C512 extraction. The original block39
+record's 512×1024 projection has an exact 524,288-position raw-index relation
+to the public QMMA decoder in the candidate C1024/C512 channel basis.
+
+`tools/check_decoder39_peer_image.py` rounds those public inputs to FP8,
+runs the C1024→C512 projection and 8×8 upsample/skip merge on AMD, and passes
+three exact device/scalar stages. The output has 0.04418 mean absolute error
+and 0.99941 correlation against public FP16 block39. Its device bytes feed
+native-schedule C512 blocks40–47, block48, C256 blocks48–55, and the block56
+projection/skip merge. All their stages and handoffs pass exactly; block47
+vs public FP16 is 0.39551/0.96129 (MAE/correlation), block55 is
+0.71607/0.96112, and the block56 FP8 merge is 0.73472/0.97945.
+
+This path begins with public *logical* ViT38 and split-encoder30 tensors.
+Its block39 inverse-map test is an identity control; it does not validate the
+native physical ViT→C512 bridge or an AMD ViT/encoder run. The earlier 16×4
+decoder39 source-composed control still passes after extending the AMD test
+to the image's 4×4 ViT geometry.
+
+The separate `from38_fp8` continuation runs C128 blocks56–61, block62 with
+the public encoder8 skip, C64 blocks62–65, block66 with the public encoder4
+skip, C32 blocks66–69, and the 256² head. All candidate AMD/scalar stages and
+device handoffs pass exactly. Block69 vs public FP16 is 0.67469 mean absolute
+error and 0.99580 correlation; its device SHA256 is
+`a5ab9a67a38f268bcc115d2daabb04c335160aad1369cc92e3768447afc58e25`.
+All 1,024 head windows pass 12 exact checks each. The direct GPU-buffer merge
+and body (2,097,152 values each) and both RGB outputs (196,608 values each)
+also pass exactly. Public-gain blended RGB vs public FP16 final has 0.00429
+mean absolute error and 0.99936 correlation; the input-color baseline has
+0.00805 mean absolute error. The rendered image is finite and visually
+coherent. This is a same-image public-input candidate run, with no original
+NVIDIA kernel or production game wiring validated.
+
 ## Upstream C512 same-image boundary
 
 `tools/extract_peer_split512_inputs.py` extracts public block39 and blocks40–47
@@ -163,6 +200,27 @@ foreach ($b in 66..69) { & build/peer_onnx_venv/Scripts/python.exe tools/check_b
 & build/peer_onnx_venv/Scripts/python.exe tools/audit_peer_decoder66_tail.py --case from39_fp8
 & build/peer_onnx_venv/Scripts/python.exe tools/check_head70_peer_frame.py --latent-case from39_fp8 --output-root "$HOME\DLSS5FSR-build-offload\peer_head_frame_256_from39_fp8"
 & build/peer_onnx_venv/Scripts/python.exe tools/check_head70_peer_gpu_chain.py --latent-case from39_fp8 --frame-dir "$HOME\DLSS5FSR-build-offload\peer_head_frame_256_from39_fp8" --output-dir "$HOME\DLSS5FSR-build-offload\peer_head_frame_256_from39_fp8_connected_gpu"
+```
+
+For the newer block39 boundary, after the public extractions above:
+
+```powershell
+& build/peer_onnx_venv/Scripts/python.exe tools/extract_peer_decoder39_inputs.py
+& build/peer_onnx_venv/Scripts/python.exe tools/check_decoder39_peer_image.py
+& build/peer_onnx_venv/Scripts/python.exe tools/check_split512_peer_image.py --amd-block39
+& build/peer_onnx_venv/Scripts/python.exe tools/check_upsample48_peer_image.py --amd-block39
+& build/peer_onnx_venv/Scripts/python.exe tools/check_decoder48_55_peer_image.py --amd-block39
+& build/peer_onnx_venv/Scripts/python.exe tools/check_upsample56_peer_image.py --from38
+foreach ($b in 56..61) { & build/peer_onnx_venv/Scripts/python.exe tools/check_block56_candidate.py --case image_from38 --block $b --width 32 --height 32 }
+& build/peer_onnx_venv/Scripts/python.exe tools/audit_peer_decoder56_tail.py --case image_from38
+& build/peer_onnx_venv/Scripts/python.exe tools/check_upsample62_peer_image.py --case from38_fp8
+foreach ($b in 62..65) { & build/peer_onnx_venv/Scripts/python.exe tools/check_block62_candidate.py --case from38_fp8 --block $b --width 64 --height 64 }
+& build/peer_onnx_venv/Scripts/python.exe tools/audit_peer_decoder62_tail.py --case from38_fp8
+& build/peer_onnx_venv/Scripts/python.exe tools/check_upsample66_peer_image.py --case from38_fp8
+foreach ($b in 66..69) { & build/peer_onnx_venv/Scripts/python.exe tools/check_block66_peer_candidate.py --case from38_fp8 --block $b --width 128 --height 128 }
+& build/peer_onnx_venv/Scripts/python.exe tools/audit_peer_decoder66_tail.py --case from38_fp8
+& build/peer_onnx_venv/Scripts/python.exe tools/check_head70_peer_frame.py --latent-case from38_fp8 --output-root "$HOME\DLSS5FSR-build-offload\peer_head_frame_256_from38_fp8"
+& build/peer_onnx_venv/Scripts/python.exe tools/check_head70_peer_gpu_chain.py --latent-case from38_fp8 --frame-dir "$HOME\DLSS5FSR-build-offload\peer_head_frame_256_from38_fp8" --output-dir "$HOME\DLSS5FSR-build-offload\peer_head_frame_256_from38_fp8_connected_gpu"
 ```
 
 The scripts default their large C512 fixtures to a home-directory offload
