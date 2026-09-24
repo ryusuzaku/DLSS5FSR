@@ -611,3 +611,54 @@ or block48 prefix. The C256 runner also accepts `--prefix-root` and
 those custom locations. The small source tensors and reports stay under
 `build/`. The downstream `from39_fp8` case writes its large body fixtures to
 `$HOME\DLSS5FSR-build-offload` and small audit manifests to `build/`.
+
+## Captured game proxy: GPU input and full replay
+
+The diagnostic HIP input kernel consumes the staged proxy's pitched bytes and
+produces 256×256 interleaved linear RGB directly on the GPU. It implements the
+same center-square crop, pixel-center bilinear resize and sRGB decode as
+`tools/prepare_candidate_input.py`, for RGBA8 and R16G16B16A16 FP16. It is a
+candidate input contract, not a recovered NVIDIA frontend. The test harness
+checks every output against the CPU converter, emits the GPU tensor, and times
+200 warm-cache launches. On the captured 991×620 FP16 Cyberpunk proxy it
+reported 196,608 values, MAE `2.112e-9`, maximum absolute difference
+`5.960e-8`, zero values above `1e-6`, and `0.005177 ms` per kernel launch.
+The 1280×720 RGBA8 and FP16 synthetic captures also passed with maximum
+absolute difference `5.960e-8`. These timings exclude D3D/HIP synchronization,
+copies, inference and output presentation.
+
+The GPU tensor was supplied to the same hash-pinned public block4 boundary
+and the candidate encoder5–head70 offline chain. `tools/run_candidate_frame_from_capture.py`
+runs the eleven stages in order, verifies the prepared input digest and final
+head/direct-GPU provenance, saves per-stage logs, and supports `--start-at` for
+resuming a prior output tree. This full GPU-input replay completed in about
+214 seconds, with all declared candidate HIP/scalar and device-handoff checks
+passing. The public-gain blended output versus same-input public FP16 final
+had MAE `0.00444966`, correlation `0.999555`; the input baseline MAE was
+`0.00536301`. Its generated PNG is an offline preview, not the game's live
+neural output.
+
+The minute GPU/CPU input differences expose a precision sensitivity. Public
+FP16 final RGB changes by only MAE `0.0000619` between the two prepared inputs.
+Candidate public-gain blended RGB changes by MAE `0.0045683` (maximum
+`0.1772`), while native-gain blended RGB changes by MAE `0.0001683` (maximum
+`0.00618`). The first candidate FP8 boundary already changes 83 of 262,144
+block4 values, and subsequent candidate activations diverge. Repeating the
+head with identical GPU-input tensors yielded the same public-gain RGB hash;
+the difference comes from the changed upstream input. Public gain and FP8
+quantization therefore need numerical robustness checks before production use.
+This comparison establishes neither the original input contract nor native
+kernel parity.
+
+```powershell
+$env:ROCM_ROOT = '<installed ROCm SDK>'
+& 'C:\msys64\usr\bin\bash.exe' tools/build_candidate_input_256.sh
+& build/candidate_input_256_test.exe '<capture.bin>' '<prepared-directory>/color_linear.f32' '<gpu-output.f32>'
+& build/peer_onnx_venv/Scripts/python.exe tools/run_candidate_frame_from_capture.py '<prepared-directory>' --output-root '<spacious-directory>'
+```
+
+To replay the GPU bytes instead of the CPU-prepared bytes, place the emitted
+`.f32` in a copy of the prepared directory and update the copy's
+`color_linear_sha256` manifest field. Preserve the original capture digest;
+the source capture and proxy PNG do not change. Generated capture, model and
+frame files stay outside the public repository.

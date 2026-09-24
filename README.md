@@ -174,4 +174,33 @@ supplied by the public graph. The C256/C32 maps, ViT reduction/physical
 bridge, exact native input contract, and production full-frame timing remain
 unvalidated. The normal game still uses its earlier live 64-token path.
 
+The next diagnostic input stage has a standalone HIP implementation in
+`hip/mvp1/candidate_input_256.hip`. It reads the already-staged RGBA8 or FP16
+proxy directly from GPU memory and makes the same 256×256 center-square,
+bilinear, sRGB-to-linear RGB tensor as `prepare_candidate_input.py`. Build its
+test with `tools/build_candidate_input_256.sh`, then compare a capture with:
+
+```powershell
+& build/candidate_input_256_test.exe '<capture.bin>' '<prepared-directory>/color_linear.f32' '<output-device.f32>'
+```
+
+On the 991×620 FP16 Cyberpunk capture, all 196,608 floats were within
+`5.96e-8` of the CPU converter (MAE `2.11e-9`); 1280×720 RGBA8 and FP16
+harness captures also passed. Its roughly `0.0052 ms` warm-cache kernel timing
+excludes game synchronization, transfers, network inference, and presentation.
+The complete offline candidate can be replayed from a prepared input with
+`tools/run_candidate_frame_from_capture.py <prepared-directory> --output-root
+<spacious-directory>`; `--start-at <stage>` resumes at a named stage using
+existing prior-stage outputs.
+
+A full replay using the GPU-prepared game input passed all declared candidate
+HIP/scalar and direct head-buffer checks. The public-gain blended image had
+MAE `0.004450` against the same-input public FP16 final image (input baseline
+`0.005363`). The GPU and CPU preprocessors differ by at most one float32 ULP,
+yet public-gain candidate images differ by MAE `0.004568`; native-gain blended
+images differ by only `0.000168`. This sensitivity is an unresolved candidate
+gain/quantization issue, not a live-game quality result. The kernel is not yet
+wired into the shim, and its crop/color contract has not been checked against
+the original NVIDIA frontend.
+
 Source code here is experimental. No NVIDIA binaries or weights are bundled.
