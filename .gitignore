@@ -1,0 +1,42 @@
+# Public repository allowlist. Everything else in this working directory stays local.
+/*
+!/.gitignore
+!/README.md
+!/ASSET_ORACLE_HANDOFF.md
+!/ORIGINAL_MAP_VALIDATION.md
+!/build.sh
+!/src/
+!/hip/
+!/tools/
+!/tests/
+
+# Source trees only; generated binaries, captures, models and local settings
+# are deliberately never part of the public repository.
+/hip/*
+!/hip/mvp1/
+/tools/nv_probe/
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.exe
+**/*.dll
+**/*.obj
+**/*.lib
+**/*.pdb
+**/*.bin
+**/*.fp8
+**/*.f16
+**/*.f32
+**/*.npy
+**/*.npz
+**/*.onnx
+**/*.zip
+**/*.7z
+**/*.png
+**/*.bmp
+**/*.log
+**/*.csv
+**/*.json
+!tools/**/*.json
+/hip/mvp1/rw_yp*golden.inc
+/src/ngx/shaders/*_cs.h

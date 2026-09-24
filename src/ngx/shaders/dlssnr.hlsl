@@ -1,0 +1,377 @@
+// Neural Rendering's colour pipeline: one shader, three modes.
+//
+//   Encode     the frame -> a tone-mapped proxy the model can be shown, plus an
+//              untouched copy to transfer the answer back onto
+//   Resolve    proxy + the model's answer + the untouched copy -> the finished frame
+//   Downsample the proxy -> a smaller proxy, when the model is asked to work
+//              below full resolution
+//
+// Ported from the reference mod's ref/shaders/dlssnr.hlsl, which is itself the
+// precompiled form of ref/dlssnr/DlssNr_Codec.h. The composition is RenoDX's;
+// see the attribution block below and Licenses/RenoDX_LICENSE.txt.
+//
+// Deviations from the reference, and why:
+//
+//   * Constants are root constants (b0), not a CBV. The reference needs one
+//     constant buffer per descriptor heap because three dispatches recorded on
+//     one command list all map and overwrite a single upload buffer before any
+//     of them runs -- encode and downsample end up reading the resolve's
+//     parameters. Root constants are copied into the command stream, so the bug
+//     cannot exist. It also removes the 256-byte CBV alignment trap entirely.
+//
+//   * The compare modes (side by side, wipe) are kept. They cost nothing and
+//     they are the only way to eyeball this on hardware before there is a model.
+//
+//   * t3 (motion) and t4 (previous edit) are declared and bound but not read.
+//     The reference binds them for the same reason: temporal accumulation of the
+//     edit is designed but not implemented, and leaving the slots in the table
+//     means adding it later does not change the root signature.
+
+cbuffer Params : register(b0)
+{
+    uint  gMode;             // 0 encode, 1 resolve, 2 downsample
+    float gWhitePoint;
+    uint  gWidth;
+    uint  gHeight;
+    float gTransferStrength;
+    float gColourStrength;
+    uint  gDebugView;        // 0 off, 1 proxy, 2 model, 3 amplified difference
+    float gMaxRatio;
+    uint  gPassthrough;      // 1 = the frame is already display-encoded
+    float gMvScaleX;         // motion vector units -> pixels of this dispatch
+    float gMvScaleY;
+    uint  gGuideWidth;       // the motion texture's valid region
+    uint  gGuideHeight;
+    uint  gCompareMode;      // 0 off, 1 side by side, 2 wipe
+    float gCompareSplit;     // where the wipe cuts, 0..1
+    float gCompareZoom;      // side by side: 1 fits the frame, 2 fills the half
+    uint  gCompareSwap;      // put the edited frame on the other side
+    uint  gProxyMode;        // proxy curve: 0 soft knee, 1 hybrid, 2 scale+encode
+    uint  gPad1;
+    uint  gPad2;
+};
+
+// Colours outside the AP1 gamut are impossible on any display and read as sparkle where a bright
+// saturated pixel is pushed further. Clamping inside AP1 and coming back keeps everything reachable.
+float3 ClampAp1(float3 color)
+{
+    const float3x3 bt709_to_ap1 = { 0.613097, 0.339523, 0.047379,
+                                    0.070194, 0.916354, 0.013452,
+                                    0.020616, 0.109570, 0.869815 };
+    const float3x3 ap1_to_bt709 = { 1.705051, -0.621792, -0.083259,
+                                    -0.130256, 1.140805, -0.010548,
+                                    -0.024003, -0.128969, 1.152972 };
+    return mul(ap1_to_bt709, max(mul(bt709_to_ap1, color), float3(0.0, 0.0, 0.0)));
+}
+
+// ---------------------------------------------------------------------------------------------
+// The composition below (UpgradeToneMap's two-branch ratio, the OkLab hue correction, and the blend
+// between a luminance-only result and the model's own colour) is taken from RenoDX's DLSS 5 addon by
+// clshortfuse -- https://github.com/clshortfuse/renodx. It is their design, not ours; see
+// Licenses/RenoDX_LICENSE.txt. The OkLab matrices are Bjorn Ottosson's published constants and the
+// AP1, sRGB and PQ transforms are standard colour science.
+// ---------------------------------------------------------------------------------------------
+
+// OkLab, so the model's colour can be reached without its hue being invented on the way. A ratio
+// applied to an RGB triple does not move hue, but a difference added to one does -- which is what the
+// old composition did, and why a warm subject could come back green. Here the result's chroma is
+// rebuilt in the model's own hue direction and only its magnitude is taken from the scaled colour.
+float3 CbrtSigned(float3 v) { return sign(v) * pow(abs(v), 1.0 / 3.0); }
+
+float3 ToOkLab(float3 color)
+{
+    const float3x3 rgb_to_lms = { 0.4122214708, 0.5363325363, 0.0514459929,
+                                  0.2119034982, 0.6806995451, 0.1073969566,
+                                  0.0883024619, 0.2817188376, 0.6299787005 };
+    const float3x3 lms_to_lab = { 0.2104542553, 0.7936177850, -0.0040720468,
+                                  1.9779984951, -2.4285922050, 0.4505937099,
+                                  0.0259040371, 0.7827717662, -0.8086757660 };
+    return mul(lms_to_lab, CbrtSigned(mul(rgb_to_lms, color)));
+}
+
+float3 FromOkLab(float3 lab)
+{
+    const float3x3 lab_to_lms = { 1.0, 0.3963377774, 0.2158037573,
+                                  1.0, -0.1055613458, -0.0638541728,
+                                  1.0, -0.0894841775, -1.2914855480 };
+    const float3x3 lms_to_rgb = { 4.0767416621, -3.3077115913, 0.2309699292,
+                                  -1.2684380046, 2.6097574011, -0.3413193965,
+                                  -0.0041960863, -0.7034186147, 1.7076147010 };
+    float3 lms = mul(lab_to_lms, lab);
+    return mul(lms_to_rgb, lms * lms * lms);
+}
+
+// Takes the hue and the chroma direction from `correct`, and only the chroma magnitude from
+// `incorrect`. Scaling a colour by a luminance ratio changes how saturated it reads; this puts the
+// saturation back where the model meant it without letting the hue drift.
+float3 HueOkLab(float3 incorrect, float3 correct)
+{
+    float3 incorrectLab = ToOkLab(incorrect);
+    const float3 correctLab = ToOkLab(correct);
+    const float incorrectChroma = length(incorrectLab.yz);
+    const float correctChroma = length(correctLab.yz);
+    incorrectLab.yz = correctLab.yz * (correctChroma == 0.0 ? 1.0 : incorrectChroma / correctChroma);
+    return ClampAp1(FromOkLab(incorrectLab));
+}
+
+Texture2D<float4>   gSource   : register(t0);  // encode: the frame. resolve: the proxy.
+Texture2D<float4>   gModel    : register(t1);  // resolve: what the model returned.
+Texture2D<float4>   gOriginal : register(t2);  // resolve: the untouched frame.
+Texture2D<float4>   gMotion   : register(t3);  // resolve, accumulating: the game's motion vectors.
+Texture2D<float4>   gPrevEdit : register(t4);  // resolve, accumulating: last frame's edit.
+RWTexture2D<float4> gTarget   : register(u0);  // encode: the proxy. resolve: the frame.
+RWTexture2D<float4> gKeep     : register(u1);  // encode: the untouched copy. resolve: the edit history.
+SamplerState        gLinear   : register(s0);  // so the edit can be read at a different size
+
+static const float3 kLuma = float3(0.2126, 0.7152, 0.0722);
+
+// sRGB rather than a plain 2.2 power: it is what an SDR game buffer actually carries, and the model was
+// trained on those.
+float3 LinearToSrgb(float3 v)
+{
+    v = saturate(v);
+    return lerp(v * 12.92, 1.055 * pow(max(v, 1e-8), 1.0 / 2.4) - 0.055, step(0.0031308, v));
+}
+
+float3 SrgbToLinear(float3 v)
+{
+    v = saturate(v);
+    return lerp(v / 12.92, pow((v + 0.055) / 1.055, 2.4), step(0.04045, v));
+}
+
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= gWidth || id.y >= gHeight)
+        return;
+
+    // Normalised, so the source may be any size relative to this dispatch.
+    float2 uv = (float2(id.xy) + 0.5) / float2(gWidth, gHeight);
+
+    if (gMode == 2)
+    {
+        gTarget[id.xy] = gSource.SampleLevel(gLinear, uv, 0);
+        return;
+    }
+
+    if (gMode == 0)
+    {
+        float4 source = gSource.Load(int3(id.xy, 0));
+        float3 frame = max(source.rgb, float3(0.0, 0.0, 0.0));
+
+        // Kept so the resolve has the frame as it was, rather than having to reconstruct it.
+        gKeep[id.xy] = float4(frame, source.a);
+
+        // Some games hand DLSS a frame that has already been through their tonemapper. The game says
+        // which in its own DLSS creation flags, and converting one that needs no conversion is pure
+        // damage, so it goes through untouched.
+        if (gPassthrough != 0)
+        {
+            gTarget[id.xy] = float4(frame, source.a);
+            return;
+        }
+
+        // What the model is shown: the frame scaled by the white point and encoded. Tone mapping it
+        // here as well would show the model a doubly compressed image -- the game is going to tone map
+        // this picture later. Measured against Cyberpunk's own numbers, a Reinhard proxy handed the
+        // model a scene value of 1.0 as 0.55 and 1.5 as 0.64: flat, dark, and nothing like the
+        // finished frame it was trained on.
+        float3 display = frame / max(gWhitePoint, 1e-4);
+
+        // -----------------------------------------------------------------------------------------
+        // The proxy curve. 2 is the default and the one the model should be shown: the frame is
+        // scaled and encoded and nothing else. Tone mapping it here as well would show the model a
+        // doubly compressed image -- the game is going to tone map this picture later.
+        //
+        // A curve that flattens highlights is worse than useless: a bright scene becomes a field of
+        // flat white whose blown pixels flip between frames, and unstable input is unstable output.
+        // But the proxy is RGBA8 and cannot carry anything above white either. The resolution is that
+        // a bounded proxy costs no highlight detail, because the resolve hands the headroom back on
+        // the way out -- it restores max(0, originalLuma - proxyLuma) on top of the model's answer.
+        // So the encode is free to roll instead of clip, and mode 2 needs no roll at all.
+        //
+        //   0  the old soft knee -- kept so the two can be compared on hardware
+        //   1  hybrid: identity through the midtones, a reversible roll above. 1/(1+x) rather than
+        //      exp(-x), because an algebraic curve has an exact inverse and no flat region to
+        //      quantise into -- which is what keeps a bright frame from boiling between frames
+        //   2  scale and encode only (default). Values above white clip; the resolve restores them
+        float displayLuma = dot(display, kLuma);
+
+        if (gProxyMode == 0)
+        {
+            if (displayLuma > 0.75)
+            {
+                float rolled = 0.75 + 0.25 * (1.0 - exp(-(displayLuma - 0.75) / 0.25));
+                display *= rolled / displayLuma;
+            }
+        }
+        else if (gProxyMode == 1)
+        {
+            // Identity below the knee; above it a roll towards 1.0 that never flattens a plateau.
+            // Exact inverse: over = t * head / (head - t), t = rolled - knee, head = 1 - knee.
+            const float kKnee = 0.75;
+            if (displayLuma > kKnee)
+            {
+                const float kHead = 1.0 - kKnee;
+                float over = displayLuma - kKnee;
+                float rolled = kKnee + kHead * over / (over + kHead);
+                display *= rolled / displayLuma;
+            }
+        }
+
+        gTarget[id.xy] = float4(LinearToSrgb(display), source.a);
+        return;
+    }
+
+    // Comparison, decided before anything is read, because side by side changes which part of the
+    // frame this pixel is showing rather than just which version of it.
+    //
+    //   1  side by side  each half carries the whole frame, so both are squeezed horizontally
+    //   2  wipe          one frame cut at the split, nothing resampled
+    float2 cmpUv = uv;
+    bool showOriginal = false;
+    bool onDivider = false;
+    bool outsideFrame = false;
+
+    if (gCompareMode == 1)
+    {
+        showOriginal = (uv.x < 0.5) != (gCompareSwap != 0);
+
+        // Each half is half as wide as the frame and just as tall, so the frame cannot fill it and
+        // keep its shape. Fitting it properly leaves the halves letterboxed, which is the honest way
+        // round: a comparison that changes the shape of what it is comparing is not showing you the
+        // picture. Zoom decides which is given up -- at 1 the whole frame is there at its right
+        // proportions with bars above and below, at 2 the half is filled and the sides are cropped.
+        float2 half2 = float2(uv.x < 0.5 ? uv.x * 2.0 : (uv.x - 0.5) * 2.0, uv.y) - 0.5;
+        cmpUv = float2(0.5 + half2.x / gCompareZoom, 0.5 + half2.y * 2.0 / gCompareZoom);
+
+        outsideFrame = cmpUv.x < 0.0 || cmpUv.x > 1.0 || cmpUv.y < 0.0 || cmpUv.y > 1.0;
+        onDivider = abs(uv.x - 0.5) < (1.0 / max(gWidth, 1u));
+    }
+    else if (gCompareMode == 2)
+    {
+        showOriginal = (uv.x < gCompareSplit) != (gCompareSwap != 0);
+        onDivider = abs(uv.x - gCompareSplit) < (1.0 / max(gWidth, 1u));
+    }
+
+    // Sampled rather than loaded: when the model ran at a reduced resolution these are smaller than the
+    // frame, and its edit is enlarged here while the frame underneath stays untouched.
+    float4 proxySample = gSource.SampleLevel(gLinear, cmpUv, 0);
+    float4 modelSample = gModel.SampleLevel(gLinear, cmpUv, 0);
+
+    // Nothing was encoded on the way in, so nothing is decoded here either.
+    float3 proxy = gPassthrough != 0 ? proxySample.rgb : SrgbToLinear(proxySample.rgb);
+    float3 model = gPassthrough != 0 ? modelSample.rgb : SrgbToLinear(modelSample.rgb);
+    float4 originalSample = gCompareMode == 1 ? gOriginal.SampleLevel(gLinear, cmpUv, 0)
+                                              : gOriginal.Load(int3(id.xy, 0));
+
+    // All three pictures have to share a scale before their luminances can be compared. The proxy and
+    // the model come back from an sRGB decode, so they sit in 0..1 where 1 is the white point; the
+    // frame is raw linear and runs well past that. Comparing them unnormalised is a real bug and it
+    // reads exactly like the model has stopped adding detail: with the frame several times larger,
+    // the shadow branch never fires, every pixel takes the highlight branch, and the clamp flattens
+    // the result to a near-constant scale. Colour still moves, because that comes from the model's
+    // own hue, which is what makes the failure so confusing to look at.
+    const float normScale = gPassthrough != 0 ? 1.0 : max(gWhitePoint, 1e-4);
+    float3 original = originalSample.rgb / normScale;
+
+    float originalLuma = dot(original, kLuma);
+    float proxyLuma = dot(proxy, kLuma);
+
+    if (gDebugView == 1)
+    {
+        gTarget[id.xy] = float4(proxy * gWhitePoint, originalSample.a);
+        return;
+    }
+
+    if (gDebugView == 2)
+    {
+        gTarget[id.xy] = float4(model * gWhitePoint, originalSample.a);
+        return;
+    }
+
+    float3 edit = model - proxy;
+
+    // Coring was tried here and removed: the per-frame churn's amplitude overlaps the real detail's,
+    // so an amplitude threshold cannot separate them -- it only relocated the noise to the threshold.
+
+    if (gDebugView == 3)
+    {
+        // Amplified and centred on grey, so both directions of the edit are visible at once.
+        float3 shown = saturate(0.5 + edit * 20.0);
+        gTarget[id.xy] = float4(SrgbToLinear(shown) * gWhitePoint, originalSample.a);
+        return;
+    }
+
+    // The composition. The model's answer is not treated as a difference to add onto the frame -- it
+    // is a complete picture in its own right, and it is brought back by rescaling it to sit where the
+    // original's luminance says it should. Adding a difference is what let colour run away: nothing
+    // bounded where the sum landed, so a warm subject could arrive green. Here both ends of every
+    // blend are well-formed pictures, so everything between them is one too.
+    float modelLuma = dot(model, kLuma);
+    float3 upgraded;
+
+    if (modelLuma <= 1e-5)
+    {
+        // The model can return an empty frame for an input it cannot read. Rescaling that collapses
+        // the picture to black, so the frame is handed back untouched instead.
+        upgraded = original;
+    }
+    else
+    {
+        float ratio;
+
+        if (originalLuma < proxyLuma)
+        {
+            // Below what the proxy showed: the frame's own luminance is the target.
+            ratio = originalLuma / max(proxyLuma, 1e-6);
+        }
+        else
+        {
+            // Above it, the difference is headroom the proxy could not represent -- brightness the
+            // frame really has and the model never saw. It is handed back on top of the model's own
+            // answer rather than scaled away, which is what kept highlights from being muted.
+            ratio = (modelLuma + max(0.0, originalLuma - proxyLuma)) / modelLuma;
+        }
+
+        upgraded = lerp(original, HueOkLab(model * ratio, model), gTransferStrength);
+    }
+
+    // Transfer strength decides how much of the model's picture is reached at all; colour strength
+    // decides whether its colour comes with it. At 0 the frame keeps the game's own hue exactly and
+    // only its light carries the model's verdict; at 1 the model's colour arrives as well.
+    float upgradedLuma = dot(upgraded, kLuma);
+
+    // A ratio against a dark pixel is unbounded, and clamping it is not the same as taming it.
+    //
+    // In linear light divided by paper white a shadowed pixel sits around a thousandth, so a tiny
+    // absolute edit from the model becomes an enormous ratio, hits the clamp, and doubles that
+    // pixel's brightness. The next frame it lands slightly differently and the pixel drops back.
+    // That is the boiling: patches of lighter colour crawling over otherwise still geometry, worst
+    // where the picture is darkest.
+    //
+    // Adding the same floor above and below leaves bright pixels alone -- where luminance is far
+    // larger than the floor the term vanishes -- while making the ratio fall smoothly to one as
+    // luminance approaches zero. No edit at all is the right answer for a pixel with no light in it.
+    const float kRatioFloor = 1.0 / 512.0;
+    float lumaRatio = clamp((upgradedLuma + kRatioFloor) / (originalLuma + kRatioFloor), 0.0, gMaxRatio);
+    float3 result = lerp(original * lumaRatio, upgraded, gColourStrength);
+
+    // Back out of the normalised space the composition worked in.
+    result *= normScale;
+
+    // The side being shown untouched takes the frame as it arrived, past every step above.
+    if (showOriginal)
+        result = originalSample.rgb;
+
+    // The letterbox. The sampler clamps rather than wrapping, so without this the bars would be the
+    // frame's edge row smeared down the screen.
+    if (outsideFrame)
+        result = float3(0.0, 0.0, 0.0);
+
+    // A hairline so the two sides are never mistaken for one picture.
+    if (onDivider)
+        result = float3(gWhitePoint, gWhitePoint, gWhitePoint);
+
+    gTarget[id.xy] = float4(max(result, float3(0.0, 0.0, 0.0)), originalSample.a);
+}

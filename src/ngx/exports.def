@@ -1,0 +1,78 @@
+; Undecorated exports. A game links nvngx.lib, which imports these exact
+; names, so C++ decoration must not leak out -- hence the .def rather than
+; __declspec(dllexport).
+LIBRARY nvngx
+EXPORTS
+    NVSDK_NGX_D3D11_Init
+    NVSDK_NGX_D3D11_Init_Ext
+    NVSDK_NGX_D3D11_Init_with_ProjectID
+    NVSDK_NGX_D3D11_Shutdown
+    NVSDK_NGX_D3D11_Shutdown1
+    NVSDK_NGX_D3D11_GetParameters
+    NVSDK_NGX_D3D11_AllocateParameters
+    NVSDK_NGX_D3D11_GetCapabilityParameters
+    NVSDK_NGX_D3D11_DestroyParameters
+    NVSDK_NGX_D3D11_GetScratchBufferSize
+    NVSDK_NGX_D3D11_CreateFeature
+    NVSDK_NGX_D3D11_ReleaseFeature
+    NVSDK_NGX_D3D11_GetFeatureRequirements
+    NVSDK_NGX_D3D11_EvaluateFeature
+    NVSDK_NGX_D3D11_EvaluateFeature_C
+    NVSDK_NGX_D3D12_Init
+    NVSDK_NGX_D3D12_Init_Ext
+    NVSDK_NGX_D3D12_Init_with_ProjectID
+    NVSDK_NGX_D3D12_Shutdown
+    NVSDK_NGX_D3D12_Shutdown1
+    NVSDK_NGX_D3D12_GetParameters
+    NVSDK_NGX_D3D12_AllocateParameters
+    NVSDK_NGX_D3D12_GetCapabilityParameters
+    NVSDK_NGX_D3D12_DestroyParameters
+    NVSDK_NGX_D3D12_GetScratchBufferSize
+    NVSDK_NGX_D3D12_CreateFeature
+    NVSDK_NGX_D3D12_ReleaseFeature
+    NVSDK_NGX_D3D12_GetFeatureRequirements
+    NVSDK_NGX_D3D12_EvaluateFeature
+    NVSDK_NGX_D3D12_EvaluateFeature_C
+    NVSDK_NGX_CUDA_Init
+    NVSDK_NGX_CUDA_Init_with_ProjectID
+    NVSDK_NGX_CUDA_Shutdown
+    NVSDK_NGX_CUDA_GetParameters
+    NVSDK_NGX_CUDA_AllocateParameters
+    NVSDK_NGX_CUDA_GetCapabilityParameters
+    NVSDK_NGX_CUDA_DestroyParameters
+    NVSDK_NGX_CUDA_GetScratchBufferSize
+    NVSDK_NGX_CUDA_CreateFeature
+    NVSDK_NGX_CUDA_ReleaseFeature
+    NVSDK_NGX_CUDA_EvaluateFeature
+    NVSDK_NGX_CUDA_EvaluateFeature_C
+    NVSDK_NGX_UpdateFeature
+    GetNGXResultAsString
+    NVSDK_NGX_Parameter_SetULL
+    NVSDK_NGX_Parameter_SetF
+    NVSDK_NGX_Parameter_SetD
+    NVSDK_NGX_Parameter_SetUI
+    NVSDK_NGX_Parameter_SetI
+    NVSDK_NGX_Parameter_SetD3d11Resource
+    NVSDK_NGX_Parameter_SetD3d12Resource
+    NVSDK_NGX_Parameter_SetVoidPointer
+    NVSDK_NGX_Parameter_GetULL
+    NVSDK_NGX_Parameter_GetF
+    NVSDK_NGX_Parameter_GetD
+    NVSDK_NGX_Parameter_GetUI
+    NVSDK_NGX_Parameter_GetI
+    NVSDK_NGX_Parameter_GetD3d11Resource
+    NVSDK_NGX_Parameter_GetD3d12Resource
+    NVSDK_NGX_Parameter_GetVoidPointer
+
+; DLSS-NR forwarder interface (see Dagherbou/OptiScaler_DLSSNR). OptiScaler's
+; DlssNrFeature loads nvngx.dll_dlssnr.dll and requires these in addition to
+; the four NGX D3D12 entry points above; without them it reports "the
+; forwarder is missing its exports" and never calls us.
+    dlssnr_call_set_float_slot
+    dlssnr_call_probe_float
+    dlssnr_call_last_init DATA
+    dlssnr_call_last_create DATA
+    dlssnr_call_create
+    dlssnr_call_evaluate
+    dlssnr_call_set_extras
+    dlssnr_call_release
