@@ -134,10 +134,12 @@ an exact substitute for the linear `.f32` boundary.
 Set `CandidateInputCaptureTrigger=1` to wait for a file named
 `<capture.bin>.go` before capturing; create that file once the desired scene
 is visible. The shim removes the trigger after saving the capture.
-`tools/run_candidate_encoder64_from_capture.py <prepared-directory>` can then
-extract the pinned public FP16 block-4 boundary from that input and run
-candidate HIP encoder blocks 5–8, checking each stage and device handoff.
-This is an offline partial chain: blocks 0–4 are still supplied by the public
-model, and it does not display a scene-reactive result in the game.
+`tools/run_candidate_encoder64_from_capture.py <prepared-directory>
+--through-block14` can then extract the pinned public FP16 block-4 boundary
+from that input and run candidate HIP encoder blocks 5–14, including the
+measured block-8 downsample, checking each stage and device handoff. Omit the
+flag to stop at block 8. This is an offline partial chain: blocks 0–4 are
+still supplied by the public model, and it does not display a scene-reactive
+result in the game.
 
 Source code here is experimental. No NVIDIA binaries or weights are bundled.
