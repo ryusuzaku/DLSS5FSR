@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Run public block-4 entry and candidate AMD encoder blocks 5-14 on a capture.
+"""Run public block-4 entry and candidate AMD encoder blocks 5-22 on a capture.
 
 The public optimized FP16 ONNX graph supplies only the upstream block-4
-boundary. Blocks 5-14 run through the existing HIP/scalar candidate checks.
+boundary. Blocks 5-22 run through the existing HIP/scalar candidate checks.
 This is offline, not a live game network or an original-kernel oracle.
 """
 
@@ -19,11 +19,13 @@ import onnxruntime as ort
 from audit_peer_native_c32_basis import peer_to_native_multihead
 from check_block62_candidate import ROOT, run as run_block
 from check_block56_candidate import run as run_c128
+from check_decoder49_candidate import run as run_c256
 from check_c256_ffn_candidate import H, bits
 from check_split512_peer_image import metrics
 from decode_tinlayout_global import e4m3fn
 from extract_peer_encoder64_inputs import NODES as C64_NODES
 from extract_peer_encoder128_inputs import NODES as C128_NODES
+from extract_peer_encoder256_inputs import NODES as C256_NODES
 from extract_peer_preblock0_skip import MODEL, MODEL_SHA256
 from native_split_reference import F
 from native_c64_reference import multiply
@@ -33,13 +35,16 @@ def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-def run(prepared_dir, output_root, last_block=8, through_block14=False):
+def run(prepared_dir, output_root, last_block=8, through_block14=False,
+        through_block22=False):
     prepared_dir = Path(prepared_dir).resolve()
     output_root = Path(output_root).resolve()
     if last_block not in range(5, 9):
         raise ValueError('last block must be 5..8')
-    if through_block14 and last_block != 8:
+    if (through_block14 or through_block22) and last_block != 8:
         raise ValueError('C128 continuation needs candidate block8 downsample')
+    if through_block22:
+        through_block14 = True
     prepared_path = prepared_dir / 'manifest.json'
     prepared = json.loads(prepared_path.read_text())
     color_path = prepared_dir / 'color_linear.f32'
@@ -57,13 +62,18 @@ def run(prepared_dir, output_root, last_block=8, through_block14=False):
     nodes = dict(C64_NODES)
     if through_block14:
         nodes.update({k: v for k, v in C128_NODES.items() if k != 'block8_down'})
-    branch_path = public_dir / ('encoder4_14.onnx' if through_block14 else 'encoder4_8.onnx')
+    if through_block22:
+        nodes.update({k: v for k, v in C256_NODES.items() if k != 'block14_down'})
+    branch_path = public_dir / ('encoder4_22.onnx' if through_block22 else
+                                'encoder4_14.onnx' if through_block14 else
+                                'encoder4_8.onnx')
     onnx.utils.extract_model(str(MODEL), str(branch_path), ['rgb'], list(nodes.values()))
     session = ort.InferenceSession(str(branch_path), providers=['CPUExecutionProvider'])
     arrays = session.run(None, {'rgb': rgb.transpose(2, 0, 1)[None]})
     public = {}
     for (name, _), array in zip(nodes.items(), arrays):
-        shape = ((1, 16, 16, 256) if name == 'block14_down' else
+        shape = ((1, 8, 8, 512) if name == 'block22_down' else
+                 (1, 16, 16, 256) if name in C256_NODES else
                  (1, 32, 32, 128) if name in C128_NODES else
                  (1, 64, 64, 64))
         if array.shape != shape or not np.isfinite(array).all():
@@ -172,6 +182,118 @@ def run(prepared_dir, output_root, last_block=8, through_block14=False):
             previous = result
             print(f"block{block}: MAE {comparison['mae']:.7g}, corr {comparison['correlation']:.7g}",
                   flush=True)
+    c128_final = previous if c128_blocks else None
+    downsample14 = None
+    c256_blocks = []
+    downsample22 = None
+    if through_block22:
+        stage = json.loads((output_root / 'block14/manifest.json').read_text())
+        raw_path = output_root / 'block14/raw_output/output_device.f32'
+        if (digest(raw_path) != stage['raw_output_device_sha256'] or
+                digest(c128_final) != stage['output_device_sha256']):
+            raise AssertionError('block14 raw/skip device ancestry differs')
+        records = {r['name']: r for r in
+                   json.loads((ROOT / 'dlss5-analysis/model.resolved.json').read_text())['tensors']}
+        index = records['block14.layer0.layer']['index']
+        tensor = ROOT / 'dlss5-analysis/tensors' / f'tensor_{index:03d}.bin'
+        data = np.fromfile(tensor, np.uint8)
+        if data.size != 229936 or data.size - 0x30230 != 32768:
+            raise ValueError('wrong block14 downsample tensor extent')
+        positions = np.arange(2 * 128 * 128, dtype=np.int32)
+        inputs = bits(len(positions), [1, 0, 4, 5, 2, 13, 14])
+        outputs = bits(len(positions), [3, 6, 7, 8, 9, 10, 11, 12])
+        if np.unique(outputs * 128 + inputs).size != len(positions):
+            raise ValueError('measured block14 downsample map collides')
+        matrix = np.empty((256, 128), np.float32)
+        matrix[outputs, inputs] = e4m3fn(data[0x30230:])
+        raw = np.fromfile(raw_path, '<f4').reshape(32, 32, 128)
+        rows_top = H(raw[::2, ::2] + raw[::2, 1::2])
+        rows_bottom = H(raw[1::2, ::2] + raw[1::2, 1::2])
+        pool = F(H(H(rows_top + rows_bottom) * np.float32(.25)))
+        output = F(multiply(pool.reshape(256, 128), matrix)).reshape(16, 16, 256)
+        if not np.isfinite(output).all():
+            raise ValueError('nonfinite candidate block14 downsample')
+        down = output_root / 'downsample14'
+        down.mkdir(exist_ok=True)
+        for name, array in dict(raw=raw, pool=pool, matrix=matrix, output=output).items():
+            np.asarray(array, '<f4').tofile(down / f'{name}.f32')
+        subprocess.run([str(ROOT / 'build/encoder128_downsample_test.exe'),
+                        str(down), '32', '32'], cwd=ROOT, check=True)
+        if ((down / 'pool_device.f32').read_bytes() != (down / 'pool.f32').read_bytes() or
+                (down / 'output_device.f32').read_bytes() != (down / 'output.f32').read_bytes()):
+            raise AssertionError('candidate block14 downsample HIP/scalar differs')
+        p256 = peer_to_native_multihead(np.arange(256))
+        downsample14 = dict(raw_device_sha256=digest(raw_path),
+                            output_device_sha256=digest(down / 'output_device.f32'),
+                            tensor_sha256=digest(tensor),
+                            candidate_vs_public_fp16=metrics(output[..., p256],
+                                                               public['block14_down']),
+                            hip_scalar_exact=True,
+                            map='measured C128 downsample address bits')
+        boundary14 = output_root / 'boundary14'
+        boundary14.mkdir(exist_ok=True)
+        previous = boundary14 / 'output_device.f32'
+        previous.write_bytes((down / 'output_device.f32').read_bytes())
+        (boundary14 / 'output.f32').write_bytes(previous.read_bytes())
+        for block in range(15, 23):
+            input_sha = digest(previous)
+            result = run_c256(block, previous, width=16, height=16,
+                              output_root=output_root / f'block{block}')
+            stage = json.loads((result.parents[1] / 'manifest.json').read_text())
+            if (stage['input_device_sha256'] != input_sha or
+                    stage['output_device_sha256'] != digest(result)):
+                raise AssertionError(f'candidate block{block} handoff differs')
+            answer = np.fromfile(result, '<f4').reshape(16, 16, 256)
+            reference_name = 'block22_skip' if block == 22 else f'block{block}'
+            comparison = metrics(answer[..., p256], public[reference_name])
+            c256_blocks.append(dict(block=block, input_device_sha256=input_sha,
+                                    output_device_sha256=digest(result),
+                                    candidate_vs_public_fp16=comparison,
+                                    hip_scalar_exact=True))
+            previous = result
+            print(f"block{block}: MAE {comparison['mae']:.7g}, corr {comparison['correlation']:.7g}",
+                  flush=True)
+        stage = json.loads((output_root / 'block22/manifest.json').read_text())
+        raw_path = output_root / 'block22/raw_output/output_device.f32'
+        if (digest(raw_path) != stage['raw_output_device_sha256'] or
+                digest(previous) != stage['output_device_sha256']):
+            raise AssertionError('block22 raw/skip device ancestry differs')
+        index = records['block22.layer0.layer']['index']
+        tensor = ROOT / 'dlss5-analysis/tensors' / f'tensor_{index:03d}.bin'
+        data = np.fromfile(tensor, np.uint8)
+        if data.size != 820288 or data.size - 0xa8440 != 131072:
+            raise ValueError('wrong block22 downsample tensor extent')
+        positions = np.arange(2 * 256 * 256, dtype=np.int32)
+        inputs = bits(len(positions), [1, 0, 4, 5, 2, 14, 15, 16])
+        outputs = bits(len(positions), [3, 6, 7, 8, 9, 10, 11, 12, 13])
+        if np.unique(outputs * 256 + inputs).size != len(positions):
+            raise ValueError('candidate block22 downsample map collides')
+        matrix = np.empty((512, 256), np.float32)
+        matrix[outputs, inputs] = e4m3fn(data[0xa8440:])
+        raw = np.fromfile(raw_path, '<f4').reshape(16, 16, 256)
+        rows_top = H(raw[::2, ::2] + raw[::2, 1::2])
+        rows_bottom = H(raw[1::2, ::2] + raw[1::2, 1::2])
+        pool = F(H(H(rows_top + rows_bottom) * np.float32(.25)))
+        output = F(multiply(pool.reshape(64, 256), matrix)).reshape(8, 8, 512)
+        if not np.isfinite(output).all():
+            raise ValueError('nonfinite candidate block22 downsample')
+        down = output_root / 'downsample22'
+        down.mkdir(exist_ok=True)
+        for name, array in dict(raw=raw, pool=pool, matrix=matrix, output=output).items():
+            np.asarray(array, '<f4').tofile(down / f'{name}.f32')
+        subprocess.run([str(ROOT / 'build/encoder256_downsample_test.exe'),
+                        str(down), '16', '16'], cwd=ROOT, check=True)
+        if ((down / 'pool_device.f32').read_bytes() != (down / 'pool.f32').read_bytes() or
+                (down / 'output_device.f32').read_bytes() != (down / 'output.f32').read_bytes()):
+            raise AssertionError('candidate block22 downsample HIP/scalar differs')
+        p512 = peer_to_native_multihead(np.arange(512))
+        downsample22 = dict(raw_device_sha256=digest(raw_path),
+                            output_device_sha256=digest(down / 'output_device.f32'),
+                            tensor_sha256=digest(tensor),
+                            candidate_vs_public_fp16=metrics(output[..., p512],
+                                                               public['block22_down']),
+                            hip_scalar_exact=True,
+                            map='C256 candidate map extension')
     report = dict(source_capture_sha256=prepared['source_capture_sha256'],
                   prepared_manifest_sha256=digest(prepared_path),
                   color_linear_sha256=digest(color_path),
@@ -183,7 +305,10 @@ def run(prepared_dir, output_root, last_block=8, through_block14=False):
                   blocks=blocks, final_device_sha256=digest(c64_final),
                   downsample8=downsample8,
                   c128_blocks=c128_blocks,
-                  final_c128_device_sha256=digest(previous) if c128_blocks else None,
+                  final_c128_device_sha256=digest(c128_final) if c128_blocks else None,
+                  downsample14=downsample14, c256_blocks=c256_blocks,
+                  final_c256_device_sha256=digest(previous) if c256_blocks else None,
+                  downsample22=downsample22,
                   original_kernel_executed=False, full_candidate_inference=False,
                   production_wiring=False)
     (output_root / 'report.json').write_text(json.dumps(report, indent=2) + '\n')
@@ -199,5 +324,7 @@ if __name__ == '__main__':
                                 'candidate_capture_encoder64')
     parser.add_argument('--last-block', type=int, default=8)
     parser.add_argument('--through-block14', action='store_true')
+    parser.add_argument('--through-block22', action='store_true')
     args = parser.parse_args()
-    run(args.prepared_dir, args.output_root, args.last_block, args.through_block14)
+    run(args.prepared_dir, args.output_root, args.last_block,
+        args.through_block14, args.through_block22)
