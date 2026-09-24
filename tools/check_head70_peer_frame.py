@@ -56,7 +56,7 @@ def checked_command(command, log):
 def run(size=256,chunk_windows=32,latent_case='public',output_root=None):
     if size<16 or size>256 or size%8 or chunk_windows<1:
         raise ValueError('size must be 16..256 multiple of 8; chunk positive')
-    if latent_case not in ('public','image_half','image_fp8','from62_fp8','from56_fp8','from48_fp8','from39_fp8','from38_fp8','from_encoder_skip30_fp8','from_candidate_vit16_fp8','from_candidate_encoder22_fp8'):
+    if latent_case not in ('public','image_half','image_fp8','from62_fp8','from56_fp8','from48_fp8','from39_fp8','from38_fp8','from_encoder_skip30_fp8','from_candidate_vit16_fp8','from_candidate_encoder22_fp8','from_candidate_encoder14_fp8'):
         raise ValueError('unknown latent source')
     audit_basis(verbose=False)
     source_report=json.loads((SOURCE/'manifest.json').read_text())
@@ -80,7 +80,8 @@ def run(size=256,chunk_windows=32,latent_case='public',output_root=None):
         latent_hash=source_report['latent_peer_sha256']
         latent_origin='same-image optimized public FP16 block69'
     else:
-        tail_path=ROOT/'build'/('peer_decoder66_tail_audit_candidate_encoder22' if latent_case=='from_candidate_encoder22_fp8' else
+        tail_path=ROOT/'build'/('peer_decoder66_tail_audit_candidate_encoder14' if latent_case=='from_candidate_encoder14_fp8' else
+                                'peer_decoder66_tail_audit_candidate_encoder22' if latent_case=='from_candidate_encoder22_fp8' else
                                 'peer_decoder66_tail_audit_candidate_vit16' if latent_case=='from_candidate_vit16_fp8' else
                                 'peer_decoder66_tail_audit_encoder_skip30' if latent_case=='from_encoder_skip30_fp8' else
                                 'peer_decoder66_tail_audit_from38' if latent_case=='from38_fp8' else
@@ -91,15 +92,17 @@ def run(size=256,chunk_windows=32,latent_case='public',output_root=None):
         if tail['source_model_sha256']!=source_report['model_sha256'] or \
            tail['source_image_sha256']!=source_report['input_image_sha256']:
             raise ValueError('AMD decoder tail used different public image/model')
-        latent_path=(Path.home()/'DLSS5FSR-build-offload'/f'peer_decoder66_{"encoder_skip30" if latent_case=="from_encoder_skip30_fp8" else "candidate_vit16" if latent_case=="from_candidate_vit16_fp8" else "candidate_encoder22" if latent_case=="from_candidate_encoder22_fp8" else latent_case.removesuffix("_fp8")}'/'block69/output/output_device.f32'
-                     if latent_case in ('from39_fp8','from38_fp8','from_encoder_skip30_fp8','from_candidate_vit16_fp8','from_candidate_encoder22_fp8') else
+        latent_path=(Path.home()/'DLSS5FSR-build-offload'/f'peer_decoder66_{"encoder_skip30" if latent_case=="from_encoder_skip30_fp8" else "candidate_vit16" if latent_case=="from_candidate_vit16_fp8" else "candidate_encoder22" if latent_case=="from_candidate_encoder22_fp8" else "candidate_encoder14" if latent_case=="from_candidate_encoder14_fp8" else latent_case.removesuffix("_fp8")}'/'block69/output/output_device.f32'
+                     if latent_case in ('from39_fp8','from38_fp8','from_encoder_skip30_fp8','from_candidate_vit16_fp8','from_candidate_encoder22_fp8','from_candidate_encoder14_fp8') else
                      ROOT/'build/decoder69_peer_candidate'/latent_case/'output/output_device.f32')
         latent_hash=digest(latent_path)
         if latent_hash!=tail['cases'][latent_case]['block_output_stages']['block69']['candidate_native_sha256']:
             raise ValueError('AMD decoder block69 hash differs')
         main=np.fromfile(latent_path,'<f4').reshape(128,128,32)[:size//2,:size//2].copy()
-        first_block=39 if latent_case in ('from38_fp8','from_encoder_skip30_fp8','from_candidate_vit16_fp8','from_candidate_encoder22_fp8') else 40 if latent_case=='from39_fp8' else 48 if latent_case=='from48_fp8' else 56 if latent_case=='from56_fp8' else 62 if latent_case=='from62_fp8' else 66
-        latent_origin=(f'RX9070XT candidate encoder15-30, ViT31-38, and decoder{first_block}-69; encoder14/8/4 skips public; 16-token attention experimental'
+        first_block=39 if latent_case in ('from38_fp8','from_encoder_skip30_fp8','from_candidate_vit16_fp8','from_candidate_encoder22_fp8','from_candidate_encoder14_fp8') else 40 if latent_case=='from39_fp8' else 48 if latent_case=='from48_fp8' else 56 if latent_case=='from56_fp8' else 62 if latent_case=='from62_fp8' else 66
+        latent_origin=(f'RX9070XT candidate encoder9-30, ViT31-38, and decoder{first_block}-69; encoder14 skip candidate, encoder8/4 skips public; 16-token attention experimental'
+                       if latent_case=='from_candidate_encoder14_fp8' else
+                       f'RX9070XT candidate encoder15-30, ViT31-38, and decoder{first_block}-69; encoder14/8/4 skips public; 16-token attention experimental'
                        if latent_case=='from_candidate_encoder22_fp8' else
                        f'RX9070XT candidate split encoder23-30, ViT31-38, and decoder{first_block}-69; other skips public; 16-token attention experimental'
                        if latent_case=='from_candidate_vit16_fp8' else
@@ -193,15 +196,16 @@ def run(size=256,chunk_windows=32,latent_case='public',output_root=None):
                 input_color_vs_public_final=metrics(color,public_final),
                 original_kernel_executed=False,original_runtime_validation=False,
                 native_amd_encoder_decoder_executed=False,
-                native_amd_split_encoder23_30_executed=latent_case in ('from_encoder_skip30_fp8','from_candidate_vit16_fp8','from_candidate_encoder22_fp8'),
-                native_amd_encoder15_22_candidate_executed=latent_case=='from_candidate_encoder22_fp8',
-                native_amd_vit31_38_candidate_executed=latent_case in ('from_candidate_vit16_fp8','from_candidate_encoder22_fp8'),
+                native_amd_split_encoder23_30_executed=latent_case in ('from_encoder_skip30_fp8','from_candidate_vit16_fp8','from_candidate_encoder22_fp8','from_candidate_encoder14_fp8'),
+                native_amd_encoder9_14_candidate_executed=latent_case=='from_candidate_encoder14_fp8',
+                native_amd_encoder15_22_candidate_executed=latent_case in ('from_candidate_encoder22_fp8','from_candidate_encoder14_fp8'),
+                native_amd_vit31_38_candidate_executed=latent_case in ('from_candidate_vit16_fp8','from_candidate_encoder22_fp8','from_candidate_encoder14_fp8'),
                 native_amd_decoder66_69_executed=latent_case!='public',
-                native_amd_decoder62_69_executed=latent_case in ('from62_fp8','from56_fp8','from48_fp8','from39_fp8','from38_fp8','from_encoder_skip30_fp8','from_candidate_vit16_fp8','from_candidate_encoder22_fp8'),
-                native_amd_decoder56_69_executed=latent_case in ('from56_fp8','from48_fp8','from39_fp8','from38_fp8','from_encoder_skip30_fp8','from_candidate_vit16_fp8','from_candidate_encoder22_fp8'),
-                native_amd_decoder48_69_executed=latent_case in ('from48_fp8','from39_fp8','from38_fp8','from_encoder_skip30_fp8','from_candidate_vit16_fp8','from_candidate_encoder22_fp8'),
-                native_amd_decoder40_69_executed=latent_case in ('from39_fp8','from38_fp8','from_encoder_skip30_fp8','from_candidate_vit16_fp8','from_candidate_encoder22_fp8'),
-                native_amd_decoder39_69_executed=latent_case in ('from38_fp8','from_encoder_skip30_fp8','from_candidate_vit16_fp8','from_candidate_encoder22_fp8'),
+                native_amd_decoder62_69_executed=latent_case in ('from62_fp8','from56_fp8','from48_fp8','from39_fp8','from38_fp8','from_encoder_skip30_fp8','from_candidate_vit16_fp8','from_candidate_encoder22_fp8','from_candidate_encoder14_fp8'),
+                native_amd_decoder56_69_executed=latent_case in ('from56_fp8','from48_fp8','from39_fp8','from38_fp8','from_encoder_skip30_fp8','from_candidate_vit16_fp8','from_candidate_encoder22_fp8','from_candidate_encoder14_fp8'),
+                native_amd_decoder48_69_executed=latent_case in ('from48_fp8','from39_fp8','from38_fp8','from_encoder_skip30_fp8','from_candidate_vit16_fp8','from_candidate_encoder22_fp8','from_candidate_encoder14_fp8'),
+                native_amd_decoder40_69_executed=latent_case in ('from39_fp8','from38_fp8','from_encoder_skip30_fp8','from_candidate_vit16_fp8','from_candidate_encoder22_fp8','from_candidate_encoder14_fp8'),
+                native_amd_decoder39_69_executed=latent_case in ('from38_fp8','from_encoder_skip30_fp8','from_candidate_vit16_fp8','from_candidate_encoder22_fp8','from_candidate_encoder14_fp8'),
                 comparison='same-image public FP16 skip/color and selected latent through HIP FP8/half candidate head')
     (out/'manifest.json').write_text(json.dumps(report,indent=2)+'\n')
     print(json.dumps({k:v for k,v in report.items() if k!='body_chunks'},indent=2))
@@ -211,6 +215,6 @@ if __name__=='__main__':
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--size',type=int,default=256)
     parser.add_argument('--chunk-windows',type=int,default=32)
-    parser.add_argument('--latent-case',choices=('public','image_half','image_fp8','from62_fp8','from56_fp8','from48_fp8','from39_fp8','from38_fp8','from_encoder_skip30_fp8','from_candidate_vit16_fp8','from_candidate_encoder22_fp8'),default='public')
+    parser.add_argument('--latent-case',choices=('public','image_half','image_fp8','from62_fp8','from56_fp8','from48_fp8','from39_fp8','from38_fp8','from_encoder_skip30_fp8','from_candidate_vit16_fp8','from_candidate_encoder22_fp8','from_candidate_encoder14_fp8'),default='public')
     parser.add_argument('--output-root',type=Path)
     a=parser.parse_args();run(a.size,a.chunk_windows,a.latent_case,a.output_root)

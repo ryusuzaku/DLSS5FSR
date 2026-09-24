@@ -23,8 +23,25 @@ block14 reaches 0.75429/0.97224 and 0.45211/0.98795 respectively. The
 candidate upstream boundary therefore increases the public-graph discrepancy;
 the original C128 residual order, shift interpretation, and C256 maps remain
 validation targets. This is a diagnostic comparison, not proof of native image
-quality or original-kernel parity. The branch stops at block22 for now; the
-previous full-frame result still uses the public block14 boundary.
+quality or original-kernel parity. The upstream original-kernel C128 shift
+fixture exercises the 0,3,1,2 sequence; the public ONNX graph uses zero/XY
+alternation, so its numerical difference does not isolate a shift error.
+
+The connected branch now also runs candidate encoder23–30, ViT31–38, and
+decoder39–69. Block48 consumes its own block22 skip; block56 consumes the
+block14 skip from the same encoder9–14 run. The block56 prefix checks the
+matching block14 downsample, block22 skip/downsample, and decoder48 lineage by
+hash. Encoder8 and encoder4 skips remain public same-image FP8 controls. Every
+GPU/scalar stage and device handoff through block69 is exact for the declared
+candidate. Block69 vs public FP16 is 1.07806 MAE/0.99025 correlation.
+
+The full 256×256 head passes all chunk checks and a separate direct GPU-buffer
+merge/body/RGB replay. Its public-gain blended RGB comparison to the public
+FP16 final frame is 0.006031 MAE/0.998972 correlation, versus 0.004932/0.999239
+for the earlier branch starting at public block14. The input-image baseline is
+0.008050 MAE. The image is visually coherent, but these are public-model
+diagnostics; the original C256/C32 maps, 16-token attention order, physical
+ViT bridge, and production game wiring remain unvalidated.
 
 After building `tools/build_split512_block.sh` and preparing the public ONNX
 fixtures described below, replay this branch with:
@@ -38,6 +55,32 @@ $enc256 = Join-Path $homeOffload 'peer_encoder256_from14_candidate'
 & build/peer_onnx_venv/Scripts/python.exe tools/check_encoder256_peer_image.py --candidate-block14-down (Join-Path $homeOffload 'peer_encoder14_down_candidate/output_device.f32') --output-root $enc256
 & build/peer_onnx_venv/Scripts/python.exe tools/check_decoder49_candidate.py --block 22 --input (Join-Path $enc256 'block21/output/output_device.f32') --width 16 --height 16 --output-root (Join-Path $enc256 'block22')
 & build/peer_onnx_venv/Scripts/python.exe tools/check_encoder22_downsample_peer_image.py --encoder-root $enc256 --output-root (Join-Path $homeOffload 'peer_encoder22_down_from14_candidate')
+$enc512 = Join-Path $homeOffload 'peer_split512_encoder_from14_candidate'
+& build/peer_onnx_venv/Scripts/python.exe tools/check_split512_encoder_peer_image.py --candidate-block22-down (Join-Path $homeOffload 'peer_encoder22_down_from14_candidate') --output-root $enc512
+$vit31 = Join-Path $homeOffload 'peer_vit31_from14_candidate'
+& build/peer_onnx_venv/Scripts/python.exe tools/check_vit31_peer_image.py --encoder-root $enc512 --output-root $vit31
+$vit38 = Join-Path $homeOffload 'peer_vit16_from14_candidate'
+& build/peer_onnx_venv/Scripts/python.exe tools/check_vit16_peer_image_chain.py --vit31-root $vit31 --output-root $vit38
+$dec39 = Join-Path $homeOffload 'decoder39_from14_candidate'
+& build/peer_onnx_venv/Scripts/python.exe tools/check_decoder39_peer_image.py --candidate-skip30 $enc512 --candidate-vit38 $vit38 --output-root $dec39
+$dec512 = Join-Path $homeOffload 'peer_split512_decoder_from14_candidate'
+& build/peer_onnx_venv/Scripts/python.exe tools/check_split512_peer_image.py --amd-block39 --amd-block39-dir $dec39 --output-root $dec512
+$up48 = Join-Path $homeOffload 'upsample48_from14_candidate'
+& build/peer_onnx_venv/Scripts/python.exe tools/check_upsample48_peer_image.py --chain-report (Join-Path $dec512 'report.json') --block39-dir $dec39 --candidate-skip22 (Join-Path $homeOffload 'peer_encoder22_down_from14_candidate') --output-root $up48
+$dec256 = Join-Path $homeOffload 'peer_decoder48_from14_candidate'
+& build/peer_onnx_venv/Scripts/python.exe tools/check_decoder48_55_peer_image.py --candidate-encoder22 --prefix-root $up48 --output-root $dec256
+& build/peer_onnx_venv/Scripts/python.exe tools/check_upsample56_peer_image.py --candidate-encoder22 --candidate-skip14 (Join-Path $homeOffload 'peer_encoder14_down_candidate') --candidate-encoder22-down (Join-Path $homeOffload 'peer_encoder22_down_from14_candidate') --chain-root $dec256 --output-root (Join-Path $homeOffload 'upsample56_candidate_encoder14')
+foreach ($b in 56..61) { & build/peer_onnx_venv/Scripts/python.exe tools/check_block56_candidate.py --case image_candidate_encoder14 --block $b --width 32 --height 32 }
+& build/peer_onnx_venv/Scripts/python.exe tools/audit_peer_decoder56_tail.py --case image_candidate_encoder14
+& build/peer_onnx_venv/Scripts/python.exe tools/check_upsample62_peer_image.py --case from_candidate_encoder14_fp8
+foreach ($b in 62..65) { & build/peer_onnx_venv/Scripts/python.exe tools/check_block62_candidate.py --case from_candidate_encoder14_fp8 --block $b --width 64 --height 64 }
+& build/peer_onnx_venv/Scripts/python.exe tools/audit_peer_decoder62_tail.py --case from_candidate_encoder14_fp8
+& build/peer_onnx_venv/Scripts/python.exe tools/check_upsample66_peer_image.py --case from_candidate_encoder14_fp8
+foreach ($b in 66..69) { & build/peer_onnx_venv/Scripts/python.exe tools/check_block66_peer_candidate.py --case from_candidate_encoder14_fp8 --block $b --width 128 --height 128 }
+& build/peer_onnx_venv/Scripts/python.exe tools/audit_peer_decoder66_tail.py --case from_candidate_encoder14_fp8
+$frame = Join-Path $homeOffload 'peer_head_frame_256_from_candidate_encoder14_fp8'
+& build/peer_onnx_venv/Scripts/python.exe tools/check_head70_peer_frame.py --latent-case from_candidate_encoder14_fp8 --output-root $frame
+& build/peer_onnx_venv/Scripts/python.exe tools/check_head70_peer_gpu_chain.py --latent-case from_candidate_encoder14_fp8 --frame-dir $frame --output-dir (Join-Path $homeOffload 'peer_head_frame_256_from_candidate_encoder14_fp8_connected_gpu')
 ```
 
 The large generated fixtures live in the home-directory offload folder and
