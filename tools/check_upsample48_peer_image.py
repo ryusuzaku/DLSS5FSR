@@ -36,7 +36,11 @@ def metrics(a, b):
                 correlation=float(np.corrcoef(a.ravel(), b.ravel())[0, 1]))
 
 
-def run(split512=False, output_root=None, amd_block39=False):
+def run(split512=False, output_root=None, amd_block39=False, chain_report=None, block39_dir=None):
+    if chain_report is not None:
+        if block39_dir is None or output_root is None:
+            raise ValueError('custom chain requires --block39-dir and --output-root')
+        amd_block39=True
     if amd_block39:
         split512=True
     src = json.loads((SOURCE / 'manifest.json').read_text())
@@ -50,14 +54,20 @@ def run(split512=False, output_root=None, amd_block39=False):
     x = np.empty_like(xpeer); x[..., p512] = xpeer
     source_block47_native_sha256 = None
     if split512:
-        chain_report=(ROOT / 'build/split512_peer_image_from38_report.json' if amd_block39 else
-                      ROOT / 'build/split512_peer_image_report.json')
-        chain = json.loads(chain_report.read_text())
+        report_path=(Path(chain_report) if chain_report is not None else
+                     ROOT / 'build/split512_peer_image_from38_report.json' if amd_block39 else
+                     ROOT / 'build/split512_peer_image_report.json')
+        chain = json.loads(report_path.read_text())
+        if chain_report is not None and chain['source_case'] != 'AMD block39 from public ViT38/candidate encoder skip30':
+            raise ValueError('custom C512 chain lacks candidate encoder skip provenance')
         if chain['source_model_sha256'] != src['model_sha256'] or chain['source_image_sha256'] != src['image_sha256']:
             raise ValueError('split512 source model/image differs')
         if amd_block39:
-            entry = json.loads((Path.home() / 'DLSS5FSR-build-offload' /
-                                'decoder39_peer_image/manifest.json').read_text())
+            entry_dir=(Path(block39_dir) if block39_dir is not None else
+                       Path.home() / 'DLSS5FSR-build-offload' / 'decoder39_peer_image')
+            entry = json.loads((entry_dir / 'manifest.json').read_text())
+            if block39_dir is not None and entry['case'] != 'same_image_public_vit38_candidate_skip30':
+                raise ValueError('custom block39 fixture lacks candidate encoder skip provenance')
             if chain['source_block39_native_sha256'] != entry['output_device_sha256']:
                 raise ValueError('AMD block39 handoff differs')
         candidate = Path(chain['output_root']) / 'block47-8x8-s2' / 'final_device.f32'
@@ -102,7 +112,8 @@ def run(split512=False, output_root=None, amd_block39=False):
     if (out / 'merged_device.f32').read_bytes() != (out / 'merged.f32').read_bytes():
         raise AssertionError('prefix HIP/scalar merge differs')
     public = np.fromfile(SOURCE / 'merge48_peer.f32', '<f4').reshape(16, 16, 256)
-    report = dict(case='image_fp8_from38' if amd_block39 else 'image_fp8_from39' if split512 else 'image_fp8', input_extent=[8, 8, 512],
+    report = dict(case='image_fp8_encoder_skip30' if chain_report is not None else
+                  'image_fp8_from38' if amd_block39 else 'image_fp8_from39' if split512 else 'image_fp8', input_extent=[8, 8, 512],
                   output_extent=[16, 16, 256],
                   source_model_sha256=src['model_sha256'],
                   source_block47_peer_sha256=src['tensor_sha256']['block47'],
@@ -131,7 +142,11 @@ if __name__ == '__main__':
                         help='use the C512 chain started from AMD block39')
     parser.add_argument('--output-root', type=Path,
                         help='fixture directory (use a spacious drive for --split512)')
+    parser.add_argument('--chain-report', type=Path,
+                        help='custom C512 chain report, e.g. one using a candidate encoder skip')
+    parser.add_argument('--block39-dir', type=Path,
+                        help='AMD block39 fixture that supplied the custom chain')
     args = parser.parse_args()
     if (args.split512 or args.amd_block39) and args.output_root is None:
         args.output_root = Path.home() / 'DLSS5FSR-build-offload' / ('upsample48_from38' if args.amd_block39 else 'upsample48_from39')
-    run(args.split512, args.output_root, args.amd_block39)
+    run(args.split512, args.output_root, args.amd_block39, args.chain_report, args.block39_dir)

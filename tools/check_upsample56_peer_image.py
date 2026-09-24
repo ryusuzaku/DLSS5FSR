@@ -35,8 +35,11 @@ def metrics(a,b):
                 correlation=float(np.corrcoef(a.ravel(),b.ravel())[0,1]))
 
 
-def run(candidate_block55=False, from39=False, output_root=None, chain_root=None, from38=False):
-    if from39 or from38:
+def run(candidate_block55=False, from39=False, output_root=None, chain_root=None,
+        from38=False, encoder_skip30=False):
+    if encoder_skip30 and (chain_root is None or output_root is None):
+        raise ValueError('candidate encoder skip requires explicit chain/output roots')
+    if from39 or from38 or encoder_skip30:
         candidate_block55=True
     src=json.loads((SOURCE/'manifest.json').read_text())
     for name in ('block55','skip14','merge56'):
@@ -49,6 +52,8 @@ def run(candidate_block55=False, from39=False, output_root=None, chain_root=None
                         else ROOT/'build/peer_decoder48_candidate')
         native_path=candidate_root/'block55/output/output_device.f32'
         chain=json.loads((candidate_root/'manifest.json').read_text())
+        if encoder_skip30 and chain['case']!='image_encoder_skip30':
+            raise ValueError('candidate encoder skip ancestry differs')
         if chain['blocks'][-1]['block']!=55 or digest(native_path)!=chain['final_device_sha256']:
             raise ValueError('same-image candidate block55 handoff differs')
         if (chain['source_model_sha256']!=src['model_sha256'] or
@@ -93,7 +98,9 @@ def run(candidate_block55=False, from39=False, output_root=None, chain_root=None
     if (out/'merged_device.f32').read_bytes()!=(out/'merged.f32').read_bytes():
         raise AssertionError('prefix HIP/scalar merge differs')
     public=np.fromfile(SOURCE/'merge56_peer.f32','<f4').reshape(32,32,128)
-    report=dict(case=('image_from38' if from38 else 'image_from39' if from39 else 'image_from_block48' if candidate_block55 else 'image_fp8'),
+    report=dict(case=('image_encoder_skip30' if encoder_skip30 else
+                      'image_from38' if from38 else 'image_from39' if from39 else
+                      'image_from_block48' if candidate_block55 else 'image_fp8'),
                 input_extent=[16,16,256],output_extent=[32,32,128],
                 source_model_sha256=src['model_sha256'],
                 source_block55_peer_sha256=src['tensor_sha256']['block55'],
@@ -118,7 +125,8 @@ if __name__=='__main__':
     parser.add_argument('--candidate-block55',action='store_true')
     parser.add_argument('--from39',action='store_true',help='use the C512-derived C256 block55 candidate')
     parser.add_argument('--from38',action='store_true',help='use the AMD block39-derived C256 block55 candidate')
+    parser.add_argument('--encoder-skip30',action='store_true',help='use the candidate encoder-skip C256 chain')
     parser.add_argument('--output-root',type=Path)
     parser.add_argument('--chain-root',type=Path,help='C256 block48–55 fixture directory')
     args=parser.parse_args()
-    run(args.candidate_block55,args.from39,args.output_root,args.chain_root,args.from38)
+    run(args.candidate_block55,args.from39,args.output_root,args.chain_root,args.from38,args.encoder_skip30)

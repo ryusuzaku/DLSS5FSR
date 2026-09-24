@@ -87,7 +87,7 @@ def decode(raw):
 
 
 def run(case='seeded',first_window=False,block=56,width=WIDTH,height=HEIGHT):
-    if case not in ('seeded','zero','image_fp8','image_from_block48','image_from39','image_from38'):raise ValueError('unknown skip case')
+    if case not in ('seeded','zero','image_fp8','image_from_block48','image_from39','image_from38','image_encoder_skip30'):raise ValueError('unknown skip case')
     if block not in range(56,62):raise ValueError('block must be 56..61')
     if first_window and block!=56:raise ValueError('first-window mode is only for block56')
     if width<8 or height<8 or width%8 or height%8:
@@ -100,7 +100,7 @@ def run(case='seeded',first_window=False,block=56,width=WIDTH,height=HEIGHT):
         raise ValueError('C128 PTX residual address transfer failed')
     source=((FROM39/f'upsample56_{case.removeprefix("image_")}'/'merged_device.f32' if block==56 else
              FROM39/f'peer_decoder56_{case.removeprefix("image_")}'/f'block{block-1}/output/output_device.f32')
-            if case in ('image_from39','image_from38') else
+            if case in ('image_from39','image_from38','image_encoder_skip30') else
             ROOT/'build/upsample56_prefix_derived'/case/'merged_device.f32' if block==56
             else ROOT/'build/block56_candidate'/case/'output'/'output_device.f32' if block==57
             else ROOT/'build'/f'decoder{block-1}_candidate_derived'/case/'output'/'output_device.f32')
@@ -111,7 +111,7 @@ def run(case='seeded',first_window=False,block=56,width=WIDTH,height=HEIGHT):
     ww=((width+px+7)//8)*8;hh=((height+py+7)//8)*8
     padded=np.pad(x,((py,hh-height-py),(px,ww-width-px),(0,0)))
     windows=padded.reshape(hh//8,8,ww//8,8,CHANNELS).transpose(0,2,1,3,4).reshape(-1,64,CHANNELS)
-    root=(FROM39/f'peer_decoder56_{case.removeprefix("image_")}'/f'block{block}' if case in ('image_from39','image_from38') else
+    root=(FROM39/f'peer_decoder56_{case.removeprefix("image_")}'/f'block{block}' if case in ('image_from39','image_from38','image_encoder_skip30') else
           ROOT/'build'/('block56_candidate_first_window' if first_window else 'block56_candidate')/case
           if block==56 else ROOT/'build'/f'decoder{block}_candidate_derived'/case)
     spatial=root/'spatial';save(spatial,dict(input=x,windows=windows))
@@ -153,7 +153,7 @@ def run(case='seeded',first_window=False,block=56,width=WIDTH,height=HEIGHT):
     report=dict(block=block,case=case,shift=shift,extent=[width,height,CHANNELS],
                 windows=len(chunks),tensor_sha256=digest(raw_path),input_device_sha256=digest(source),
                 output_device_sha256=digest(output_device),
-                encoder14_skip=('public same-image FP8-boundary control' if case in ('image_fp8','image_from_block48','image_from39','image_from38') else 'synthetic control'),
+                encoder14_skip=('public same-image FP8-boundary control' if case in ('image_fp8','image_from_block48','image_from39','image_from38','image_encoder_skip30') else 'synthetic control'),
                 map_status='measured C128 FFN/matrix/bias maps; candidate attention residual order',
                 original_kernel_executed=False,original_runtime_validation=False)
     (root/'manifest.json').write_text(json.dumps(report,indent=2)+'\n')
@@ -162,7 +162,7 @@ def run(case='seeded',first_window=False,block=56,width=WIDTH,height=HEIGHT):
 
 if __name__=='__main__':
     p=argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--case',choices=('seeded','zero','image_fp8','image_from_block48','image_from39','image_from38'),default='seeded')
+    p.add_argument('--case',choices=('seeded','zero','image_fp8','image_from_block48','image_from39','image_from38','image_encoder_skip30'),default='seeded')
     p.add_argument('--first-window',action='store_true')
     p.add_argument('--block',type=int,choices=range(56,62),default=56)
     p.add_argument('--width',type=int,default=WIDTH)

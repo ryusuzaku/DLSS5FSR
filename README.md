@@ -54,7 +54,8 @@ FP16 ONNX model and its blue-marble example from
 `extract_peer_decoder66_inputs.py`, `extract_peer_decoder62_inputs.py`,
 `extract_peer_decoder56_inputs.py`, then
 `extract_peer_decoder48_inputs.py`, `extract_peer_split512_inputs.py`, then
-`extract_peer_decoder39_inputs.py`.
+`extract_peer_decoder39_inputs.py`, then
+`extract_peer_split512_encoder_inputs.py`.
 Run `check_split512_peer_image.py --teacher-forced` for the native C512
 window schedule and `check_split512_peer_image.py --unshifted-control
 --teacher-forced` for the public ONNX window control. The public model's C512
@@ -63,5 +64,15 @@ native shifted schedule. Run
 `check_upsample48_peer_image.py`, `check_decoder48_55_peer_image.py`, and
 `check_upsample56_peer_image.py --candidate-block55` after building the HIP
 test executables with `tools/build_split512_block.sh`.
+
+The additional same-image encoder branch starts from public block22, runs
+candidate AMD split-encoder blocks23–30 and the 4×4 C1024 head, and checks
+the source-derived logical ViT bridge plus the ViT31 FFN/QKV prefix. Run
+`check_split512_encoder_peer_image.py` for the native shifted schedule and
+`check_split512_encoder_peer_image.py --unshifted-control` to isolate the
+public model's zero-shift behavior. `check_vit31_peer_image.py` consumes the
+native-schedule head. [CANDIDATE_IMAGE_CHAIN.md](CANDIDATE_IMAGE_CHAIN.md)
+gives the continuation through block39–69 and the full-frame head, along with
+the 16-token ViT attention and original physical-layout limits.
 
 Source code here is experimental. No NVIDIA binaries or weights are bundled.

@@ -24,8 +24,11 @@ def metrics(a, b):
                 correlation=float(np.corrcoef(a.ravel(), b.ravel())[0, 1]))
 
 
-def run(last_block=55, split512=False, output_root=None, prefix_root=None, amd_block39=False):
-    if amd_block39:
+def run(last_block=55, split512=False, output_root=None, prefix_root=None,
+        amd_block39=False, encoder_skip30=False):
+    if encoder_skip30 and (output_root is None or prefix_root is None):
+        raise ValueError('candidate encoder skip requires explicit prefix/output roots')
+    if amd_block39 or encoder_skip30:
         split512=True
     if last_block not in range(48, 56):
         raise ValueError('last block must be 48..55')
@@ -34,7 +37,9 @@ def run(last_block=55, split512=False, output_root=None, prefix_root=None, amd_b
               Path.home() / 'DLSS5FSR-build-offload' / ('upsample48_from38' if amd_block39 else 'upsample48_from39') if split512
               else ROOT / 'build/upsample48_prefix_derived/image_fp8')
     prefix_report = json.loads((prefix / 'manifest.json').read_text())
-    if prefix_report['case'] != ('image_fp8_from38' if amd_block39 else 'image_fp8_from39' if split512 else 'image_fp8'):
+    expected_case=('image_fp8_encoder_skip30' if encoder_skip30 else
+                   'image_fp8_from38' if amd_block39 else 'image_fp8_from39' if split512 else 'image_fp8')
+    if prefix_report['case'] != expected_case:
         raise ValueError('block48 prefix case differs')
     if prefix_report['source_model_sha256'] != src['model_sha256']:
         raise ValueError('block48 prefix model differs')
@@ -67,7 +72,8 @@ def run(last_block=55, split512=False, output_root=None, prefix_root=None, amd_b
     summary = dict(blocks=blocks, source_model_sha256=src['model_sha256'],
                    source_image_sha256=src['image_sha256'],
                    block48_prefix_sha256=prefix_report['output_device_sha256'],
-                   case='image_from38' if amd_block39 else 'image_from39' if split512 else 'image_from47',
+                   case='image_encoder_skip30' if encoder_skip30 else
+                        'image_from38' if amd_block39 else 'image_from39' if split512 else 'image_from47',
                    output_root=str(out.resolve()),
                    final_device_sha256=digest(previous),
                    candidate_basis='C256 extension of measured C64/C128 maps',
@@ -85,7 +91,10 @@ if __name__ == '__main__':
                         help='consume the C512 candidate-derived block48 prefix')
     parser.add_argument('--amd-block39', action='store_true',
                         help='consume block48 derived from AMD block39')
+    parser.add_argument('--encoder-skip30', action='store_true',
+                        help='consume the block48 prefix using the candidate encoder skip')
     parser.add_argument('--output-root', type=Path, help='candidate block fixture directory')
     parser.add_argument('--prefix-root', type=Path, help='block48 prefix fixture directory')
     args = parser.parse_args()
-    run(args.last_block, args.split512, args.output_root, args.prefix_root, args.amd_block39)
+    run(args.last_block, args.split512, args.output_root, args.prefix_root,
+        args.amd_block39, args.encoder_skip30)

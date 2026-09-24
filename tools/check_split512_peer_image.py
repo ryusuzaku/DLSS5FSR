@@ -29,11 +29,14 @@ def metrics(candidate, reference):
                 correlation=float(np.corrcoef(candidate.ravel(), reference.ravel())[0, 1]))
 
 
-def run(output_root, through=47, teacher_forced=False, unshifted_control=False, amd_block39=False):
+def run(output_root, through=47, teacher_forced=False, unshifted_control=False,
+        amd_block39=False, amd_block39_dir=None):
     if through not in range(40, 48):
         raise ValueError('through must be block40..47')
     if unshifted_control and amd_block39:
         raise ValueError('the zero-shift public control starts at public block39')
+    if amd_block39_dir is not None and not amd_block39:
+        raise ValueError('--amd-block39-dir requires --amd-block39')
     source = json.loads((SOURCE / 'manifest.json').read_text())
     for block in range(39, through + 1):
         name = f'block{block}'
@@ -44,9 +47,13 @@ def run(output_root, through=47, teacher_forced=False, unshifted_control=False, 
     p512 = peer_to_native_multihead(np.arange(512))
     peer = np.fromfile(SOURCE / 'block39_peer.f32', '<f4').reshape(64, 512)
     if amd_block39:
-        upstream = Path.home() / 'DLSS5FSR-build-offload' / 'decoder39_peer_image'
+        upstream = (Path(amd_block39_dir).resolve() if amd_block39_dir is not None else
+                    Path.home() / 'DLSS5FSR-build-offload' / 'decoder39_peer_image')
         record = json.loads((upstream / 'manifest.json').read_text())
         candidate = upstream / 'output_device.f32'
+        if amd_block39_dir is not None and (record['case'] != 'same_image_public_vit38_candidate_skip30' or
+                                             not record.get('candidate_skip30_device_sha256')):
+            raise ValueError('custom AMD block39 lacks candidate encoder skip provenance')
         if (record['source_model_sha256'] != source['model_sha256'] or
                 record['source_image_sha256'] != source['image_sha256'] or
                 record['output_device_sha256'] != digest(candidate)):
@@ -101,16 +108,20 @@ def run(output_root, through=47, teacher_forced=False, unshifted_control=False, 
                   window_schedule='public ONNX unshifted control' if unshifted_control else 'native 0,3,1,2 repeat',
                   input_vs_public_fp16=first_input,
                   source_block39_native_sha256=source_block39_native_sha256,
-                  source_case='AMD block39 from public ViT38/skip30' if amd_block39 else 'public block39 FP8-rounded',
+                  source_case=('AMD block39 from public ViT38/candidate encoder skip30'
+                               if amd_block39_dir is not None else
+                               'AMD block39 from public ViT38/skip30' if amd_block39 else
+                               'public block39 FP8-rounded'),
                   peer_to_native_channels=p512.tolist(), handoffs=handoffs,
                   candidate_vs_public_fp16=comparisons, teacher_forced=teacher,
                   output_root=str(out), final_device_sha256=handoffs[-1]['device_output_sha256'],
                   basis='candidate C512 P extension; not original-map recovery',
                   hip_scalar_exact=True, original_kernel_executed=False,
                   original_runtime_validation=False)
-    summary = ROOT / ('build/split512_peer_image_from38_report.json' if amd_block39 else
-                      'build/split512_peer_image_unshifted_report.json' if unshifted_control
-                      else 'build/split512_peer_image_report.json')
+    summary = (out / 'report.json' if amd_block39_dir is not None else
+               ROOT / ('build/split512_peer_image_from38_report.json' if amd_block39 else
+                       'build/split512_peer_image_unshifted_report.json' if unshifted_control
+                       else 'build/split512_peer_image_report.json'))
     summary.write_text(json.dumps(report, indent=2) + '\n')
     print(f'report: {summary}')
     return report
@@ -126,10 +137,13 @@ if __name__ == '__main__':
                         help='run zero-shift public-model control, not the native schedule')
     parser.add_argument('--amd-block39', action='store_true',
                         help='start from the same-image AMD block39 device output')
+    parser.add_argument('--amd-block39-dir', type=Path,
+                        help='specific AMD block39 output root, e.g. with candidate encoder skip')
     args = parser.parse_args()
     if args.output_root is None:
         name = ('peer_split512_from38_candidate' if args.amd_block39 else
                 'peer_split512_unshifted_control' if args.unshifted_control else
                 'peer_split512_candidate')
         args.output_root = Path.home() / 'DLSS5FSR-build-offload' / name
-    run(args.output_root, args.through, args.teacher_forced, args.unshifted_control, args.amd_block39)
+    run(args.output_root, args.through, args.teacher_forced, args.unshifted_control,
+        args.amd_block39, args.amd_block39_dir)

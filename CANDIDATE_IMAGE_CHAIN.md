@@ -6,6 +6,79 @@ skip, block48 merge, and blocks48–55. Its block55 bytes match the earlier
 independently extracted block55 boundary exactly. The ONNX model SHA256 is
 `7aa891c46f90f3d0a4539701ba009131ac333602634a62ad8675da90d0f8a173`.
 
+## Candidate split encoder on the same image
+
+`tools/extract_peer_split512_encoder_inputs.py` extracts public block22,
+blocks23–30, and the 4×4 C1024 head from one blue-marble inference. The
+block30 skip bytes match the independent block39 extraction. Block22 and the
+head are FP32 public graph boundaries; blocks23–30 are half-rounded.
+
+`tools/check_split512_encoder_peer_image.py` converts public block22 to the
+candidate C512 basis and FP8, then runs AMD blocks23–30 at 8×8 with the
+native 0,3,1,2,0,3,1,2 shift schedule. All 104 spatial/body stages and eight
+device input/output handoffs match the scalar candidate exactly. The block30
+raw output feeds the 2×2 pool and C1024 head; both AMD stages match exactly.
+Block30 skip vs public FP16 is 0.71386 MAE/0.85549 correlation, and the head
+is 0.86382/0.88383. The all-zero-shift control reaches block30 at
+0.14838/0.99557 and the head at 0.11039/0.99825. This difference reflects
+the public ONNX encoder's zero-shift windows; the native-shift run remains the
+candidate path. Neither comparison validates an original NVIDIA kernel.
+
+`tools/check_vit31_peer_image.py` takes the *native-schedule AMD head device
+bytes*, applies the 4×4 source-derived logical ViT map on AMD, and runs the
+ViT31 expansion, gated hidden, contract/residual, QKV projection, and QKV
+normalization. The bridge's 16,384 values and all five ViT stages match their
+scalar candidates exactly. The ViT31 contract device SHA256 is
+`50456897945dc46ae9fa8699b9349c425e67baf1df97a49fb5f585095727fab5`.
+The original physical C512→ViT map is still unverified, and the available
+native attention reference covers 64/128/256 tokens, not this image's 16.
+Therefore this branch stops before ViT31 attention and does not reach ViT38.
+
+A separate decoder continuation combines the public *logical* ViT38 with the
+candidate AMD block30 skip. `check_decoder39_peer_image.py --candidate-skip30`
+then feeds AMD blocks39–69 and the full 256² head via case-specific fixtures.
+The block39 output vs public FP16 is 0.32561 MAE/0.96044 correlation; block47
+is 0.62656/0.90115; block55 is 1.06460/0.91014; block61 is
+1.01223/0.96901; block65 is 1.03792/0.98873; and block69 is
+0.66831/0.99560. Every AMD/scalar stage and device handoff passes. The
+block69 device SHA256 is
+`100e53d44b40cbf84f837f407478082f3f80d706c507487a3e6679c0bffe35f9`.
+
+The head's 1,024 windows each pass 12 body checks, both gain settings pass
+their outer checks, and the direct GPU-buffer test matches merge, body, and
+both RGB outputs exactly. Public-gain blended RGB vs the public FP16 final
+has 0.00481 MAE/0.99923 correlation over 196,608 values; the input-color
+baseline is 0.00805 MAE. The render is finite and visually coherent. This
+still uses public ViT38, encoder22/14/8/4 skips, preblock skip, and color;
+the candidate split encoder supplies only the block30 decoder skip. No
+original NVIDIA execution or in-game neural rendering is established.
+
+After the prior public boundary extractions and HIP build, replay this branch
+with generated fixtures on a spacious drive:
+
+```powershell
+$offload = Join-Path $HOME 'DLSS5FSR-build-offload'
+python tools/extract_peer_split512_encoder_inputs.py
+python tools/check_split512_encoder_peer_image.py --output-root "$offload/peer_split512_encoder_candidate"
+python tools/check_split512_encoder_peer_image.py --unshifted-control --output-root "$offload/peer_split512_encoder_unshifted"
+python tools/check_vit31_peer_image.py --encoder-root "$offload/peer_split512_encoder_candidate" --output-root "$offload/peer_vit31_prefix"
+python tools/check_decoder39_peer_image.py --candidate-skip30 "$offload/peer_split512_encoder_candidate" --output-root "$offload/decoder39_candidate_skip30"
+python tools/check_split512_peer_image.py --amd-block39 --amd-block39-dir "$offload/decoder39_candidate_skip30" --output-root "$offload/peer_split512_candidate_skip30"
+python tools/check_upsample48_peer_image.py --chain-report "$offload/peer_split512_candidate_skip30/report.json" --block39-dir "$offload/decoder39_candidate_skip30" --output-root "$offload/upsample48_candidate_skip30"
+python tools/check_decoder48_55_peer_image.py --encoder-skip30 --prefix-root "$offload/upsample48_candidate_skip30" --output-root "$offload/peer_decoder48_candidate_skip30"
+python tools/check_upsample56_peer_image.py --encoder-skip30 --chain-root "$offload/peer_decoder48_candidate_skip30" --output-root "$offload/upsample56_encoder_skip30"
+foreach ($b in 56..61) { python tools/check_block56_candidate.py --case image_encoder_skip30 --block $b --width 32 --height 32 }
+python tools/audit_peer_decoder56_tail.py --case image_encoder_skip30
+python tools/check_upsample62_peer_image.py --case from_encoder_skip30_fp8
+foreach ($b in 62..65) { python tools/check_block62_candidate.py --case from_encoder_skip30_fp8 --block $b --width 64 --height 64 }
+python tools/audit_peer_decoder62_tail.py --case from_encoder_skip30_fp8
+python tools/check_upsample66_peer_image.py --case from_encoder_skip30_fp8
+foreach ($b in 66..69) { python tools/check_block66_peer_candidate.py --case from_encoder_skip30_fp8 --block $b --width 128 --height 128 }
+python tools/audit_peer_decoder66_tail.py --case from_encoder_skip30_fp8
+python tools/check_head70_peer_frame.py --latent-case from_encoder_skip30_fp8 --output-root "$offload/peer_head_frame_256_encoder_skip30"
+python tools/check_head70_peer_gpu_chain.py --latent-case from_encoder_skip30_fp8 --frame-dir "$offload/peer_head_frame_256_encoder_skip30" --output-dir "$offload/peer_head_frame_256_encoder_skip30_gpu"
+```
+
 ## Same-image AMD block39 boundary
 
 `tools/extract_peer_decoder39_inputs.py` extracts public ViT38, split-encoder30

@@ -18,23 +18,31 @@ from native_c64_reference import multiply
 from native_c32_reference import H
 
 
-def run_block(block,width=8,height=4,derived=False):
+def run_block(block,width=8,height=4,derived=False,image_source=None,output_root=None):
     exe=ROOT/'build/vit_expand_chain_test.exe'
     if not exe.is_file():raise FileNotFoundError('build with bash tools/build_split512_block.sh')
-    if (width,height) not in ((8,4),(16,4)):raise ValueError('covered extents are 8x4 and 16x4')
+    if (width,height) not in ((4,4),(8,4),(16,4)):raise ValueError('covered extents are 4x4, 8x4 and 16x4')
     tokens=width*height
     if block==31:
-        head_path=ROOT/'build'/('split512_bridge' if width==8 else 'split512_bridge_32x8')/'head_device.f32'
-        if not head_path.is_file():raise FileNotFoundError('run python tools/check_split512_bridge.py first')
-        head=np.fromfile(head_path,'<f4')
-        gather=logical_map(tokens) if derived else recover(width,height)[0]
-        if len(head)!=len(gather):raise ValueError('head/map extent mismatch')
-        cases='vit_bridge_derived_cases' if derived else 'vit_bridge_ptx_cases'
-        source_path=ROOT/'build'/cases/f'block30_head_{width}x{height}'/'device.f32'
-        if not source_path.is_file():raise FileNotFoundError(f'run the {cases} bridge check first')
-        mapped=np.fromfile(source_path,'<f4')
-        if mapped.tobytes()!=np.asarray(head[gather],dtype='<f4').tobytes():
-            raise ValueError('HIP bridge output differs bytewise from PTX map gather')
+        if image_source is not None:
+            if (width,height)!=(4,4) or not derived:
+                raise ValueError('image source requires the 4x4 derived-map candidate')
+            source_path=Path(image_source)
+            if not source_path.is_file():raise FileNotFoundError(source_path)
+            head_path=None
+        else:
+            if width==4:raise ValueError('4x4 requires an explicit image source')
+            head_path=ROOT/'build'/('split512_bridge' if width==8 else 'split512_bridge_32x8')/'head_device.f32'
+            if not head_path.is_file():raise FileNotFoundError('run python tools/check_split512_bridge.py first')
+            head=np.fromfile(head_path,'<f4')
+            gather=logical_map(tokens) if derived else recover(width,height)[0]
+            if len(head)!=len(gather):raise ValueError('head/map extent mismatch')
+            cases='vit_bridge_derived_cases' if derived else 'vit_bridge_ptx_cases'
+            source_path=ROOT/'build'/cases/f'block30_head_{width}x{height}'/'device.f32'
+            if not source_path.is_file():raise FileNotFoundError(f'run the {cases} bridge check first')
+            mapped=np.fromfile(source_path,'<f4')
+            if mapped.tobytes()!=np.asarray(head[gather],dtype='<f4').tobytes():
+                raise ValueError('HIP bridge output differs bytewise from PTX map gather')
     else:
         if tokens!=64:raise ValueError('connected ViT attention requires 64 tokens')
         suffix='_derived' if derived else ''
@@ -92,7 +100,12 @@ def run_block(block,width=8,height=4,derived=False):
                 *qkv_weights,qkv_scales,qkv_projected,qkv,*attention_data.values())):
         raise ValueError(f'nonfinite ViT block{block} stage')
     suffix='_derived' if derived else ''
-    folder=ROOT/'build'/(('vit_expand_chain' if tokens==32 else 'vit_expand_chain_16x4')+suffix) if block==31 else ROOT/'build'/f'vit_block{block}_16x4{suffix}'
+    if output_root is not None:
+        folder=Path(output_root)
+    elif block==31:
+        folder=ROOT/'build'/(('vit_expand_chain' if tokens==32 else 'vit_expand_chain_16x4')+suffix)
+    else:
+        folder=ROOT/'build'/f'vit_block{block}_16x4{suffix}'
     folder.mkdir(parents=True,exist_ok=True)
     for name,array in (('input',x),('weights',weight),('expanded',expanded),('hidden',hidden),
                        ('contract_weights',contract_weights),('contract_skip',contract_skip),
@@ -108,11 +121,13 @@ def run_block(block,width=8,height=4,derived=False):
                 contraction_tensor=contract_record['index'],
                 contraction_sha256=hashlib.sha256(contract_raw).hexdigest(),
                 qkv_tensor=qkv_record['index'],qkv_sha256=hashlib.sha256(qkv_raw).hexdigest(),
-                bridge=('upstream capture-derived logical map composed with original PTX physical source; no original-kernel execution'
+                bridge=('candidate 4x4 logical C512/ViT map; original physical bridge unverified'
+                        if image_source is not None else
+                        'upstream capture-derived logical map composed with original PTX physical source; no original-kernel execution'
                         if derived else 'PTX source-linear map on logical-HWC control; C512 split-view composition missing; no original-kernel execution'),
                 oracle='unchanged native_vit_linear_reference, native_vit_qkv_reference, native_vit_attention_reference, and native_c64_reference.multiply',
                 comparison='exact')
-    if block==31:report['head_sha256']=hashlib.sha256(head_path.read_bytes()).hexdigest()
+    if block==31 and head_path is not None:report['head_sha256']=hashlib.sha256(head_path.read_bytes()).hexdigest()
     if tokens==64:
         report['projection_tensor']=projection_record['index']
         report['projection_sha256']=hashlib.sha256(projection_raw).hexdigest()
