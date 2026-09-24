@@ -47,7 +47,7 @@ def project_sequential_f32(x,weights):
 
 
 def run(case):
-    if case not in ('image_half','image_fp8','from56_fp8'):raise ValueError('bad case')
+    if case not in ('image_half','image_fp8','from56_fp8','from48_fp8'):raise ValueError('bad case')
     audit_basis(verbose=False)
     src=json.loads((SOURCE/'manifest.json').read_text())
     for name in ('block61','skip8','merge62'):
@@ -56,22 +56,24 @@ def run(case):
     xpeer=np.fromfile(SOURCE/'block61_peer.f32','<f4').reshape(32,32,128)
     speer=np.fromfile(SOURCE/'skip8_peer.f32','<f4').reshape(64,64,64)
     if case=='image_fp8':xpeer=F(xpeer);speer=F(speer)
-    if case=='from56_fp8':speer=F(speer)
+    if case in ('from56_fp8','from48_fp8'):speer=F(speer)
     p128=peer_to_native_multihead(np.arange(128))
     p64=peer_to_native_multihead(np.arange(64))
     x=np.empty_like(xpeer);x[...,p128]=xpeer
     upstream=None
-    if case=='from56_fp8':
-        audit_path=ROOT/'build/peer_decoder56_tail_audit/manifest.json'
+    if case in ('from56_fp8','from48_fp8'):
+        audit_path=ROOT/'build'/('peer_decoder56_tail_audit' if case=='from56_fp8' else 'peer_decoder56_tail_audit_from48')/'manifest.json'
         audit=json.loads(audit_path.read_text())
-        input_path=ROOT/'build/decoder61_candidate_derived/image_fp8/output/output_device.f32'
+        source_case='image_fp8' if case=='from56_fp8' else 'image_from_block48'
+        input_path=ROOT/'build/decoder61_candidate_derived'/source_case/'output/output_device.f32'
         if audit['source_model_sha256']!=src['model_sha256'] or \
            audit['source_image_sha256']!=src['image_sha256'] or \
            digest(input_path)!=audit['block_output_stages']['block61']['candidate_native_sha256']:
             raise ValueError('upstream block61 provenance/hash differs')
         x=np.fromfile(input_path,'<f4').reshape(32,32,128)
         upstream=dict(audit_sha256=digest(audit_path),block61_native_sha256=digest(input_path),
-                      boundary='AMD candidate block56-61 from public block55/skip14')
+                      boundary=('AMD candidate block48-61 from public block47/skip22/skip14'
+                                if case=='from48_fp8' else 'AMD candidate block56-61 from public block55/skip14'))
     skip=np.empty_like(speer);skip[...,p64]=speer
     raw_path=ROOT/'dlss5-analysis/tensors/tensor_140.bin'
     raw=np.fromfile(raw_path,np.uint8)
@@ -128,5 +130,5 @@ def run(case):
 
 if __name__=='__main__':
     p=argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--case',choices=('image_half','image_fp8','from56_fp8'),default='image_half')
+    p.add_argument('--case',choices=('image_half','image_fp8','from56_fp8','from48_fp8'),default='image_half')
     a=p.parse_args();run(a.case)

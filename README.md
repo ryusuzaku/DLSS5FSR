@@ -24,6 +24,9 @@ local checks and which are attributed to other projects.
 block47→56 candidate run. The matching encoder22 skip is now used at block48;
 its AMD/scalar checks are exact, while comparisons to the public FP16 ONNX
 model are approximate because the candidate rounds activations to FP8.
+The same-image candidate has also been propagated through blocks56–69 and
+the full-frame head; the document gives the measured RGB comparison and
+original-kernel validation limits.
 
 The research scripts expect a local `dlss5-analysis/` generated from a
 matching, independently obtained `nvngx_dlssnr.dll`. Some also import the

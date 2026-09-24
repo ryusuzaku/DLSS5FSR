@@ -19,9 +19,10 @@ ROOT=Path(__file__).resolve().parents[1]
 def digest(path):return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-def run(size,latent_case='public',output_dir=None):
-    frame=ROOT/f'build/peer_head_frame_{size}' if latent_case=='public' else \
-          ROOT/f'build/peer_head_frame_{size}_{latent_case}'
+def run(size,latent_case='public',output_dir=None,frame_dir=None):
+    frame=Path(frame_dir) if frame_dir is not None else (
+        ROOT/f'build/peer_head_frame_{size}' if latent_case=='public' else
+        ROOT/f'build/peer_head_frame_{size}_{latent_case}')
     original=json.loads((frame/'manifest.json').read_text())
     if original['size']!=[size,size] or original['windows']!=size*size//64:
         raise ValueError('frame fixture size differs')
@@ -72,6 +73,7 @@ def run(size,latent_case='public',output_dir=None):
 if __name__=='__main__':
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--size',type=int,default=256)
-    p.add_argument('--latent-case',choices=('public','image_half','image_fp8','from62_fp8','from56_fp8'),default='public')
+    p.add_argument('--latent-case',choices=('public','image_half','image_fp8','from62_fp8','from56_fp8','from48_fp8'),default='public')
     p.add_argument('--output-dir',type=Path)
-    a=p.parse_args();run(a.size,a.latent_case,a.output_dir)
+    p.add_argument('--frame-dir',type=Path)
+    a=p.parse_args();run(a.size,a.latent_case,a.output_dir,a.frame_dir)

@@ -26,7 +26,7 @@ def metrics(a,b):
 
 
 def run(case='image_fp8'):
-    if case not in ('image_half','image_fp8','from56_fp8'):raise ValueError('bad case')
+    if case not in ('image_half','image_fp8','from56_fp8','from48_fp8'):raise ValueError('bad case')
     source=json.loads((SOURCE/'manifest.json').read_text())
     order=peer_to_native_multihead(np.arange(64))
     prefix=ROOT/'build/upsample62_prefix_derived'/case
@@ -35,8 +35,8 @@ def run(case='image_fp8'):
        digest(prefix/'merged_device.f32')!=p['output_device_sha256'] or \
        p['source_model_sha256']!=source['model_sha256']:
         raise ValueError('prefix provenance/exactness differs')
-    if case=='from56_fp8':
-        upstream=ROOT/'build/peer_decoder56_tail_audit/manifest.json'
+    if case in ('from56_fp8','from48_fp8'):
+        upstream=ROOT/'build'/('peer_decoder56_tail_audit' if case=='from56_fp8' else 'peer_decoder56_tail_audit_from48')/'manifest.json'
         u=json.loads(upstream.read_text())
         if p['upstream_amd_block61']['audit_sha256']!=digest(upstream) or \
            p['input_native_sha256']!=u['block_output_stages']['block61']['candidate_native_sha256'] or \
@@ -70,7 +70,8 @@ def run(case='image_fp8'):
                 original_runtime_validation=False,production_wiring=False)
     out=ROOT/'build'/('peer_decoder62_tail_audit' if case=='image_fp8' else
                       'peer_decoder62_tail_audit_half' if case=='image_half' else
-                      'peer_decoder62_tail_audit_from56')
+                      'peer_decoder62_tail_audit_from56' if case=='from56_fp8' else
+                      'peer_decoder62_tail_audit_from48')
     out.mkdir(parents=True,exist_ok=True)
     (out/'manifest.json').write_text(json.dumps(report,indent=2)+'\n')
     print(json.dumps(report,indent=2))
@@ -78,5 +79,5 @@ def run(case='image_fp8'):
 
 if __name__=='__main__':
     p=argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--case',choices=('image_half','image_fp8','from56_fp8'),default='image_fp8')
+    p.add_argument('--case',choices=('image_half','image_fp8','from56_fp8','from48_fp8'),default='image_fp8')
     a=p.parse_args();run(a.case)

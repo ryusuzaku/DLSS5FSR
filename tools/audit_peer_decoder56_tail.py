@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Audit same-image AMD candidate blocks56–61 against public FP16 stages."""
 from pathlib import Path
+import argparse
 import hashlib
 import json
 import numpy as np
@@ -25,10 +26,10 @@ def metrics(a,b):
                 correlation=float(np.corrcoef(a.ravel(),b.ravel())[0,1]))
 
 
-def run():
+def run(case='image_fp8'):
+    if case not in ('image_fp8','image_from_block48'):raise ValueError('bad case')
     source=json.loads((SOURCE/'manifest.json').read_text())
     order=peer_to_native_multihead(np.arange(128))
-    case='image_fp8'
     prefix=ROOT/'build/upsample56_prefix_derived'/case
     p=json.loads((prefix/'manifest.json').read_text())
     if not p['hip_projection_merge_exact'] or \
@@ -61,9 +62,13 @@ def run():
                 block_output_stages=stages,exact_device_handoffs=6,
                 scalar_hip_stages_exact=True,original_kernel_executed=False,
                 original_runtime_validation=False,production_wiring=False)
-    OUT.mkdir(parents=True,exist_ok=True)
-    (OUT/'manifest.json').write_text(json.dumps(report,indent=2)+'\n')
+    out=OUT if case=='image_fp8' else ROOT/'build/peer_decoder56_tail_audit_from48'
+    out.mkdir(parents=True,exist_ok=True)
+    (out/'manifest.json').write_text(json.dumps(report,indent=2)+'\n')
     print(json.dumps(report,indent=2))
 
 
-if __name__=='__main__':run()
+if __name__=='__main__':
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--case',choices=('image_fp8','image_from_block48'),default='image_fp8')
+    run(parser.parse_args().case)

@@ -5,6 +5,7 @@ All RX9070XT stages are exact against native-style scalar candidate arithmetic.
 Public FP16 model differences are diagnostics, not original-kernel verdicts.
 """
 from pathlib import Path
+import argparse
 import hashlib
 import json
 import numpy as np
@@ -29,7 +30,7 @@ def metrics(a,b):
                 correlation=float(np.corrcoef(a.ravel(),b.ravel())[0,1]))
 
 
-def run():
+def run(cases=None):
     source=json.loads((SOURCE/'manifest.json').read_text())
     map32=peer_to_native(np.arange(32))
     report=dict(source_model_sha256=source['model_sha256'],
@@ -38,15 +39,17 @@ def run():
                 cases={},original_kernel_executed=False,
                 original_runtime_validation=False,
                 production_wiring=False)
-    for case in ('image_half','image_fp8','from62_fp8','from56_fp8'):
+    for case in (cases or ('image_half','image_fp8','from62_fp8','from56_fp8')):
         prefix=ROOT/'build/upsample66_prefix_derived'/case
         p=json.loads((prefix/'manifest.json').read_text())
         if not p['hip_projection_merge_exact'] or \
            digest(prefix/'merged_device.f32')!=p['output_device_sha256']:
             raise ValueError('prefix not exact/hash valid')
-        if case in ('from62_fp8','from56_fp8'):
-            upstream=ROOT/'build'/('peer_decoder62_tail_audit' if case=='from62_fp8' else
-                                    'peer_decoder62_tail_audit_from56')/'manifest.json'
+        if case in ('from62_fp8','from56_fp8','from48_fp8'):
+            audit_dir=('peer_decoder62_tail_audit' if case=='from62_fp8' else
+                       'peer_decoder62_tail_audit_from56' if case=='from56_fp8' else
+                       'peer_decoder62_tail_audit_from48')
+            upstream=ROOT/'build'/audit_dir/'manifest.json'
             u=json.loads(upstream.read_text())
             if p['upstream_amd_block65']['audit_sha256']!=digest(upstream) or \
                p['input_native_sha256']!=u['block_output_stages']['block65']['candidate_native_sha256'] or \
@@ -75,9 +78,14 @@ def run():
                                    block_output_stages=stages,
                                    exact_device_handoffs=4,
                                    scalar_hip_stages_exact=True)
-    OUT.mkdir(parents=True,exist_ok=True)
-    (OUT/'manifest.json').write_text(json.dumps(report,indent=2)+'\n')
+    out=OUT if cases is None else ROOT/'build/peer_decoder66_tail_audit_from48'
+    out.mkdir(parents=True,exist_ok=True)
+    (out/'manifest.json').write_text(json.dumps(report,indent=2)+'\n')
     print(json.dumps(report,indent=2))
 
 
-if __name__=='__main__':run()
+if __name__=='__main__':
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--case',choices=('from48_fp8',))
+    args=parser.parse_args()
+    run([args.case] if args.case else None)

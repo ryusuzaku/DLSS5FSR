@@ -61,7 +61,7 @@ def save(folder,values):
 
 def run(block=66,case='seeded',first_window=False,width=WIDTH,height=HEIGHT):
     if block not in range(66,70):raise ValueError('block must be 66..69')
-    if case not in ('seeded','zero','image_half','image_fp8','from62_fp8','from56_fp8'):
+    if case not in ('seeded','zero','image_half','image_fp8','from62_fp8','from56_fp8','from48_fp8'):
         raise ValueError('unknown skip case')
     if first_window and block!=66:raise ValueError('first-window mode only supports block66')
     if width<8 or height<8 or width%8 or height%8:
@@ -117,7 +117,7 @@ def run(block=66,case='seeded',first_window=False,width=WIDTH,height=HEIGHT):
                 input_device_sha256=digest(source),output_device_sha256=digest(output_device),
                 basis_audit='build/peer_native_c32_basis_audit.json',
                 map_status='public QMMA C32 candidate in exact block66 transition basis; no native C32 body map oracle',
-                encoder_skips=('public same-image block4 skip' if case.startswith('image_') or case in ('from62_fp8','from56_fp8') else
+                encoder_skips=('public same-image block4 skip' if case.startswith('image_') or case in ('from62_fp8','from56_fp8','from48_fp8') else
                                'synthetic controls inherited from blocks48/56/62/66'),
                 original_kernel_executed=False,original_runtime_validation=False)
     (root/'manifest.json').write_text(json.dumps(report,indent=2)+'\n')
@@ -128,7 +128,7 @@ def run(block=66,case='seeded',first_window=False,width=WIDTH,height=HEIGHT):
 if __name__=='__main__':
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--block',type=int,choices=range(66,70),default=66)
-    p.add_argument('--case',choices=('seeded','zero','image_half','image_fp8','from62_fp8','from56_fp8'),default='seeded')
+    p.add_argument('--case',choices=('seeded','zero','image_half','image_fp8','from62_fp8','from56_fp8','from48_fp8'),default='seeded')
     p.add_argument('--first-window',action='store_true')
     p.add_argument('--width',type=int,default=WIDTH)
     p.add_argument('--height',type=int,default=HEIGHT)

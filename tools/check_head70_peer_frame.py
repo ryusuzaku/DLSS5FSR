@@ -53,10 +53,10 @@ def checked_command(command, log):
     return result.stdout.count('PASS')
 
 
-def run(size=256,chunk_windows=32,latent_case='public'):
+def run(size=256,chunk_windows=32,latent_case='public',output_root=None):
     if size<16 or size>256 or size%8 or chunk_windows<1:
         raise ValueError('size must be 16..256 multiple of 8; chunk positive')
-    if latent_case not in ('public','image_half','image_fp8','from62_fp8','from56_fp8'):
+    if latent_case not in ('public','image_half','image_fp8','from62_fp8','from56_fp8','from48_fp8'):
         raise ValueError('unknown latent source')
     audit_basis(verbose=False)
     source_report=json.loads((SOURCE/'manifest.json').read_text())
@@ -69,8 +69,9 @@ def run(size=256,chunk_windows=32,latent_case='public'):
             raise ValueError(f'public source hash differs: {name}')
     if not source_report['same_inference_call']:
         raise ValueError('latent/skip/color are not coherent')
-    out=ROOT/f'build/peer_head_frame_{size}' if latent_case=='public' else \
-        ROOT/f'build/peer_head_frame_{size}_{latent_case}'
+    out=Path(output_root) if output_root is not None else (
+        ROOT/f'build/peer_head_frame_{size}' if latent_case=='public' else
+        ROOT/f'build/peer_head_frame_{size}_{latent_case}')
     out.mkdir(parents=True,exist_ok=True)
     channel_map=peer_to_native(np.arange(32))
     if latent_case=='public':
@@ -79,7 +80,9 @@ def run(size=256,chunk_windows=32,latent_case='public'):
         latent_hash=source_report['latent_peer_sha256']
         latent_origin='same-image optimized public FP16 block69'
     else:
-        tail=json.loads((ROOT/'build/peer_decoder66_tail_audit/manifest.json').read_text())
+        tail_path=ROOT/'build'/('peer_decoder66_tail_audit_from48' if latent_case=='from48_fp8' else
+                                'peer_decoder66_tail_audit')/'manifest.json'
+        tail=json.loads(tail_path.read_text())
         if tail['source_model_sha256']!=source_report['model_sha256'] or \
            tail['source_image_sha256']!=source_report['input_image_sha256']:
             raise ValueError('AMD decoder tail used different public image/model')
@@ -88,7 +91,7 @@ def run(size=256,chunk_windows=32,latent_case='public'):
         if latent_hash!=tail['cases'][latent_case]['block_output_stages']['block69']['candidate_native_sha256']:
             raise ValueError('AMD decoder block69 hash differs')
         main=np.fromfile(latent_path,'<f4').reshape(128,128,32)[:size//2,:size//2].copy()
-        first_block=56 if latent_case=='from56_fp8' else 62 if latent_case=='from62_fp8' else 66
+        first_block=48 if latent_case=='from48_fp8' else 56 if latent_case=='from56_fp8' else 62 if latent_case=='from62_fp8' else 66
         latent_origin=f'RX9070XT candidate decoder{first_block}-69, {latent_case} public boundary inputs'
     peer_skip=np.fromfile(SOURCE/'skip_peer.f32','<f4').reshape(256,256,32)[:size,:size]
     skip=np.empty_like(peer_skip);skip[...,channel_map]=peer_skip
@@ -178,8 +181,9 @@ def run(size=256,chunk_windows=32,latent_case='public'):
                 original_kernel_executed=False,original_runtime_validation=False,
                 native_amd_encoder_decoder_executed=False,
                 native_amd_decoder66_69_executed=latent_case!='public',
-                native_amd_decoder62_69_executed=latent_case in ('from62_fp8','from56_fp8'),
-                native_amd_decoder56_69_executed=latent_case=='from56_fp8',
+                native_amd_decoder62_69_executed=latent_case in ('from62_fp8','from56_fp8','from48_fp8'),
+                native_amd_decoder56_69_executed=latent_case in ('from56_fp8','from48_fp8'),
+                native_amd_decoder48_69_executed=latent_case=='from48_fp8',
                 comparison='same-image public FP16 skip/color and selected latent through HIP FP8/half candidate head')
     (out/'manifest.json').write_text(json.dumps(report,indent=2)+'\n')
     print(json.dumps({k:v for k,v in report.items() if k!='body_chunks'},indent=2))
@@ -189,5 +193,6 @@ if __name__=='__main__':
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--size',type=int,default=256)
     parser.add_argument('--chunk-windows',type=int,default=32)
-    parser.add_argument('--latent-case',choices=('public','image_half','image_fp8','from62_fp8','from56_fp8'),default='public')
-    a=parser.parse_args();run(a.size,a.chunk_windows,a.latent_case)
+    parser.add_argument('--latent-case',choices=('public','image_half','image_fp8','from62_fp8','from56_fp8','from48_fp8'),default='public')
+    parser.add_argument('--output-root',type=Path)
+    a=parser.parse_args();run(a.size,a.chunk_windows,a.latent_case,a.output_root)

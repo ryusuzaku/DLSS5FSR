@@ -86,7 +86,7 @@ def decode(raw):
 
 
 def run(case='seeded',first_window=False,block=62,width=WIDTH,height=HEIGHT):
-    if case not in ('seeded','zero','image_half','image_fp8','from56_fp8'):raise ValueError('unknown skip case')
+    if case not in ('seeded','zero','image_half','image_fp8','from56_fp8','from48_fp8'):raise ValueError('unknown skip case')
     if block not in range(62,66):raise ValueError('block must be 62..65')
     if first_window and block!=62:raise ValueError('first-window mode is only for block62')
     if width<8 or height<8 or width%8 or height%8:
@@ -149,7 +149,7 @@ def run(case='seeded',first_window=False,block=62,width=WIDTH,height=HEIGHT):
                 windows=len(chunks),tensor_sha256=digest(raw_path),input_device_sha256=digest(source),
                 output_device_sha256=digest(output_device),
                 encoder8_skip=('public same-image half-boundary control' if case=='image_half' else
-                               'public same-image FP8-boundary control' if case in ('image_fp8','from56_fp8') else
+                               'public same-image FP8-boundary control' if case in ('image_fp8','from56_fp8','from48_fp8') else
                                'synthetic control'),
                 map_status='measured C64 FFN/matrix/bias maps; candidate attention residual order',
                 original_kernel_executed=False,original_runtime_validation=False)
@@ -159,7 +159,7 @@ def run(case='seeded',first_window=False,block=62,width=WIDTH,height=HEIGHT):
 
 if __name__=='__main__':
     p=argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--case',choices=('seeded','zero','image_half','image_fp8','from56_fp8'),default='seeded')
+    p.add_argument('--case',choices=('seeded','zero','image_half','image_fp8','from56_fp8','from48_fp8'),default='seeded')
     p.add_argument('--first-window',action='store_true')
     p.add_argument('--block',type=int,choices=range(62,66),default=62)
     p.add_argument('--width',type=int,default=WIDTH)

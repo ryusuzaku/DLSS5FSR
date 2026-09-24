@@ -35,3 +35,51 @@ unvalidated by independent logical assets or an original-kernel output.
 The public repo excludes the ONNX model, packed tensors, original DLL/cubins,
 generated fixtures and game captures. A local workspace with matching source
 data, ROCm, and the reference decoder is needed to replay the scripts.
+
+## Extension through the full frame
+
+The block56 device merge above was passed through candidate blocks56–61,
+then block62 with the same-image encoder8 skip, blocks62–65, block66 with the
+same-image encoder4 skip, and blocks66–69. Every prefix, body stage, and
+interblock device handoff matched the scalar candidate exactly. At the final
+block69 latent, the candidate/public FP16 comparison has 0.99706 correlation
+and 0.47920 mean absolute error over 524,288 values. The block69 device hash
+is `428f16285506440571ecfda73fe16181cbf71e0a16d160563209c83a8ae09f1d`.
+
+`tools/check_head70_peer_frame.py --latent-case from48_fp8` then used that AMD
+latent with the same-image public preblock skip and color. All 1,024 head
+windows passed 12 exact GPU/scalar body checks each; both gain settings passed
+the outer checks. A separate `tools/check_head70_peer_gpu_chain.py` run passed
+direct GPU-buffer merge and body comparisons (2,097,152 values each) and RGB
+comparisons (196,608 values at each gain), all exact. The public-gain blended
+candidate image differs from the public FP16 final image by 0.00403 mean
+absolute error, with 0.99942 correlation over 196,608 RGB values. The input
+image baseline is 0.00805 mean absolute error. The resulting image is finite
+and visually coherent, but it is a static public-model comparison and does
+not validate the original NVIDIA kernels or production game wiring.
+
+This full-frame run used an optional output directory on a second local drive
+because generated fixtures exceed the free space in the workspace. The output
+directory is not part of the public checkout.
+
+After the public-model extractions listed in `README.md` and a build of
+`tools/build_split512_block.sh`, the candidate can be replayed with:
+
+```powershell
+python tools/check_upsample48_peer_image.py
+python tools/check_decoder48_55_peer_image.py
+python tools/check_upsample56_peer_image.py --candidate-block55
+foreach ($b in 56..61) { python tools/check_block56_candidate.py --case image_from_block48 --block $b --width 32 --height 32 }
+python tools/audit_peer_decoder56_tail.py --case image_from_block48
+python tools/check_upsample62_peer_image.py --case from48_fp8
+foreach ($b in 62..65) { python tools/check_block62_candidate.py --case from48_fp8 --block $b --width 64 --height 64 }
+python tools/audit_peer_decoder62_tail.py --case from48_fp8
+python tools/check_upsample66_peer_image.py --case from48_fp8
+foreach ($b in 66..69) { python tools/check_block66_peer_candidate.py --case from48_fp8 --block $b --width 128 --height 128 }
+python tools/audit_peer_decoder66_tail.py --case from48_fp8
+python tools/check_head70_peer_frame.py --latent-case from48_fp8 --output-root "D:\scratch\peer_head_frame_256_from48_fp8"
+python tools/check_head70_peer_gpu_chain.py --latent-case from48_fp8 --frame-dir "D:\scratch\peer_head_frame_256_from48_fp8" --output-dir "D:\scratch\peer_head_frame_256_from48_fp8_connected_gpu"
+```
+
+The example output directory should be changed to a drive with ample free
+space. All generated fixtures stay outside Git.
