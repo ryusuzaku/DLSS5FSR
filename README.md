@@ -119,4 +119,17 @@ confirmed the candidate square, exact HIP readback and model-texture copies
 without device errors. `DebugView=2` now outputs opaque alpha; the game's HUD
 and some later-rendered elements still appear above the diagnostic view.
 
+For the next live-input boundary, `CandidateInputCapturePath` in
+`dlssnr_shim.ini` writes one completed staged proxy frame to an absolute `.bin`
+path. This capture does not alter the model output. Run
+`python tools/prepare_candidate_input.py <capture.bin> --output-dir <directory>`
+to center-crop and bilinearly resize it to 256×256, decode its sRGB proxy
+values to linear `color_linear.f32`, and make a visual PNG plus manifest. The
+binary format begins with `D5INP001`, then little-endian width, height,
+bytes-per-pixel, row pitch, passthrough flag, proxy mode and float white point,
+followed by the exact pitched rows. The converter accepts RGBA8 and FP16;
+its crop/color contract is a diagnostic candidate and has **not** been
+validated against the original NVIDIA frontend. The PNG is 8-bit and is not
+an exact substitute for the linear `.f32` boundary.
+
 Source code here is experimental. No NVIDIA binaries or weights are bundled.

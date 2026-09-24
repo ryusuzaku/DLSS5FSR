@@ -157,6 +157,10 @@ struct Config {
     // network inference; empty keeps the normal model path.
     std::wstring candidatePreviewPath;
 
+    // Diagnostic one-shot capture of the completed staged proxy. This is the
+    // input boundary for a future full-frame candidate, not a model output.
+    std::wstring candidateInputCapturePath;
+
     // Scene value the game's tonemapper calls white. Everything the encode
     // does is relative to it, and getting it wrong is not a subtle error: the
     // proxy is either crushed or clipped and the model is shown a picture that
@@ -528,6 +532,7 @@ bool HipC32blkBlockTest();  // connected C=32 block (S170)  // one-shot CONNECTE
 void HipFeBlockView();  // level-2 cached-block view into sharedOut (§34)
 bool HipFeBlockStaged();  // level-3 staged-window run, real pixels (§34)
 bool HipCandidatePreview();  // fixed-image model-texture bridge, DebugView=2 only
+bool HipCandidateInputCapture();  // one-shot staged-proxy capture
 UINT64 HipStagingRowPitch();
 UINT64 HipStagingBytes();
 ID3D12Resource* HipStagingIn();

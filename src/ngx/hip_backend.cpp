@@ -106,6 +106,9 @@ struct State {
     UINT64 previewPitch = 0;
     uint64_t previewRuns = 0;
 
+    // One completed proxy frame, captured only when explicitly requested.
+    bool candidateInputCaptureAttempted = false;
+
     // The FP8 GEMM self-test: runs once when configured, proves the whole
     // "real weights through rocWMMA inside the shim" chain bit-exactly.
     bool selfTestDone = false;
@@ -414,6 +417,7 @@ void Shutdown() {
     s.usable = false;
     s.attempted = false;  // a fresh Init may bring a different GPU setup
     s.runs = 0;
+    s.candidateInputCaptureAttempted = false;
 }
 
 // --------------------------------------------------------------- staging ---
@@ -522,6 +526,61 @@ bool RunModel() {
     if (s.runs == 0)
         LOGI("hip: identity model ready (first launch)");
     ++s.runs;
+    return true;
+}
+
+bool CandidateInputCapture() {
+    State& s = S();
+    const Config& cfg = Cfg();
+    if (cfg.candidateInputCapturePath.empty() || s.candidateInputCaptureAttempted)
+        return true;
+    s.candidateInputCaptureAttempted = true;
+    if (!s.usable || !s.ptrIn || !s.w || !s.h ||
+        (s.bpp != 4 && s.bpp != 8) || s.w > 4096 || s.h > 4096 ||
+        s.pitch < (UINT64)s.w * s.bpp || s.pitch > UINT32_MAX ||
+        s.bytes != s.pitch * s.h || s.bytes > 128ull * 1024ull * 1024ull) {
+        LOGE("hip: candidate input capture staging format/extent unsupported");
+        return false;
+    }
+    std::vector<unsigned char> pixels((size_t)s.bytes);
+    hipError_t e = s.Memcpy(pixels.data(), s.ptrIn, pixels.size(),
+                            hipMemcpyDeviceToHost);
+    if (e == hipSuccess) e = s.StreamSynchronize(s.stream);
+    if (e != hipSuccess) {
+        LOGE("hip: candidate input capture readback failed: %s", s.GetErrorString(e));
+        return false;
+    }
+    // D5INP001: LE width, height, bytes/pixel, row pitch, passthrough,
+    // proxy mode, white point, followed by the exact staged rows including
+    // pitch padding. The converter owns the 256x256 crop and color decode.
+    unsigned char header[36]{};
+    memcpy(header, "D5INP001", 8);
+    const unsigned int fields[6] = {s.w, s.h, s.bpp, (unsigned int)s.pitch,
+                                    (unsigned int)(cfg.passthrough != 0),
+                                    (unsigned int)cfg.proxyMode};
+    memcpy(header + 8, fields, sizeof(fields));
+    memcpy(header + 32, &cfg.whitePoint, sizeof(float));
+    const std::wstring tmp = cfg.candidateInputCapturePath + L".tmp";
+    FILE* f = _wfopen(tmp.c_str(), L"wb");
+    if (!f) {
+        LOGE("hip: candidate input capture cannot open %ls", tmp.c_str());
+        return false;
+    }
+    const bool written = fwrite(header, 1, sizeof(header), f) == sizeof(header) &&
+                         fwrite(pixels.data(), 1, pixels.size(), f) == pixels.size() &&
+                         fflush(f) == 0;
+    const bool closed = fclose(f) == 0;
+    if (!written || !closed ||
+        !MoveFileExW(tmp.c_str(), cfg.candidateInputCapturePath.c_str(),
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        _wremove(tmp.c_str());
+        LOGE("hip: candidate input capture write/rename failed at %ls",
+             cfg.candidateInputCapturePath.c_str());
+        return false;
+    }
+    LOGI("hip: candidate input captured %ux%u bpp=%u pitch=%llu bytes=%llu at %ls",
+         s.w, s.h, s.bpp, (unsigned long long)s.pitch,
+         (unsigned long long)s.bytes, cfg.candidateInputCapturePath.c_str());
     return true;
 }
 
@@ -10344,6 +10403,7 @@ bool HipC32blkBlockTest() { return hipb::C32blkBlockTestImpl(); }
 void HipFeBlockView() { hipb::FeBlockView(); }
 bool HipFeBlockStaged() { return hipb::FeBlockStaged(); }
 bool HipCandidatePreview() { return hipb::CandidatePreview(); }
+bool HipCandidateInputCapture() { return hipb::CandidateInputCapture(); }
 UINT64 HipStagingRowPitch() { return hipb::StagingRowPitch(); }
 UINT64 HipStagingBytes() { return hipb::StagingBytes(); }
 ID3D12Resource* HipStagingIn() { return hipb::StagingIn(); }

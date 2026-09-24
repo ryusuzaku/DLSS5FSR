@@ -123,11 +123,16 @@ Config& Cfg() { return g_cfg; }
 
 void ConfigLoad(const std::wstring& dir) {
     Config& c = g_cfg;
+    // NGX can Init/Shutdown repeatedly in one process. An empty INI value
+    // means "use the default", so a later Init must not inherit an earlier
+    // capture/preview path (or any other omitted setting).
+    c = Config{};
     std::wstring path = dir + L"\\dlssnr_shim.ini";
     std::wifstream in(path);
     if (!in.is_open()) {
         LOGI("config: no dlssnr_shim.ini, using defaults");
         g_cfgLoaded = true;
+        LogSetLevel((LogLevel)c.logLevel);
         return;
     }
 
@@ -167,6 +172,7 @@ void ConfigLoad(const std::wstring& dir) {
             else if (key == L"HipFeWindY")       c.hipFeWindY = std::stoi(val);
             else if (key == L"HipFeTransition")  c.hipFeTransition = std::stoi(val);
             else if (key == L"CandidatePreviewPath") c.candidatePreviewPath = val;
+            else if (key == L"CandidateInputCapturePath") c.candidateInputCapturePath = val;
             else if (key == L"WhitePoint")       c.whitePoint = std::stof(val);
             else if (key == L"ProxyMode")        c.proxyMode = std::stoi(val);
             else if (key == L"MaxRatio")         c.maxRatio = std::stof(val);
@@ -206,6 +212,9 @@ void ConfigLoad(const std::wstring& dir) {
     if (!c.candidatePreviewPath.empty())
         LOGI("config: fixed candidate preview armed at %ls (DebugView=2 required; not live inference)",
              c.candidatePreviewPath.c_str());
+    if (!c.candidateInputCapturePath.empty())
+        LOGI("config: one-shot candidate input capture armed at %ls",
+             c.candidateInputCapturePath.c_str());
 }
 
 }  // namespace ngx

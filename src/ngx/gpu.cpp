@@ -871,6 +871,13 @@ bool GpuPrepareHipModel(uint64_t n, const Config& cfg) {
     // The staged proxy bytes are the model's input; the launch synchronises,
     // so sharedOut holds the answer by the time it returns.
     if (!HipRunModel()) return false;
+    if (!cfg.candidateInputCapturePath.empty() && !HipCandidateInputCapture()) {
+        static bool captureFailureLogged = false;
+        if (!captureFailureLogged) {
+            captureFailureLogged = true;
+            LOGW("nr: candidate input capture failed; model output is unaffected");
+        }
+    }
 
     // S176: the wiring. RunModel above is still a copy; this replaces the
     // patch it produces with real network output computed from the staged

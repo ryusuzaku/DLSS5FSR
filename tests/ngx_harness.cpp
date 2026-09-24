@@ -507,6 +507,7 @@ struct IniValues {
     int hipFeLive = 0;
     int hipFeTransition = 0;
     std::string candidatePreviewPath;
+    std::string candidateInputCapturePath;
     // S231 step 3: the default is the SHIPPED reading (2, our map), so a green run
     // means the path the game runs is right. Only the c256f2 check consults this --
     // it is the one staged check that applies the same un-permutation the live
@@ -549,6 +550,7 @@ static bool WriteIni(const std::string& dir, const IniValues& v) {
             "HipFeLive=%d\n"
             "HipFeTransition=%d\n"
             "CandidatePreviewPath=%s\n"
+            "CandidateInputCapturePath=%s\n"
             "HipFfnTranspose=%d\n"
             "DumpField=%d\n",
             v.nrPasses, v.hipBackend, v.hipWeightsDir.c_str(),
@@ -559,6 +561,7 @@ static bool WriteIni(const std::string& dir, const IniValues& v) {
             v.maxRatio,
             v.passthrough, v.debugView, v.dumpFrames, v.dumpEvery,
             v.hipFeLive, v.hipFeTransition, v.candidatePreviewPath.c_str(),
+            v.candidateInputCapturePath.c_str(),
             v.hipFfnTranspose, v.dumpField);
     fclose(f);
     return true;
@@ -1066,6 +1069,7 @@ int main(int argc, char** argv) {
     // DIFFERENT tables on purpose: the writer stores B,G,R in memory, and that
     // channel swap has shipped once already.
     printf("\n-- pass 6b: HDR (f16) colour + output, dumps --\n");
+    const char* captureF16Env = getenv("DLSS5_CANDIDATE_INPUT_CAPTURE_F16");
     {
         static const unsigned short kHalf[8] = {0x0000, 0x3400, 0x3800, 0x3A00,
                                                 0x3C00, 0x4000, 0xB800, 0x1419};
@@ -1100,11 +1104,39 @@ int main(int argc, char** argv) {
             hdr.nrPasses = 1;
             hdr.debugView = 0;
             hdr.dumpFrames = 1;
+            if (captureF16Env && *captureF16Env) {
+                remove(captureF16Env);
+                hdr.candidateInputCapturePath = captureF16Env;
+            }
             PassResult p6b = RunPass(ngx, d, iniDir, hdr, color16.Get(),
                                      output16.Get(), SRC_W, SRC_H, DST_W, DST_H,
                                      kFrames);
             Check(p6b.evalFailures == 0,
                   "every frame succeeds with an f16 frame while dumping");
+            if (captureF16Env && *captureF16Env) {
+                FILE* raw = fopen(captureF16Env, "rb");
+                bool valid = raw != nullptr;
+                unsigned char header[36]{};
+                unsigned short green = 0;
+                if (valid) {
+                    valid = fread(header, 1, sizeof(header), raw) == sizeof(header);
+                    unsigned int w = 0, h = 0, bpp = 0, pitch = 0;
+                    memcpy(&w, header + 8, 4); memcpy(&h, header + 12, 4);
+                    memcpy(&bpp, header + 16, 4); memcpy(&pitch, header + 20, 4);
+                    valid = valid && memcmp(header, "D5INP001", 8) == 0 &&
+                            w == DST_W && h == DST_H && bpp == 8 &&
+                            pitch >= DST_W * 8;
+                    if (valid)
+                        valid = fseek(raw, (long)(sizeof(header) +
+                                 (size_t)(DST_H / 2) * pitch + (DST_W / 2) * 8 + 2),
+                                 SEEK_SET) == 0 &&
+                                fread(&green, 1, sizeof(green), raw) == sizeof(green);
+                    fclose(raw);
+                }
+                Check(valid, "HDR candidate capture has full FP16 proxy extent");
+                Check(valid && green >= 0x39DF && green <= 0x39E5,
+                      "HDR candidate capture preserves encoded half green");
+            }
 
             // Frame 0 of the pass is the one that dumps. The writer runs on its
             // own queue, so give it a moment rather than reading a file the GPU
@@ -1294,6 +1326,52 @@ int main(int argc, char** argv) {
         Check(opaque, "candidate debug view stays opaque over zero-alpha scene");
     }
 
+    // Opt-in readback of the actual staged model input. It must be the
+    // encoded, full-frame proxy, not the 64-token live sampler output.
+    const char* captureEnv = getenv("DLSS5_CANDIDATE_INPUT_CAPTURE");
+    if (captureEnv && *captureEnv) {
+        printf("\n-- pass 10: candidate input capture --\n");
+        remove(captureEnv);
+        IniValues capture;
+        capture.candidateInputCapturePath = captureEnv;
+        PassResult cp = RunPass(ngx, d, iniDir, capture, color.Get(),
+                                output.Get(), SRC_W, SRC_H, DST_W, DST_H,
+                                kFrames);
+        Check(cp.evalFailures == 0, "candidate input capture frame evaluates");
+        FILE* raw = fopen(captureEnv, "rb");
+        bool valid = raw != nullptr;
+        unsigned char header[36]{};
+        unsigned char center[4]{};
+        if (valid) {
+            valid = fread(header, 1, sizeof(header), raw) == sizeof(header);
+            unsigned int w = 0, h = 0, bpp = 0, pitch = 0;
+            memcpy(&w, header + 8, 4); memcpy(&h, header + 12, 4);
+            memcpy(&bpp, header + 16, 4); memcpy(&pitch, header + 20, 4);
+            valid = valid && memcmp(header, "D5INP001", 8) == 0 &&
+                    w == DST_W && h == DST_H && bpp == 4 && pitch >= w * bpp;
+            if (valid) {
+                valid = fseek(raw, (long)(sizeof(header) +
+                         (size_t)(DST_H / 2) * pitch + (DST_W / 2) * 4), SEEK_SET) == 0 &&
+                        fread(center, 1, sizeof(center), raw) == sizeof(center);
+            }
+            fclose(raw);
+        }
+        Check(valid, "candidate input capture has full proxy extent and format");
+        Check(valid && center[0] >= 175 && center[0] <= 200 &&
+              center[1] >= 175 && center[1] <= 200,
+              "candidate captured center is the encoded gradient");
+    }
+    if (captureF16Env && *captureF16Env) {
+        FILE* raw = fopen(captureF16Env, "rb");
+        unsigned char header[20]{};
+        bool persistent = raw && fread(header, 1, sizeof(header), raw) == sizeof(header);
+        if (raw) fclose(raw);
+        unsigned int bpp = 0;
+        memcpy(&bpp, header + 16, 4);
+        Check(persistent && memcmp(header, "D5INP001", 8) == 0 && bpp == 8,
+              "empty later config does not overwrite the HDR capture");
+    }
+
     // ---- the log -------------------------------------------------------
     // Pass 2 asserts the frame is unchanged at strength 0, which is also what
     // a chain that never ran would produce. The shim warns when it falls back
@@ -1320,6 +1398,9 @@ int main(int argc, char** argv) {
                           != std::string::npos,
                       "fixed candidate preview upload timing was logged");
             }
+            if (captureEnv && *captureEnv)
+                Check(text.find("hip: candidate input captured ") != std::string::npos,
+                      "candidate input capture was logged");
 
             // Counted, not just searched: every pass should have run the
             // chain, and one fallback anywhere is a failure.
@@ -1984,7 +2065,8 @@ int main(int argc, char** argv) {
             // per mode, so it contributes two beyond the single-pass count, and
             // S223c's f16 dump pass and S223d's live-chain pass (one arm per
             // process, chosen by DLSS5_ARM) are one single pass each.
-            Check(inits == 1 + 8 + 2 + 1 + ((previewEnv && *previewEnv) ? 1 : 0),
+            Check(inits == 1 + 8 + 2 + 1 + ((previewEnv && *previewEnv) ? 1 : 0) +
+                      ((captureEnv && *captureEnv) ? 1 : 0),
                   "every pass initialised the shim");
             Check(hipReady >= 1, "the HIP model ran at least once");
             Check(hipDegraded == 0, "no degradation to the identity model");
