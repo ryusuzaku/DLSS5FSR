@@ -1266,6 +1266,19 @@ int main(int argc, char** argv) {
     const char* previewEnv = getenv("DLSS5_CANDIDATE_PREVIEW");
     if (previewEnv && *previewEnv) {
         printf("\n-- pass 9: fixed candidate preview model texture --\n");
+        // A real game frame can carry zero alpha even when its RGB is valid.
+        // The diagnostic view must be opaque so the game cannot blend the
+        // preview with that frame. Restore the source to COMMON for upload.
+        for (size_t k = 0; k < (size_t)SRC_W * SRC_H; ++k)
+            src[k * 4 + 3] = 0;
+        Transition(d.list.Get(), color.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
+                   D3D12_RESOURCE_STATE_COMMON);
+        D3DSubmit(d);
+        Check(UploadPixels(d, color.Get(), src.data(), SRC_W, SRC_H),
+              "zero-alpha scene uploaded for candidate preview");
+        Transition(d.list.Get(), color.Get(), D3D12_RESOURCE_STATE_COMMON,
+                   D3D12_RESOURCE_STATE_RENDER_TARGET);
+        D3DSubmit(d);
         IniValues preview;
         preview.candidatePreviewPath = previewEnv;
         preview.debugView = 2;
@@ -1275,6 +1288,10 @@ int main(int argc, char** argv) {
         Check(pp.evalFailures == 0, "candidate preview frame evaluates");
         Check(MaxChannelDiff(p1.rb, pp.rb) > 20,
               "fixed candidate preview visibly changes the model texture");
+        bool opaque = pp.rb.pixels.size() == (size_t)DST_W * DST_H * 4;
+        for (size_t k = 0; opaque && k < (size_t)DST_W * DST_H; ++k)
+            opaque = pp.rb.pixels[k * 4 + 3] == 255;
+        Check(opaque, "candidate debug view stays opaque over zero-alpha scene");
     }
 
     // ---- the log -------------------------------------------------------

@@ -286,7 +286,10 @@ void main(uint3 id : SV_DispatchThreadID)
 
     if (gDebugView == 2)
     {
-        gTarget[id.xy] = float4(model * gWhitePoint, originalSample.a);
+        // DebugView=2 is an opaque view of the model texture. The game's
+        // source alpha can be zero, which made a fixed preview appear as a
+        // translucent overlay of the live scene and hid the black letterbox.
+        gTarget[id.xy] = float4(model * gWhitePoint, 1.0);
         return;
     }
 
