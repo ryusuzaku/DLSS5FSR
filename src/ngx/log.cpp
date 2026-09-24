@@ -166,6 +166,7 @@ void ConfigLoad(const std::wstring& dir) {
             else if (key == L"HipFeWindX")       c.hipFeWindX = std::stoi(val);
             else if (key == L"HipFeWindY")       c.hipFeWindY = std::stoi(val);
             else if (key == L"HipFeTransition")  c.hipFeTransition = std::stoi(val);
+            else if (key == L"CandidatePreviewPath") c.candidatePreviewPath = val;
             else if (key == L"WhitePoint")       c.whitePoint = std::stof(val);
             else if (key == L"ProxyMode")        c.proxyMode = std::stoi(val);
             else if (key == L"MaxRatio")         c.maxRatio = std::stof(val);
@@ -202,6 +203,9 @@ void ConfigLoad(const std::wstring& dir) {
     LOGI("config: live=%d block=%d strength=%.4f transpose=%d wind=%d,%d transition=%d",
          (int)c.hipFeLive, c.hipFeBlock, c.hipFeStrength, c.hipFfnTranspose,
          c.hipFeWindX, c.hipFeWindY, (int)c.hipFeTransition);
+    if (!c.candidatePreviewPath.empty())
+        LOGI("config: fixed candidate preview armed at %ls (DebugView=2 required; not live inference)",
+             c.candidatePreviewPath.c_str());
 }
 
 }  // namespace ngx

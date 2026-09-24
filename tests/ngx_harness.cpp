@@ -506,6 +506,7 @@ struct IniValues {
     // behaviour it was pinned with; the live-chain pass arms it explicitly.
     int hipFeLive = 0;
     int hipFeTransition = 0;
+    std::string candidatePreviewPath;
     // S231 step 3: the default is the SHIPPED reading (2, our map), so a green run
     // means the path the game runs is right. Only the c256f2 check consults this --
     // it is the one staged check that applies the same un-permutation the live
@@ -547,6 +548,7 @@ static bool WriteIni(const std::string& dir, const IniValues& v) {
             "DumpEvery=%d\n"
             "HipFeLive=%d\n"
             "HipFeTransition=%d\n"
+            "CandidatePreviewPath=%s\n"
             "HipFfnTranspose=%d\n"
             "DumpField=%d\n",
             v.nrPasses, v.hipBackend, v.hipWeightsDir.c_str(),
@@ -556,7 +558,8 @@ static bool WriteIni(const std::string& dir, const IniValues& v) {
             v.colourStrength, v.modelScale, v.whitePoint, v.proxyMode,
             v.maxRatio,
             v.passthrough, v.debugView, v.dumpFrames, v.dumpEvery,
-            v.hipFeLive, v.hipFeTransition, v.hipFfnTranspose, v.dumpField);
+            v.hipFeLive, v.hipFeTransition, v.candidatePreviewPath.c_str(),
+            v.hipFfnTranspose, v.dumpField);
     fclose(f);
     return true;
 }
@@ -1257,6 +1260,23 @@ int main(int argc, char** argv) {
         Check(liveChecks == 1, "the selected arm's live chain ran");
     }
 
+    // Optional fixed candidate image through the real D3D12/HIP model-texture
+    // bridge. This checks display plumbing and upload timing, not inference on
+    // the harness gradient. Keep it opt-in so the normal 117 checks are stable.
+    const char* previewEnv = getenv("DLSS5_CANDIDATE_PREVIEW");
+    if (previewEnv && *previewEnv) {
+        printf("\n-- pass 9: fixed candidate preview model texture --\n");
+        IniValues preview;
+        preview.candidatePreviewPath = previewEnv;
+        preview.debugView = 2;
+        PassResult pp = RunPass(ngx, d, iniDir, preview, color.Get(),
+                                output.Get(), SRC_W, SRC_H, DST_W, DST_H,
+                                kFrames);
+        Check(pp.evalFailures == 0, "candidate preview frame evaluates");
+        Check(MaxChannelDiff(p1.rb, pp.rb) > 20,
+              "fixed candidate preview visibly changes the model texture");
+    }
+
     // ---- the log -------------------------------------------------------
     // Pass 2 asserts the frame is unchanged at strength 0, which is also what
     // a chain that never ran would produce. The shim warns when it falls back
@@ -1275,6 +1295,14 @@ int main(int argc, char** argv) {
             size_t n;
             while ((n = fread(buf, 1, sizeof(buf), f)) > 0) text.append(buf, n);
             fclose(f);
+            if (previewEnv && *previewEnv) {
+                Check(text.find("fixed candidate preview center-pixel device readback exact")
+                          != std::string::npos,
+                      "fixed candidate preview upload/readback is exact");
+                Check(text.find("fixed candidate preview upload frame")
+                          != std::string::npos,
+                      "fixed candidate preview upload timing was logged");
+            }
 
             // Counted, not just searched: every pass should have run the
             // chain, and one fallback anywhere is a failure.
@@ -1939,7 +1967,8 @@ int main(int argc, char** argv) {
             // per mode, so it contributes two beyond the single-pass count, and
             // S223c's f16 dump pass and S223d's live-chain pass (one arm per
             // process, chosen by DLSS5_ARM) are one single pass each.
-            Check(inits == 1 + 8 + 2 + 1, "every pass initialised the shim");
+            Check(inits == 1 + 8 + 2 + 1 + ((previewEnv && *previewEnv) ? 1 : 0),
+                  "every pass initialised the shim");
             Check(hipReady >= 1, "the HIP model ran at least once");
             Check(hipDegraded == 0, "no degradation to the identity model");
         }

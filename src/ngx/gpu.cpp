@@ -996,6 +996,8 @@ bool GpuPrepareHipModel(uint64_t n, const Config& cfg) {
     // through the frontend+chain, block answer into sharedOut, window
     // bytes + block checksum logged for the offline oracle recompute.
     HipFeBlockStaged();
+    if (!cfg.candidatePreviewPath.empty() && !HipCandidatePreview())
+        LOGW("nr: fixed candidate preview failed; keeping the existing model output");
 
     // Refresh the model texture on our own queue. Ping-pong makes the rewrite
     // safe even though the gate above accepts a one-frame-late counter:

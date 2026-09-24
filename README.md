@@ -100,4 +100,20 @@ HIP/scalar stages and handoffs pass exactly. The public-gain blended frame has
 0.005367 MAE against the same-image public FP16 output; see
 [CANDIDATE_IMAGE_CHAIN.md](CANDIDATE_IMAGE_CHAIN.md) for replay and limits.
 
+An opt-in **fixed-image game preview** can check whether that candidate frame
+reaches the shim's D3D12/HIP model texture. Run
+`python tools/export_candidate_preview.py` with the locally generated frame and
+connected-GPU manifests, then set `CandidatePreviewPath` to the exported `.bin`
+and `DebugView=2` in the game's `dlssnr_shim.ini`. The game should display a
+centered square of the candidate image; the log reports an exact GPU pixel
+readback and upload time. Set `CandidatePreviewPath=` and `DebugView=0` to
+restore the normal game path. This preview replays one blue-marble image on
+every frame. It does not apply the candidate network to the live scene, and
+its upload timing is not inference timing. The live shim still uses its earlier
+64-token encoder path; connecting the full 256×256 encoder, ViT, decoder, and
+head to each game frame remains open work. If the preview DLL replaced an
+existing game install, `tools/restore_candidate_preview.ps1 -BackupDir
+<backup-folder> -GameDir <game-bin-x64-folder>` restores the saved DLLs and
+configuration after the game is closed.
+
 Source code here is experimental. No NVIDIA binaries or weights are bundled.

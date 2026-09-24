@@ -97,6 +97,15 @@ struct State {
 
     uint64_t runs = 0;  // successful model launches (for the log)
 
+    // Opt-in fixed-image preview. Keep its host expansion cached so a frame
+    // only pays for one upload; the normal network path never reads this.
+    std::wstring previewPath;
+    bool previewLoadAttempted = false;
+    std::vector<unsigned char> preview8, preview16, previewFrame;
+    unsigned int previewW = 0, previewH = 0, previewBpp = 0;
+    UINT64 previewPitch = 0;
+    uint64_t previewRuns = 0;
+
     // The FP8 GEMM self-test: runs once when configured, proves the whole
     // "real weights through rocWMMA inside the shim" chain bit-exactly.
     bool selfTestDone = false;
@@ -513,6 +522,119 @@ bool RunModel() {
     if (s.runs == 0)
         LOGI("hip: identity model ready (first launch)");
     ++s.runs;
+    return true;
+}
+
+bool CandidatePreview() {
+    State& s = S();
+    const Config& cfg = Cfg();
+    if (cfg.candidatePreviewPath.empty()) return true;
+    if (cfg.debugView != 2) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            LOGW("hip: fixed candidate preview requires DebugView=2; ignored");
+        }
+        return false;
+    }
+    if (!s.usable || !s.ptrOut || !s.pitch || !s.bytes ||
+        (s.bpp != 4 && s.bpp != 8) || !s.w || !s.h ||
+        s.w > 4096 || s.h > 4096 || s.pitch < (UINT64)s.w * s.bpp ||
+        s.bytes < s.pitch * s.h) {
+        LOGW("hip: fixed candidate preview staging format/extent unsupported");
+        return false;
+    }
+    if (s.previewPath != cfg.candidatePreviewPath) {
+        s.previewPath = cfg.candidatePreviewPath;
+        s.previewLoadAttempted = false;
+        s.preview8.clear(); s.preview16.clear(); s.previewFrame.clear();
+        s.previewRuns = 0;
+    }
+    if (!s.previewLoadAttempted) {
+        s.previewLoadAttempted = true;
+        FILE* file = _wfopen(s.previewPath.c_str(), L"rb");
+        if (!file) {
+            LOGE("hip: fixed candidate preview not readable: %ls", s.previewPath.c_str());
+            return false;
+        }
+        const size_t n8 = 256u * 256u * 4u, n16 = n8 * 2u;
+        unsigned char header[16]{};
+        bool valid = fread(header, 1, sizeof(header), file) == sizeof(header);
+        const unsigned char magic[8] = {'D','5','P','R','E','V','0','1'};
+        unsigned int w = 0, h = 0;
+        if (valid) {
+            memcpy(&w, header + 8, 4); memcpy(&h, header + 12, 4);
+            valid = memcmp(header, magic, 8) == 0 && w == 256 && h == 256;
+        }
+        if (valid) {
+            s.preview8.resize(n8); s.preview16.resize(n16);
+            valid = fread(s.preview8.data(), 1, n8, file) == n8 &&
+                    fread(s.preview16.data(), 1, n16, file) == n16 &&
+                    fgetc(file) == EOF;
+        }
+        fclose(file);
+        if (!valid) {
+            s.preview8.clear(); s.preview16.clear();
+            LOGE("hip: fixed candidate preview has wrong header or size");
+            return false;
+        }
+        LOGI("hip: fixed 256x256 candidate preview loaded (%ls); this is replay, not live inference",
+             s.previewPath.c_str());
+    }
+    if (s.preview8.empty() || s.preview16.empty()) return false;
+    if (s.previewFrame.empty() || s.previewW != s.w || s.previewH != s.h ||
+        s.previewBpp != s.bpp || s.previewPitch != s.pitch) {
+        s.previewW = s.w; s.previewH = s.h;
+        s.previewBpp = s.bpp; s.previewPitch = s.pitch;
+        s.previewFrame.assign((size_t)s.bytes, 0);
+        const unsigned int side = s.w < s.h ? s.w : s.h;
+        const unsigned int left = (s.w - side) / 2, top = (s.h - side) / 2;
+        const auto& src = s.bpp == 4 ? s.preview8 : s.preview16;
+        for (unsigned int y = 0; y < side; ++y) {
+            const unsigned int sy = y * 256u / side;
+            for (unsigned int x = 0; x < side; ++x) {
+                const unsigned int sx = x * 256u / side;
+                const size_t dst = (size_t)(top + y) * (size_t)s.pitch +
+                                   (size_t)(left + x) * s.bpp;
+                const size_t source = ((size_t)sy * 256u + sx) * s.bpp;
+                memcpy(s.previewFrame.data() + dst, src.data() + source, s.bpp);
+            }
+        }
+        LOGI("hip: fixed preview expanded to %ux%u bpp=%u pitch=%llu, centered square %u",
+             s.w, s.h, s.bpp, (unsigned long long)s.pitch, side);
+    }
+    LARGE_INTEGER frequency{}, begin{}, end{};
+    QueryPerformanceFrequency(&frequency);
+    QueryPerformanceCounter(&begin);
+    hipError_t e = s.Memcpy(s.ptrOut, s.previewFrame.data(),
+                            s.previewFrame.size(), hipMemcpyHostToDevice);
+    if (e == hipSuccess) e = s.StreamSynchronize(s.stream);
+    QueryPerformanceCounter(&end);
+    if (e != hipSuccess) {
+        LOGE("hip: fixed preview upload failed: %s", s.GetErrorString(e));
+        return false;
+    }
+    if (s.previewRuns == 0) {
+        unsigned char actual[8]{};
+        const unsigned int side = s.w < s.h ? s.w : s.h;
+        const size_t center = (size_t)(s.h / 2) * (size_t)s.pitch +
+                              (size_t)(s.w / 2) * s.bpp;
+        if (s.Memcpy(actual, (const unsigned char*)s.ptrOut + center,
+                     s.bpp, hipMemcpyDeviceToHost) != hipSuccess ||
+            memcmp(actual, s.previewFrame.data() + center, s.bpp) != 0) {
+            LOGE("hip: fixed candidate preview center-pixel readback differs");
+            return false;
+        }
+        LOGI("hip: fixed candidate preview center-pixel device readback exact");
+    }
+    if ((s.previewRuns++ % 60) == 0) {
+        double ms = frequency.QuadPart > 0
+            ? 1000.0 * (double)(end.QuadPart - begin.QuadPart) /
+                  (double)frequency.QuadPart : 0.0;
+        LOGI("hip: fixed candidate preview upload frame %llu %.3f ms (%llu bytes); not inference timing",
+             (unsigned long long)s.previewRuns, ms,
+             (unsigned long long)s.previewFrame.size());
+    }
     return true;
 }
 
@@ -10221,6 +10343,7 @@ bool HipC256blkBlockTest() { return hipb::C256blkBlockTestImpl(); }
 bool HipC32blkBlockTest() { return hipb::C32blkBlockTestImpl(); }
 void HipFeBlockView() { hipb::FeBlockView(); }
 bool HipFeBlockStaged() { return hipb::FeBlockStaged(); }
+bool HipCandidatePreview() { return hipb::CandidatePreview(); }
 UINT64 HipStagingRowPitch() { return hipb::StagingRowPitch(); }
 UINT64 HipStagingBytes() { return hipb::StagingBytes(); }
 ID3D12Resource* HipStagingIn() { return hipb::StagingIn(); }
