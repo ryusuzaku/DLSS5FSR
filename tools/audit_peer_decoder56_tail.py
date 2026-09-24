@@ -28,10 +28,10 @@ def metrics(a,b):
 
 
 def run(case='image_fp8'):
-    if case not in ('image_fp8','image_from_block48','image_from39','image_from38','image_encoder_skip30'):raise ValueError('bad case')
+    if case not in ('image_fp8','image_from_block48','image_from39','image_from38','image_encoder_skip30','image_candidate_vit16'):raise ValueError('bad case')
     source=json.loads((SOURCE/'manifest.json').read_text())
     order=peer_to_native_multihead(np.arange(128))
-    prefix=(FROM39/f'upsample56_{case.removeprefix("image_")}' if case in ('image_from39','image_from38','image_encoder_skip30') else
+    prefix=(FROM39/f'upsample56_{case.removeprefix("image_")}' if case in ('image_from39','image_from38','image_encoder_skip30','image_candidate_vit16') else
             ROOT/'build/upsample56_prefix_derived'/case)
     p=json.loads((prefix/'manifest.json').read_text())
     if not p['hip_projection_merge_exact'] or \
@@ -41,7 +41,7 @@ def run(case='image_fp8'):
     previous=prefix/'merged_device.f32'
     stages={}
     for block in range(56,62):
-        root=(FROM39/f'peer_decoder56_{case.removeprefix("image_")}'/f'block{block}' if case in ('image_from39','image_from38','image_encoder_skip30') else
+        root=(FROM39/f'peer_decoder56_{case.removeprefix("image_")}'/f'block{block}' if case in ('image_from39','image_from38','image_encoder_skip30','image_candidate_vit16') else
               ROOT/'build/block56_candidate'/case if block==56 else
               ROOT/'build'/f'decoder{block}_candidate_derived'/case)
         m=json.loads((root/'manifest.json').read_text())
@@ -65,7 +65,7 @@ def run(case='image_fp8'):
                 block_output_stages=stages,exact_device_handoffs=6,
                 scalar_hip_stages_exact=True,original_kernel_executed=False,
                 original_runtime_validation=False,production_wiring=False)
-    out=(ROOT/'build'/f'peer_decoder56_tail_audit_{case.removeprefix("image_")}' if case in ('image_from39','image_from38','image_encoder_skip30') else
+    out=(ROOT/'build'/f'peer_decoder56_tail_audit_{case.removeprefix("image_")}' if case in ('image_from39','image_from38','image_encoder_skip30','image_candidate_vit16') else
          OUT if case=='image_fp8' else ROOT/'build/peer_decoder56_tail_audit_from48')
     out.mkdir(parents=True,exist_ok=True)
     (out/'manifest.json').write_text(json.dumps(report,indent=2)+'\n')
@@ -74,5 +74,5 @@ def run(case='image_fp8'):
 
 if __name__=='__main__':
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--case',choices=('image_fp8','image_from_block48','image_from39','image_from38','image_encoder_skip30'),default='image_fp8')
+    parser.add_argument('--case',choices=('image_fp8','image_from_block48','image_from39','image_from38','image_encoder_skip30','image_candidate_vit16'),default='image_fp8')
     run(parser.parse_args().case)

@@ -67,12 +67,14 @@ test executables with `tools/build_split512_block.sh`.
 
 The additional same-image encoder branch starts from public block22, runs
 candidate AMD split-encoder blocks23–30 and the 4×4 C1024 head, and checks
-the source-derived logical ViT bridge plus the ViT31 FFN/QKV prefix. Run
+the source-derived logical ViT bridge plus candidate ViT31–38. Run
 `check_split512_encoder_peer_image.py` for the native shifted schedule and
 `check_split512_encoder_peer_image.py --unshifted-control` to isolate the
 public model's zero-shift behavior. `check_vit31_peer_image.py` consumes the
-native-schedule head. [CANDIDATE_IMAGE_CHAIN.md](CANDIDATE_IMAGE_CHAIN.md)
-gives the continuation through block39–69 and the full-frame head, along with
-the 16-token ViT attention and original physical-layout limits.
+native-schedule head, then `check_vit16_peer_image_chain.py` and
+`audit_vit16_peer_image.py`. [CANDIDATE_IMAGE_CHAIN.md](CANDIDATE_IMAGE_CHAIN.md)
+gives the continuation through block39–69 and the full-frame head. The 16-token
+attention reduction is experimental: its original-kernel order and physical
+ViT bridge remain unverified.
 
 Source code here is experimental. No NVIDIA binaries or weights are bundled.

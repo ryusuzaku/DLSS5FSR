@@ -32,9 +32,9 @@ def metrics(candidate, reference):
                 correlation=float(np.corrcoef(candidate.ravel(), reference.ravel())[0, 1]))
 
 
-def run(output_root=None, candidate_skip30=None):
-    if candidate_skip30 is not None and output_root is None:
-        raise ValueError('candidate skip requires a distinct --output-root')
+def run(output_root=None, candidate_skip30=None, candidate_vit38=None):
+    if (candidate_skip30 is not None or candidate_vit38 is not None) and output_root is None:
+        raise ValueError('candidate input requires a distinct --output-root')
     src = json.loads((SOURCE / 'manifest.json').read_text())
     for name in ('vit38', 'skip30', 'merge39', 'block39'):
         if digest(SOURCE / f'{name}_peer.f32') != src['tensor_sha256'][name]:
@@ -45,7 +45,21 @@ def run(output_root=None, candidate_skip30=None):
     p512 = peer_to_native_multihead(np.arange(512))
     peer_vit = np.fromfile(SOURCE / 'vit38_peer.f32', '<f4').reshape(4, 4, 1024)
     peer_skip = np.fromfile(SOURCE / 'skip30_peer.f32', '<f4').reshape(8, 8, 512)
-    main = np.empty_like(peer_vit); main[..., p1024] = peer_vit; main = F(main)
+    if candidate_vit38 is None:
+        main = np.empty_like(peer_vit); main[..., p1024] = peer_vit; main = F(main)
+        candidate_vit_sha256 = None
+    else:
+        vit = Path(candidate_vit38).resolve()
+        ancestry = json.loads((vit / 'report.json').read_text())
+        if (ancestry['source_model_sha256'] != src['model_sha256'] or
+                ancestry['source_image_sha256'] != src['image_sha256'] or
+                not ancestry['hip_scalar_exact']):
+            raise ValueError('candidate ViT38 model/image/exactness differs')
+        candidate = vit / 'inverse_bridge/device.f32'
+        if digest(candidate) != ancestry['vit38_inverse_device_sha256']:
+            raise ValueError('candidate ViT38 inverse device hash differs')
+        main = np.fromfile(candidate, '<f4').reshape(4, 4, 1024)
+        candidate_vit_sha256 = digest(candidate)
     if candidate_skip30 is None:
         skip = np.empty_like(peer_skip); skip[..., p512] = peer_skip; skip = F(skip)
         candidate_skip_sha256 = None
@@ -102,11 +116,14 @@ def run(output_root=None, candidate_skip30=None):
         raise AssertionError('block39 AMD/scalar output differs')
     public_merge = np.fromfile(SOURCE / 'merge39_peer.f32', '<f4').reshape(8, 8, 512)
     public_output = np.fromfile(SOURCE / 'block39_peer.f32', '<f4').reshape(8, 8, 512)
-    report = dict(case='same_image_public_vit38_candidate_skip30' if candidate_skip30 is not None
-                  else 'same_image_public_vit38_skip30',
+    report = dict(case='same_image_candidate_vit38_skip30' if candidate_vit38 is not None and candidate_skip30 is not None
+                  else 'same_image_candidate_vit38_public_skip30' if candidate_vit38 is not None else
+                  'same_image_public_vit38_candidate_skip30' if candidate_skip30 is not None else
+                  'same_image_public_vit38_skip30',
                   source_model_sha256=src['model_sha256'],
                   source_image_sha256=src['image_sha256'],
                   source_vit38_peer_sha256=src['tensor_sha256']['vit38'],
+                  candidate_vit38_inverse_device_sha256=candidate_vit_sha256,
                   source_skip30_peer_sha256=src['tensor_sha256']['skip30'],
                   candidate_skip30_device_sha256=candidate_skip_sha256,
                   block39_tensor_sha256=digest(raw_path),
@@ -117,7 +134,11 @@ def run(output_root=None, candidate_skip30=None):
                   hip_scalar_stages_exact=3,
                   merged_half_vs_public_fp16=metrics(merged_half[..., p512], public_merge),
                   output_fp8_vs_public_fp16=metrics(output[..., p512], public_output),
-                  basis='C1024/C512 P relation exact for block39 projection; public logical ViT and candidate encoder skip'
+                  basis='C1024/C512 P relation exact for block39 projection; 16-token candidate ViT and candidate encoder skip; physical map/original attention unverified'
+                  if candidate_vit38 is not None and candidate_skip30 is not None else
+                  'C1024/C512 P relation exact for block39 projection; 16-token candidate ViT and public encoder skip; physical map/original attention unverified'
+                  if candidate_vit38 is not None else
+                  'C1024/C512 P relation exact for block39 projection; public logical ViT and candidate encoder skip'
                   if candidate_skip30 is not None else
                   'C1024/C512 P relation exact for block39 projection; public logical ViT and skip inputs',
                   native_vit_physical_bridge_validated=False,
@@ -133,5 +154,7 @@ if __name__ == '__main__':
     parser.add_argument('--output-root', type=Path)
     parser.add_argument('--candidate-skip30', type=Path,
                         help='encoder candidate output root, using its block30 AMD device skip')
+    parser.add_argument('--candidate-vit38', type=Path,
+                        help='ViT16 candidate chain root, using its inverse bridge device output')
     args = parser.parse_args()
-    run(args.output_root, args.candidate_skip30)
+    run(args.output_root, args.candidate_skip30, args.candidate_vit38)

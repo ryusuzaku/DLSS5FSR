@@ -169,3 +169,22 @@ __global__ void k_vit_attention(const float* qkv,const float* exponents,
     numerator=split512_half((float)(double(numerator)+second));
     output[i]=split512_fp8(split512_half(numerator*split512_half(1.0f/den)));
 }
+
+// Candidate for the image's 16 valid tokens. The original 16-token reduction
+// order has not been checked against an SM120 execution.
+__global__ void k_vit_attention16_candidate(const float* qkv,const float* exponents,
+                                             float* output) {
+    int i=blockIdx.x*blockDim.x+threadIdx.x;
+    if(i>=16*1024)return;
+    int query=i/1024,head=i%1024/32,channel=i%32;
+    const float* e=exponents+(head*16+query)*16;
+    double den=0.0,numerator=0.0;
+    for(int key=0;key<16;++key) {
+        den+=double(e[key]);
+        numerator+=double(split512_fp8(e[key]))*
+                   double(qkv[key*3072+2048+head*32+channel]);
+    }
+    float half_den=split512_half(float(den));
+    float half_num=split512_half(float(numerator));
+    output[i]=split512_fp8(split512_half(half_num*split512_half(1.0f/half_den)));
+}

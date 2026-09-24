@@ -14,6 +14,7 @@ sys.path.insert(0,str(ROOT/'ref/dlss5-port/Development'))
 import native_vit_linear_reference as V
 import native_vit_qkv_reference as Q
 import native_vit_attention_reference as A
+import vit_attention16_candidate as A16
 from native_c64_reference import multiply
 from native_c32_reference import H
 
@@ -44,10 +45,14 @@ def run_block(block,width=8,height=4,derived=False,image_source=None,output_root
             if mapped.tobytes()!=np.asarray(head[gather],dtype='<f4').tobytes():
                 raise ValueError('HIP bridge output differs bytewise from PTX map gather')
     else:
-        if tokens!=64:raise ValueError('connected ViT attention requires 64 tokens')
-        suffix='_derived' if derived else ''
-        previous=f'vit_expand_chain_16x4{suffix}' if block==32 else f'vit_block{block-1}_16x4{suffix}'
-        source_path=ROOT/'build'/previous/'projection_device.f32'
+        if tokens==16 and image_source is not None and derived:
+            source_path=Path(image_source)
+        elif tokens==64:
+            suffix='_derived' if derived else ''
+            previous=f'vit_expand_chain_16x4{suffix}' if block==32 else f'vit_block{block-1}_16x4{suffix}'
+            source_path=ROOT/'build'/previous/'projection_device.f32'
+        else:
+            raise ValueError('connected ViT attention requires 64 tokens or explicit 4x4 candidate source')
         if not source_path.is_file():raise FileNotFoundError(f'run block{block-1} first')
     x=np.fromfile(source_path,'<f4')
     if x.size!=tokens*1024:raise ValueError('wrong ViT source extent')
@@ -77,7 +82,7 @@ def run_block(block,width=8,height=4,derived=False,image_source=None,output_root
     q,k,v=Q.qkv(contract,qkv_weights,qkv_scales)
     qkv=np.stack((q,k,v),axis=1)
     attention_data={}
-    if tokens==64:
+    if tokens in (16,64):
         qb,kb=(a.reshape(tokens,32,32).transpose(1,0,2) for a in (q,k))
         scores=H(qb@kb.transpose(0,2,1))
         coefficient=np.array([0x2dbb],np.uint16).view(np.float16).astype(np.float32)[0]
@@ -85,7 +90,12 @@ def run_block(block,width=8,height=4,derived=False,image_source=None,output_root
                        1.439453125,1.9775390625)
         bits=affine.astype(np.float16).view(np.uint16).astype(np.uint32)
         exponents=(((bits<<4)+0x4000)&65535).astype(np.uint16).view(np.float16).astype(np.float32)
-        attention=A.attention(q,k,v)
+        if tokens==16:
+            candidate_scores,candidate_exponents,attention=A16.reference(q,k,v)
+            np.testing.assert_array_equal(candidate_scores,scores)
+            np.testing.assert_array_equal(candidate_exponents,exponents)
+        else:
+            attention=A.attention(q,k,v)
         projection_record=records[f'block{block}.layer4.layer']
         projection_path=ROOT/'dlss5-analysis/tensors'/f"tensor_{projection_record['index']:03d}.bin"
         projection_raw=projection_path.read_bytes()
@@ -121,14 +131,19 @@ def run_block(block,width=8,height=4,derived=False,image_source=None,output_root
                 contraction_tensor=contract_record['index'],
                 contraction_sha256=hashlib.sha256(contract_raw).hexdigest(),
                 qkv_tensor=qkv_record['index'],qkv_sha256=hashlib.sha256(qkv_raw).hexdigest(),
-                bridge=('candidate 4x4 logical C512/ViT map; original physical bridge unverified'
+                bridge=('prior candidate ViT device projection; original physical bridge unverified'
+                        if image_source is not None and block>31 else
+                        'candidate 4x4 logical C512/ViT map; original physical bridge unverified'
                         if image_source is not None else
                         'upstream capture-derived logical map composed with original PTX physical source; no original-kernel execution'
                         if derived else 'PTX source-linear map on logical-HWC control; C512 split-view composition missing; no original-kernel execution'),
                 oracle='unchanged native_vit_linear_reference, native_vit_qkv_reference, native_vit_attention_reference, and native_c64_reference.multiply',
                 comparison='exact')
+    if tokens==16:
+        report['attention_contract']='16 valid keys; float64 sum then half denominator, FP8 exponent-value product; candidate only, original reduction unverified'
+        report['oracle']='native ViT linear/QKV scalar references plus vit_attention16_candidate; exact candidate comparison, not original parity'
     if block==31 and head_path is not None:report['head_sha256']=hashlib.sha256(head_path.read_bytes()).hexdigest()
-    if tokens==64:
+    if tokens in (16,64):
         report['projection_tensor']=projection_record['index']
         report['projection_sha256']=hashlib.sha256(projection_raw).hexdigest()
     subprocess.run([str(exe),str(folder),str(tokens)],cwd=ROOT,check=True)

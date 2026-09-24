@@ -58,7 +58,9 @@ def run(split512=False, output_root=None, amd_block39=False, chain_report=None, 
                      ROOT / 'build/split512_peer_image_from38_report.json' if amd_block39 else
                      ROOT / 'build/split512_peer_image_report.json')
         chain = json.loads(report_path.read_text())
-        if chain_report is not None and chain['source_case'] != 'AMD block39 from public ViT38/candidate encoder skip30':
+        if chain_report is not None and chain['source_case'] not in (
+                'AMD block39 from public ViT38/candidate encoder skip30',
+                'AMD block39 from candidate ViT38/candidate encoder skip30'):
             raise ValueError('custom C512 chain lacks candidate encoder skip provenance')
         if chain['source_model_sha256'] != src['model_sha256'] or chain['source_image_sha256'] != src['image_sha256']:
             raise ValueError('split512 source model/image differs')
@@ -66,8 +68,14 @@ def run(split512=False, output_root=None, amd_block39=False, chain_report=None, 
             entry_dir=(Path(block39_dir) if block39_dir is not None else
                        Path.home() / 'DLSS5FSR-build-offload' / 'decoder39_peer_image')
             entry = json.loads((entry_dir / 'manifest.json').read_text())
-            if block39_dir is not None and entry['case'] != 'same_image_public_vit38_candidate_skip30':
+            if block39_dir is not None and entry['case'] not in (
+                    'same_image_public_vit38_candidate_skip30',
+                    'same_image_candidate_vit38_skip30'):
                 raise ValueError('custom block39 fixture lacks candidate encoder skip provenance')
+            if block39_dir is not None and (
+                    (entry['case'] == 'same_image_candidate_vit38_skip30') !=
+                    (chain['source_case'] == 'AMD block39 from candidate ViT38/candidate encoder skip30')):
+                raise ValueError('custom ViT ancestry differs between block39 and C512 chain')
             if chain['source_block39_native_sha256'] != entry['output_device_sha256']:
                 raise ValueError('AMD block39 handoff differs')
         candidate = Path(chain['output_root']) / 'block47-8x8-s2' / 'final_device.f32'
@@ -112,7 +120,9 @@ def run(split512=False, output_root=None, amd_block39=False, chain_report=None, 
     if (out / 'merged_device.f32').read_bytes() != (out / 'merged.f32').read_bytes():
         raise AssertionError('prefix HIP/scalar merge differs')
     public = np.fromfile(SOURCE / 'merge48_peer.f32', '<f4').reshape(16, 16, 256)
-    report = dict(case='image_fp8_encoder_skip30' if chain_report is not None else
+    report = dict(case=('image_fp8_candidate_vit16' if chain_report is not None and
+                        chain['source_case'] == 'AMD block39 from candidate ViT38/candidate encoder skip30' else
+                        'image_fp8_encoder_skip30') if chain_report is not None else
                   'image_fp8_from38' if amd_block39 else 'image_fp8_from39' if split512 else 'image_fp8', input_extent=[8, 8, 512],
                   output_extent=[16, 16, 256],
                   source_model_sha256=src['model_sha256'],

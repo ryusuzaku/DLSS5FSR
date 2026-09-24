@@ -25,14 +25,62 @@ the public ONNX encoder's zero-shift windows; the native-shift run remains the
 candidate path. Neither comparison validates an original NVIDIA kernel.
 
 `tools/check_vit31_peer_image.py` takes the *native-schedule AMD head device
-bytes*, applies the 4×4 source-derived logical ViT map on AMD, and runs the
-ViT31 expansion, gated hidden, contract/residual, QKV projection, and QKV
-normalization. The bridge's 16,384 values and all five ViT stages match their
-scalar candidates exactly. The ViT31 contract device SHA256 is
-`50456897945dc46ae9fa8699b9349c425e67baf1df97a49fb5f585095727fab5`.
-The original physical C512→ViT map is still unverified, and the available
-native attention reference covers 64/128/256 tokens, not this image's 16.
-Therefore this branch stops before ViT31 attention and does not reach ViT38.
+bytes*, applies the 4×4 source-derived logical ViT map on AMD, and runs all of
+ViT31, including a **candidate** 16-key attention reduction and final
+projection. `tools/check_vit16_peer_image_chain.py` continues its device output
+through ViT32–38 and applies the inverse logical map on AMD. Every HIP stage
+and device handoff matches its scalar candidate exactly. The bridge's 16,384
+values are exact against the declared gather. The final ViT38 projection
+device SHA256 is
+`2126421cb98ea2f64690d91929d201cb00164ab3c03105e9a41e3799737da361`.
+
+The 16-token attention uses the public graph's 16 valid keys and the recovered
+score/exponent transform, with a declared half-rounded reduction. The available
+native attention reference covers 64/128/256 tokens; **the original 16-token
+reduction order has not been checked against an original kernel**. The original
+physical C512→ViT and ViT→C512 maps are also unverified. In the public ViT
+basis, the ViT38 candidate has 0.43860 MAE and 0.87659 correlation against
+the same-image public FP16 graph. `tools/audit_vit16_peer_image.py` checks
+every ViT31–38 public stage: MAE falls from 1.02998 at ViT31 to 0.43860 at
+ViT38, while correlation ranges from 0.87659 to 0.90114. These are diagnostics
+of the candidate against a different FP16 graph, not original-kernel parity.
+
+The candidate ViT38 output and AMD encoder30 skip then feed AMD decoder39–69
+and the full 256² head. All body/prefix/handoff checks remain exact against
+the scalar candidate, including all 1,024 head windows and the separate direct
+GPU-buffer merge/body/RGB check. Block39 vs public FP16 has 0.61445 MAE and
+0.89599 correlation; block69 has 1.08336/0.99061. With the public gain, the
+blended RGB image has 0.00493 MAE and 0.99918 correlation against the public
+FP16 final image, compared with 0.00805 input-color MAE. The render is finite
+and visually coherent. It still uses public block22, encoder22/14/8/4 skips,
+preblock skip, and color. No original kernel, independent C256/C32 logical-map
+holdout, or production game wiring has been validated.
+
+After the public extractions and HIP builds, replay this candidate line with
+large generated fixtures outside Git:
+
+```powershell
+$offload = Join-Path $HOME 'DLSS5FSR-build-offload'
+python tools/check_split512_encoder_peer_image.py --output-root "$offload/peer_split512_encoder_candidate"
+python tools/check_vit31_peer_image.py --encoder-root "$offload/peer_split512_encoder_candidate" --output-root "$offload/peer_vit31_candidate16"
+python tools/check_vit16_peer_image_chain.py --vit31-root "$offload/peer_vit31_candidate16" --output-root "$offload/peer_vit16_candidate"
+python tools/audit_vit16_peer_image.py --vit31-root "$offload/peer_vit31_candidate16" --chain-root "$offload/peer_vit16_candidate"
+python tools/check_decoder39_peer_image.py --candidate-vit38 "$offload/peer_vit16_candidate" --candidate-skip30 "$offload/peer_split512_encoder_candidate" --output-root "$offload/decoder39_candidate_vit16"
+python tools/check_split512_peer_image.py --amd-block39 --amd-block39-dir "$offload/decoder39_candidate_vit16" --output-root "$offload/peer_split512_candidate_vit16"
+python tools/check_upsample48_peer_image.py --chain-report "$offload/peer_split512_candidate_vit16/report.json" --block39-dir "$offload/decoder39_candidate_vit16" --output-root "$offload/upsample48_candidate_vit16"
+python tools/check_decoder48_55_peer_image.py --candidate-vit16 --prefix-root "$offload/upsample48_candidate_vit16" --output-root "$offload/peer_decoder48_candidate_vit16"
+python tools/check_upsample56_peer_image.py --candidate-vit16 --chain-root "$offload/peer_decoder48_candidate_vit16" --output-root "$offload/upsample56_candidate_vit16"
+foreach ($b in 56..61) { python tools/check_block56_candidate.py --case image_candidate_vit16 --block $b --width 32 --height 32 }
+python tools/audit_peer_decoder56_tail.py --case image_candidate_vit16
+python tools/check_upsample62_peer_image.py --case from_candidate_vit16_fp8
+foreach ($b in 62..65) { python tools/check_block62_candidate.py --case from_candidate_vit16_fp8 --block $b --width 64 --height 64 }
+python tools/audit_peer_decoder62_tail.py --case from_candidate_vit16_fp8
+python tools/check_upsample66_peer_image.py --case from_candidate_vit16_fp8
+foreach ($b in 66..69) { python tools/check_block66_peer_candidate.py --case from_candidate_vit16_fp8 --block $b --width 128 --height 128 }
+python tools/audit_peer_decoder66_tail.py --case from_candidate_vit16_fp8
+python tools/check_head70_peer_frame.py --latent-case from_candidate_vit16_fp8 --output-root "$offload/peer_head_frame_256_candidate_vit16"
+python tools/check_head70_peer_gpu_chain.py --latent-case from_candidate_vit16_fp8 --frame-dir "$offload/peer_head_frame_256_candidate_vit16" --output-dir "$offload/peer_head_frame_256_candidate_vit16_gpu"
+```
 
 A separate decoder continuation combines the public *logical* ViT38 with the
 candidate AMD block30 skip. `check_decoder39_peer_image.py --candidate-skip30`

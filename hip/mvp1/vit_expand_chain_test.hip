@@ -38,9 +38,9 @@ int main(int argc,char** argv) {
     ok=compare("ViT contract/residual",dc,contract)&&ok;
     ok=compare("ViT QKV projected",dqp,qkv_projected)&&ok;
     ok=compare("ViT QKV normalized",dq,qkv)&&ok;
-    if(tokens==64) {
-        auto scores=read(dir,"scores",32*64*64);
-        auto exponents=read(dir,"exponents",32*64*64);
+    if(tokens==64||tokens==16) {
+        auto scores=read(dir,"scores",size_t(32)*tokens*tokens);
+        auto exponents=read(dir,"exponents",size_t(32)*tokens*tokens);
         auto attention=read(dir,"attention",size_t(tokens)*1024);
         auto projection_weights=read(dir,"projection_weights",1024*1024);
         auto projection_skip=read(dir,"projection_skip",1024);
@@ -55,8 +55,12 @@ int main(int argc,char** argv) {
                            dq,ds,tokens);
         hipLaunchKernelGGL(k_vit_exponents,dim3((exponents.size()+255)/256),dim3(256),0,0,
                            ds,dex,int(exponents.size()));
-        hipLaunchKernelGGL(k_vit_attention,dim3((attention.size()+255)/256),dim3(256),0,0,
-                           dq,dex,da,tokens);
+        if(tokens==64)
+            hipLaunchKernelGGL(k_vit_attention,dim3((attention.size()+255)/256),dim3(256),0,0,
+                               dq,dex,da,tokens);
+        else
+            hipLaunchKernelGGL(k_vit_attention16_candidate,dim3((attention.size()+255)/256),dim3(256),0,0,
+                               dq,dex,da);
         hipLaunchKernelGGL(k_vit_residual_projection,dim3((projection.size()+255)/256),dim3(256),0,0,
                            da,dc,dpw,dps,dp,tokens,1024);
         HIP_CHECK(hipGetLastError());HIP_CHECK(hipDeviceSynchronize());

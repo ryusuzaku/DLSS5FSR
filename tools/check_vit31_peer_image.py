@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Connect same-image AMD encoder head to the validated ViT31 prefix."""
+"""Connect same-image AMD encoder head to a candidate 16-token ViT31."""
 from pathlib import Path
 import argparse
 import hashlib
@@ -56,9 +56,10 @@ def run(encoder_root, output_root):
                   map_sha256=digest(mapping / 'hwc-to-vit.i32'),
                   bridge_device_sha256=digest(case / 'device.f32'),
                   vit31_contract_device_sha256=digest(vit / 'contract_device.f32'),
+                  vit31_projection_device_sha256=digest(vit / 'projection_device.f32'),
                   vit31_qkv_scalar_sha256=digest(vit / 'qkv.f32'),
                   extent=[4, 4, 1024],
-                  scope='ViT31 expand, gated hidden, contract/residual, QKV projection and normalize; attention/projection pending',
+                  scope='ViT31 expansion, contract, QKV, candidate 16-key attention and final projection; original 16-token reduction unverified',
                   hip_scalar_exact=True, original_kernel_executed=False,
                   original_physical_bridge_validated=False)
     (out / 'report.json').write_text(json.dumps(result, indent=2) + '\n')

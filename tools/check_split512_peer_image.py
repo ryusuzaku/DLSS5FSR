@@ -51,8 +51,9 @@ def run(output_root, through=47, teacher_forced=False, unshifted_control=False,
                     Path.home() / 'DLSS5FSR-build-offload' / 'decoder39_peer_image')
         record = json.loads((upstream / 'manifest.json').read_text())
         candidate = upstream / 'output_device.f32'
-        if amd_block39_dir is not None and (record['case'] != 'same_image_public_vit38_candidate_skip30' or
-                                             not record.get('candidate_skip30_device_sha256')):
+        if amd_block39_dir is not None and (record['case'] not in (
+                'same_image_public_vit38_candidate_skip30', 'same_image_candidate_vit38_skip30') or
+                not record.get('candidate_skip30_device_sha256')):
             raise ValueError('custom AMD block39 lacks candidate encoder skip provenance')
         if (record['source_model_sha256'] != source['model_sha256'] or
                 record['source_image_sha256'] != source['image_sha256'] or
@@ -101,6 +102,8 @@ def run(output_root, through=47, teacher_forced=False, unshifted_control=False,
                 device_sha256=digest(folder / 'final_device.f32'))
             print(f"teacher block{block}: MAE {teacher[f'block{block}']['output_vs_public_fp16']['mae']:.7g}, "
                   f"corr {teacher[f'block{block}']['output_vs_public_fp16']['correlation']:.7g}")
+    custom_vit = bool(amd_block39_dir is not None and
+                      record['case'] == 'same_image_candidate_vit38_skip30')
     report = dict(source_model_sha256=source['model_sha256'],
                   source_image_sha256=source['image_sha256'],
                   source_block39_sha256=source['tensor_sha256']['block39'],
@@ -108,7 +111,9 @@ def run(output_root, through=47, teacher_forced=False, unshifted_control=False,
                   window_schedule='public ONNX unshifted control' if unshifted_control else 'native 0,3,1,2 repeat',
                   input_vs_public_fp16=first_input,
                   source_block39_native_sha256=source_block39_native_sha256,
-                  source_case=('AMD block39 from public ViT38/candidate encoder skip30'
+                  source_case=('AMD block39 from candidate ViT38/candidate encoder skip30'
+                               if custom_vit else
+                               'AMD block39 from public ViT38/candidate encoder skip30'
                                if amd_block39_dir is not None else
                                'AMD block39 from public ViT38/skip30' if amd_block39 else
                                'public block39 FP8-rounded'),

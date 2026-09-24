@@ -73,7 +73,7 @@ def run(size,latent_case='public',output_dir=None,frame_dir=None):
 if __name__=='__main__':
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--size',type=int,default=256)
-    p.add_argument('--latent-case',choices=('public','image_half','image_fp8','from62_fp8','from56_fp8','from48_fp8','from39_fp8','from38_fp8','from_encoder_skip30_fp8'),default='public')
+    p.add_argument('--latent-case',choices=('public','image_half','image_fp8','from62_fp8','from56_fp8','from48_fp8','from39_fp8','from38_fp8','from_encoder_skip30_fp8','from_candidate_vit16_fp8'),default='public')
     p.add_argument('--output-dir',type=Path)
     p.add_argument('--frame-dir',type=Path)
     a=p.parse_args();run(a.size,a.latent_case,a.output_dir,a.frame_dir)
