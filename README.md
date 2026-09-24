@@ -114,6 +114,9 @@ its upload timing is not inference timing. The live shim still uses its earlier
 head to each game frame remains open work. If the preview DLL replaced an
 existing game install, `tools/restore_candidate_preview.ps1 -BackupDir
 <backup-folder> -GameDir <game-bin-x64-folder>` restores the saved DLLs and
-configuration after the game is closed.
+configuration after the game is closed. A Cyberpunk 2077 run at 991×620
+confirmed the candidate square, exact HIP readback and model-texture copies
+without device errors. `DebugView=2` now outputs opaque alpha; the game's HUD
+and some later-rendered elements still appear above the diagnostic view.
 
 Source code here is experimental. No NVIDIA binaries or weights are bundled.
