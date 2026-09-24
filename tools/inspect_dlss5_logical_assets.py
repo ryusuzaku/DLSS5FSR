@@ -21,6 +21,10 @@ STEMS_C256 = tuple(f'block{b}-{kind}'
 COUNTS_C32 = {stem: 8736 if stem.endswith('-ffn') else 8225
               for stem in STEMS_C32 if stem not in ('post70-scales', 'post70-head')}
 COUNTS_C32.update({'post70-scales': 64, 'post70-head': 96})
+COUNTS_C256 = {stem: (1024*256 + 256*1024 + 256*256 + 256
+                     if stem.endswith('-ffn') else
+                     4*256*256 + 8*64*64 + 8 + 256)
+               for stem in STEMS_C256}
 
 
 def is_asset_name(name: str, direct: bool) -> bool:
@@ -62,11 +66,11 @@ def inventory(path: Path, with_hashes: bool) -> dict:
                 if len(matches) == 1:
                     name, size, source = matches[0]
                     result.update(path=name, bytes=size)
-                    if label == 'c32_recovery':
-                        expected = COUNTS_C32[stem] * (2 if name.endswith('.f16') else 4)
-                        result['expected_bytes'] = expected
-                        if size != expected:
-                            result['status'] = 'wrong_size'
+                    count = (COUNTS_C32 if label == 'c32_recovery' else COUNTS_C256)[stem]
+                    expected = count * (2 if name.endswith('.f16') else 4)
+                    result['expected_bytes'] = expected
+                    if size != expected:
+                        result['status'] = 'wrong_size'
                     if with_hashes:
                         h = hashlib.sha256()
                         if archive:
@@ -94,6 +98,8 @@ def main() -> int:
     parser.add_argument('path', type=Path, help='full package ZIP or extracted native-game-tiled-assets directory')
     parser.add_argument('--hash', action='store_true', help='include SHA256 of found target files')
     parser.add_argument('--out', type=Path, help='save JSON report at this path')
+    parser.add_argument('--require', choices=('c32_recovery', 'c256_followup', 'both'),
+                        default='c32_recovery', help='which file group controls the exit code')
     args = parser.parse_args()
     report = inventory(args.path, args.hash)
     encoded = json.dumps(report, indent=2) + '\n'
@@ -103,7 +109,8 @@ def main() -> int:
         args.out.parent.mkdir(parents=True, exist_ok=True)
         args.out.write_text(encoded, encoding='utf-8')
     print(encoded, end='')
-    return 0 if report['c32_recovery']['ready'] else 1
+    groups = ('c32_recovery', 'c256_followup') if args.require == 'both' else (args.require,)
+    return 0 if all(report[group]['ready'] for group in groups) else 1
 
 
 if __name__ == '__main__':

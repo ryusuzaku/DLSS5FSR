@@ -59,10 +59,19 @@ directory without installing the package. The four local source/peer ZIPs
 have 0/16 required C32 files and 0/28 C256 follow-up files. See
 `ASSET_ORACLE_HANDOFF.md` for commands and return artifacts.
 
+`tools/validate_c256_logical_assets.py --raw-only` verifies all 14 ordinary
+C256 packed tensors byte-for-byte against the signed DLL at the extracted
+offsets: **9,649,248/9,649,248** bytes. The full validator is ready to check
+the predeclared C256 maps against 28 supplied logical files (12,393,584
+values), but no genuine matching logical package has been obtained here.
+Synthetic directory/ZIP and one-coefficient-mutation tests check report and
+failure behavior only; they are not logical-map evidence.
+
 If the full asset directory or ZIP becomes available, run
 `python tools/recover_head70_maps.py --assets <path>` to infer C32 maps from
 logical weights, verify every coefficient, and hold out blocks69/70. Then
-check C256 logical arrays and skip-channel order against blocks48–55 before
+run `python tools/validate_c256_logical_assets.py --assets <path> --dll <path>
+--out <report.json>` for the C256 block15–21/49–55 exact comparison before
 promoting their status. A Blackwell machine instead allows direct probes of
 the local signed cubins. Neither route can be replaced by a small RGB MAE
 against the optimized public FP16 ONNX graph, whose arithmetic differs from

@@ -17,7 +17,10 @@ To help validate the logical weight maps, read
 run `tools/inspect_dlss5_logical_assets.py` without installing or executing
 the package. A matching original DLL and full logical assets are needed for
 the held-out C32 recovery script; it reads them locally and writes only small
-map/provenance files. `ORIGINAL_MAP_VALIDATION.md` records which claims are
+map/provenance files. `tools/validate_c256_logical_assets.py --raw-only`
+checks extracted C256 tensors against the matching DLL; with logical assets,
+the same tool checks all 14 ordinary C256 blocks without fitting C256 maps.
+`ORIGINAL_MAP_VALIDATION.md` records which claims are
 local checks and which are attributed to other projects.
 
 [CANDIDATE_IMAGE_CHAIN.md](CANDIDATE_IMAGE_CHAIN.md) records a same-image

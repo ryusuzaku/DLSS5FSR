@@ -18,8 +18,10 @@ python tools/inspect_dlss5_logical_assets.py "C:\path\to\OptiScaler-DLSS5-AMD-0.
 ```
 
 The script reads ZIP members without extracting or executing them. It checks
-the 16 C32 files needed by our recovery (including sizes), plus the 28
-ordinary C256 block15–21/49–55 files. Send back `asset-inventory.json` if
+the 16 C32 files needed by our recovery, plus the 28 ordinary C256
+block15–21/49–55 files, including expected sizes for both groups. Use
+`--require c256_followup` if you only need the C256 exit code. Send back
+`asset-inventory.json` if
 sharing the full ZIP is inconvenient. The report contains filenames, lengths
 and hashes, but **cannot itself prove the maps**. No account details or game
 files are needed for inventory.
@@ -27,6 +29,15 @@ files are needed for inventory.
 With the ZIP and a matching privately extracted DLL in the same working
 checkout, first generate `dlss5-analysis/tensors/` using
 `tools/extract_dlssnr.py`, then run:
+
+```powershell
+python tools/validate_c256_logical_assets.py --raw-only --dll "C:\path\to\nvngx_dlssnr.dll" --out "C:\path\to\c256-raw-provenance.json"
+```
+
+This first check needs no logical assets. It verifies the known DLL SHA256 and
+byte-compares all 14 extracted C256 tensors at their recorded DLL offsets.
+The expected total is 9,649,248 raw bytes. It does **not** validate logical
+coefficient maps. With logical assets, continue with the C32 and C256 checks:
 
 ```powershell
 python tools/recover_head70_maps.py --assets "C:\path\to\OptiScaler-DLSS5-AMD-0.29.zip" --out "build\head70_recovered_layouts_029"
@@ -39,8 +50,23 @@ small return artifacts are `PROVENANCE.json` and the three generated `.npz`
 map files in the output directory. They contain mappings and hashes, not
 the bulk model assets. The recovery fails without publishing maps when an
 input is ambiguous or a held-out comparison differs. C256 assets can then
-be used for a separate block15/49 coefficient and skip-order validation;
-the inventory checks presence only for C256.
+be used for a separate block15–21/49–55 coefficient and skip-order validation:
+
+```powershell
+python tools/validate_c256_logical_assets.py --assets "C:\path\to\OptiScaler-DLSS5-AMD-0.29.zip" --dll "C:\path\to\nvngx_dlssnr.dll" --out "C:\path\to\c256-validation.json"
+```
+
+The C256 validator compares predeclared candidate FFN, Q/K/V, projection,
+bias, scale and skip coordinates against all 14 supplied logical block pairs.
+It fits no C256 coefficients or bit maps. An exact result covers 12,393,584
+values; mismatch reports name the component and index without exporting
+weights. The ZIP or asset directory and this checkout's raw tensors must be
+from the same model build. The tool checks the DLL hash and verifies that each
+raw tensor's bytes occur at the recorded DLL offset. Send back
+`c256-validation.json`, which contains
+file/tensor hashes and counts rather than coefficient arrays. This validates
+the supplied package's logical interpretation; its own provenance and original
+GPU execution remain separate evidence.
 
 ## Blackwell owner: direct original oracle
 

@@ -58,6 +58,11 @@ image baseline is 0.00805 mean absolute error. The resulting image is finite
 and visually coherent, but it is a static public-model comparison and does
 not validate the original NVIDIA kernels or production game wiring.
 
+The independent C256 coordinate check is prepared in
+`tools/validate_c256_logical_assets.py`. Its verdict is pending a matching
+full package with logical files; the synthetic parser/checker smoke run is
+not map evidence.
+
 This full-frame run used an optional output directory on a second local drive
 because generated fixtures exceed the free space in the workspace. The output
 directory is not part of the public checkout.
