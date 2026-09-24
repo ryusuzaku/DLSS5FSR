@@ -15,6 +15,7 @@ from audit_peer_native_c32_basis import peer_to_native
 ROOT=Path(__file__).resolve().parents[1]
 SOURCE=ROOT/'build/peer_decoder66_inputs'
 OUT=ROOT/'build/peer_decoder66_tail_audit'
+FROM39=Path.home()/'DLSS5FSR-build-offload'
 
 
 def digest(path):return hashlib.sha256(Path(path).read_bytes()).hexdigest()
@@ -40,15 +41,17 @@ def run(cases=None):
                 original_runtime_validation=False,
                 production_wiring=False)
     for case in (cases or ('image_half','image_fp8','from62_fp8','from56_fp8')):
-        prefix=ROOT/'build/upsample66_prefix_derived'/case
+        prefix=(FROM39/'upsample66_from39' if case=='from39_fp8' else
+                ROOT/'build/upsample66_prefix_derived'/case)
         p=json.loads((prefix/'manifest.json').read_text())
         if not p['hip_projection_merge_exact'] or \
            digest(prefix/'merged_device.f32')!=p['output_device_sha256']:
             raise ValueError('prefix not exact/hash valid')
-        if case in ('from62_fp8','from56_fp8','from48_fp8'):
+        if case in ('from62_fp8','from56_fp8','from48_fp8','from39_fp8'):
             audit_dir=('peer_decoder62_tail_audit' if case=='from62_fp8' else
                        'peer_decoder62_tail_audit_from56' if case=='from56_fp8' else
-                       'peer_decoder62_tail_audit_from48')
+                       'peer_decoder62_tail_audit_from48' if case=='from48_fp8' else
+                       'peer_decoder62_tail_audit_from39')
             upstream=ROOT/'build'/audit_dir/'manifest.json'
             u=json.loads(upstream.read_text())
             if p['upstream_amd_block65']['audit_sha256']!=digest(upstream) or \
@@ -58,7 +61,8 @@ def run(cases=None):
         stages={}
         previous=prefix/'merged_device.f32'
         for block in range(66,70):
-            root=(ROOT/'build/block66_peer_candidate'/case if block==66 else
+            root=(FROM39/'peer_decoder66_from39'/f'block{block}' if case=='from39_fp8' else
+                  ROOT/'build/block66_peer_candidate'/case if block==66 else
                   ROOT/'build'/f'decoder{block}_peer_candidate'/case)
             m=json.loads((root/'manifest.json').read_text())
             output=root/'output/output_device.f32'
@@ -78,7 +82,8 @@ def run(cases=None):
                                    block_output_stages=stages,
                                    exact_device_handoffs=4,
                                    scalar_hip_stages_exact=True)
-    out=OUT if cases is None else ROOT/'build/peer_decoder66_tail_audit_from48'
+    out=(ROOT/'build/peer_decoder66_tail_audit_from39' if cases==['from39_fp8'] else
+         OUT if cases is None else ROOT/'build/peer_decoder66_tail_audit_from48')
     out.mkdir(parents=True,exist_ok=True)
     (out/'manifest.json').write_text(json.dumps(report,indent=2)+'\n')
     print(json.dumps(report,indent=2))
@@ -86,6 +91,6 @@ def run(cases=None):
 
 if __name__=='__main__':
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--case',choices=('from48_fp8',))
+    parser.add_argument('--case',choices=('from48_fp8','from39_fp8'))
     args=parser.parse_args()
     run([args.case] if args.case else None)

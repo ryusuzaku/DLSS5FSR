@@ -10,6 +10,7 @@ from audit_peer_native_c32_basis import peer_to_native_multihead
 
 ROOT=Path(__file__).resolve().parents[1]
 SOURCE=ROOT/'build/peer_decoder62_inputs'
+FROM39=Path.home()/'DLSS5FSR-build-offload'
 
 
 def digest(path):return hashlib.sha256(Path(path).read_bytes()).hexdigest()
@@ -26,17 +27,20 @@ def metrics(a,b):
 
 
 def run(case='image_fp8'):
-    if case not in ('image_half','image_fp8','from56_fp8','from48_fp8'):raise ValueError('bad case')
+    if case not in ('image_half','image_fp8','from56_fp8','from48_fp8','from39_fp8'):raise ValueError('bad case')
     source=json.loads((SOURCE/'manifest.json').read_text())
     order=peer_to_native_multihead(np.arange(64))
-    prefix=ROOT/'build/upsample62_prefix_derived'/case
+    prefix=(FROM39/'upsample62_from39' if case=='from39_fp8' else
+            ROOT/'build/upsample62_prefix_derived'/case)
     p=json.loads((prefix/'manifest.json').read_text())
     if not p['hip_projection_merge_exact'] or \
        digest(prefix/'merged_device.f32')!=p['output_device_sha256'] or \
        p['source_model_sha256']!=source['model_sha256']:
         raise ValueError('prefix provenance/exactness differs')
-    if case in ('from56_fp8','from48_fp8'):
-        upstream=ROOT/'build'/('peer_decoder56_tail_audit' if case=='from56_fp8' else 'peer_decoder56_tail_audit_from48')/'manifest.json'
+    if case in ('from56_fp8','from48_fp8','from39_fp8'):
+        upstream=ROOT/'build'/('peer_decoder56_tail_audit' if case=='from56_fp8' else
+                               'peer_decoder56_tail_audit_from48' if case=='from48_fp8' else
+                               'peer_decoder56_tail_audit_from39')/'manifest.json'
         u=json.loads(upstream.read_text())
         if p['upstream_amd_block61']['audit_sha256']!=digest(upstream) or \
            p['input_native_sha256']!=u['block_output_stages']['block61']['candidate_native_sha256'] or \
@@ -45,7 +49,8 @@ def run(case='image_fp8'):
     previous=prefix/'merged_device.f32'
     stages={}
     for block in range(62,66):
-        root=(ROOT/'build/block62_candidate'/case if block==62 else
+        root=(FROM39/'peer_decoder62_from39'/f'block{block}' if case=='from39_fp8' else
+              ROOT/'build/block62_candidate'/case if block==62 else
               ROOT/'build'/f'decoder{block}_candidate_derived'/case)
         m=json.loads((root/'manifest.json').read_text())
         output=root/'output/output_device.f32'
@@ -68,7 +73,8 @@ def run(case='image_fp8'):
                 block_output_stages=stages,exact_device_handoffs=4,
                 scalar_hip_stages_exact=True,original_kernel_executed=False,
                 original_runtime_validation=False,production_wiring=False)
-    out=ROOT/'build'/('peer_decoder62_tail_audit' if case=='image_fp8' else
+    out=ROOT/'build'/('peer_decoder62_tail_audit_from39' if case=='from39_fp8' else
+                      'peer_decoder62_tail_audit' if case=='image_fp8' else
                       'peer_decoder62_tail_audit_half' if case=='image_half' else
                       'peer_decoder62_tail_audit_from56' if case=='from56_fp8' else
                       'peer_decoder62_tail_audit_from48')
@@ -79,5 +85,5 @@ def run(case='image_fp8'):
 
 if __name__=='__main__':
     p=argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--case',choices=('image_half','image_fp8','from56_fp8','from48_fp8'),default='image_fp8')
+    p.add_argument('--case',choices=('image_half','image_fp8','from56_fp8','from48_fp8','from39_fp8'),default='image_fp8')
     a=p.parse_args();run(a.case)

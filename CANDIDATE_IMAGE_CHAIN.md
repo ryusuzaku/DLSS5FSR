@@ -40,8 +40,25 @@ error. `tools/check_upsample56_peer_image.py --from39` consumes that device
 output and the same-image encoder14 skip. Its C256→C128 projection (32,768
 values) and skip merge (131,072 values) pass exactly; the FP8 merge vs public
 FP16 has 0.97930 correlation and 0.73654 mean absolute error. This connected
-native-schedule path now reaches the block56 body input. It has not yet been
-propagated through the rest of the full-frame image chain.
+native-schedule path then runs through blocks56–61, the encoder8 skip and
+block62 prefix, blocks62–65, the encoder4 skip and block66 prefix, and
+blocks66–69. Every device stage and handoff matches the scalar candidate
+exactly. Block61 vs public FP16 has 0.97731 correlation/0.86468 mean absolute
+error; block65 has 0.99035/0.97426; block69 has 0.99582/0.67474. The
+block69 device SHA256 is
+`e75111a727230658034cecdee841bf01283e45bb683c8b9b9bdf3dc8b613d076`.
+
+The 256² `from39_fp8` head consumed that block69 device output with the
+same-image public preblock skip and color. All 1,024 windows passed the 12
+exact AMD/scalar body checks each, and both gain settings passed their outer
+checks. The separate direct GPU-buffer test passed exact merge and body
+comparisons (2,097,152 values each) and RGB comparisons (196,608 values
+at each gain). The public-gain blended image has 0.00423 mean absolute error
+and 0.99940 correlation against the public FP16 final RGB over 196,608 values;
+the input-color baseline has 0.00805 mean absolute error. The rendered image
+is finite and visually coherent. This is still a static candidate comparison:
+the public block39, encoder skips, preblock skip, and color are input sources;
+no original NVIDIA kernel or production game path was executed.
 
 `tools/check_upsample48_peer_image.py` converts the public C512/C256 channel
 bases to candidate native order and rounds the activations to FP8. Its
@@ -136,6 +153,16 @@ public extraction and C512 HIP test build:
 & build/peer_onnx_venv/Scripts/python.exe tools/check_upsample48_peer_image.py --split512
 & build/peer_onnx_venv/Scripts/python.exe tools/check_decoder48_55_peer_image.py --split512
 & build/peer_onnx_venv/Scripts/python.exe tools/check_upsample56_peer_image.py --from39
+foreach ($b in 56..61) { & build/peer_onnx_venv/Scripts/python.exe tools/check_block56_candidate.py --case image_from39 --block $b --width 32 --height 32 }
+& build/peer_onnx_venv/Scripts/python.exe tools/audit_peer_decoder56_tail.py --case image_from39
+& build/peer_onnx_venv/Scripts/python.exe tools/check_upsample62_peer_image.py --case from39_fp8
+foreach ($b in 62..65) { & build/peer_onnx_venv/Scripts/python.exe tools/check_block62_candidate.py --case from39_fp8 --block $b --width 64 --height 64 }
+& build/peer_onnx_venv/Scripts/python.exe tools/audit_peer_decoder62_tail.py --case from39_fp8
+& build/peer_onnx_venv/Scripts/python.exe tools/check_upsample66_peer_image.py --case from39_fp8
+foreach ($b in 66..69) { & build/peer_onnx_venv/Scripts/python.exe tools/check_block66_peer_candidate.py --case from39_fp8 --block $b --width 128 --height 128 }
+& build/peer_onnx_venv/Scripts/python.exe tools/audit_peer_decoder66_tail.py --case from39_fp8
+& build/peer_onnx_venv/Scripts/python.exe tools/check_head70_peer_frame.py --latent-case from39_fp8 --output-root "$HOME\DLSS5FSR-build-offload\peer_head_frame_256_from39_fp8"
+& build/peer_onnx_venv/Scripts/python.exe tools/check_head70_peer_gpu_chain.py --latent-case from39_fp8 --frame-dir "$HOME\DLSS5FSR-build-offload\peer_head_frame_256_from39_fp8" --output-dir "$HOME\DLSS5FSR-build-offload\peer_head_frame_256_from39_fp8_connected_gpu"
 ```
 
 The scripts default their large C512 fixtures to a home-directory offload
@@ -143,4 +170,5 @@ folder; `--output-root` can select another spacious drive for the C512 runner
 or block48 prefix. The C256 runner also accepts `--prefix-root` and
 `--output-root`; block56 accepts `--chain-root` and `--output-root` to follow
 those custom locations. The small source tensors and reports stay under
-`build/`.
+`build/`. The downstream `from39_fp8` case writes its large body fixtures to
+`$HOME\DLSS5FSR-build-offload` and small audit manifests to `build/`.

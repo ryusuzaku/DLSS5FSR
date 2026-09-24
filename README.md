@@ -24,14 +24,14 @@ the same tool checks all 14 ordinary C256 blocks without fitting C256 maps.
 local checks and which are attributed to other projects.
 
 [CANDIDATE_IMAGE_CHAIN.md](CANDIDATE_IMAGE_CHAIN.md) records same-image
-block39→48 and block47→56 candidate runs. The matching encoder22 skip is used at block48;
+block39→head and block47→head candidate runs. The matching encoder22 skip is used at block48;
 its AMD/scalar checks are exact, while comparisons to the public FP16 ONNX
 model are approximate because the candidate rounds activations to FP8.
 The same-image candidate has also been propagated through blocks56–69 and
 the full-frame head; the document gives the measured RGB comparison and
-original-kernel validation limits. A separate native-window C512 extension
-now reaches the block56 body input from public block39; the earlier full-frame
-run still begins at public block47.
+original-kernel validation limits. The newer full-frame path starts at public
+block39 and uses the candidate native C512 window schedule; public encoder
+skips and preblock inputs still provide its upstream boundaries.
 
 The research scripts expect a local `dlss5-analysis/` generated from a
 matching, independently obtained `nvngx_dlssnr.dll`. Some also import the
