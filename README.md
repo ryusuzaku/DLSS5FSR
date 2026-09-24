@@ -139,8 +139,39 @@ is visible. The shim removes the trigger after saving the capture.
 from that input and run candidate HIP encoder blocks 5–22, including the
 block-8, block-14 and block-22 downsample paths, checking each stage and
 device handoff. Use `--through-block14` for a shorter run or omit both flags
-to stop at block 8. This is an offline partial chain: blocks 0–4 are still
-supplied by the public model, and it does not display a scene-reactive result
-in the game. The C256 coefficient map remains a candidate extension.
+to stop at block 8. The later captured-input runners continue that same
+frame through encoder30, ViT31–38, decoder39–69 and the 256×256 head. Each
+runner verifies its parent device hash and independently extracts the public
+FP16 comparison boundaries from the prepared input. For example, with a
+spacious output directory and the HIP test executables built:
+
+```powershell
+$py = 'build/peer_onnx_venv/Scripts/python.exe'
+$input = '<prepared-directory>'
+$out = '<output-directory>'
+& $py tools/run_candidate_encoder64_from_capture.py $input --through-block22 --output-root "$out/encoder22"
+& $py tools/run_candidate_encoder512_from_capture.py $input "$out/encoder22" --output-root "$out/encoder30"
+& $py tools/run_candidate_vit39_from_capture.py $input "$out/encoder30" --output-root "$out/vit39"
+& $py tools/run_candidate_decoder512_from_capture.py $input "$out/vit39" --output-root "$out/decoder47"
+& $py tools/run_candidate_decoder256_from_capture.py $input "$out/encoder22" "$out/decoder47" --output-root "$out/decoder55"
+& $py tools/run_candidate_decoder128_from_capture.py $input "$out/encoder22" "$out/decoder55" --output-root "$out/decoder61"
+& $py tools/run_candidate_decoder64_from_capture.py $input "$out/encoder22" "$out/decoder61" --output-root "$out/decoder65"
+& $py tools/run_candidate_decoder32_from_capture.py $input "$out/decoder65" --output-root "$out/decoder69"
+& $py tools/extract_candidate_head_inputs_from_capture.py $input "$out/decoder69" --output-root "$out/head_inputs"
+& $py tools/check_head70_peer_frame.py --latent-case capture_candidate --source-dir "$out/head_inputs" --candidate-latent "$out/decoder69/block69/output/output_device.f32" --candidate-report "$out/decoder69/report.json" --output-root "$out/head70"
+& $py tools/check_head70_peer_gpu_chain.py --latent-case capture_candidate --frame-dir "$out/head70" --output-dir "$out/head70_connected_gpu"
+```
+
+The head writes `public_gain_blended.png`, `public_final.png`, and manifests
+under the selected output directory. A captured Cyberpunk proxy completed
+this offline chain with exact candidate GPU/scalar stage checks and direct
+head-buffer handoffs. Its public-gain blended RGB had 0.004528 MAE against
+the same-input public FP16 final image, compared with 0.005364 for the input
+image; the enhanced RGB before blending had 0.017400 MAE. This is a
+candidate/public diagnostic, not original-kernel parity or an in-game visual
+improvement. Blocks 0–4, the block4 decoder skip and preblock0 skip are
+supplied by the public graph. The C256/C32 maps, ViT reduction/physical
+bridge, exact native input contract, and production full-frame timing remain
+unvalidated. The normal game still uses its earlier live 64-token path.
 
 Source code here is experimental. No NVIDIA binaries or weights are bundled.

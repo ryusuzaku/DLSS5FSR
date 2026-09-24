@@ -1,5 +1,44 @@
 # Same-image candidate decoder chain (2026-09-24)
 
+## Captured game-frame offline continuation
+
+A versioned staged-proxy capture from Cyberpunk (991×620 FP16, center-cropped
+to a 256×256 linear RGB candidate input) now runs from the pinned public
+block4 boundary through AMD candidate encoder5–30, ViT31–38, decoder39–69,
+and the 1,024-window head. Every stage consumes the preceding candidate's
+device bytes, and each public boundary is extracted from that same prepared
+frame and cross-checked where the extracted branches overlap. The original
+capture, model, packed weights, generated tensors and screenshots remain
+local and are excluded from Git; the source-only replay commands are in
+`README.md`.
+
+The captured frame's candidate block30 skip has 0.813836 MAE/0.841799
+correlation against the public FP16 block30, and its C1024 head has
+0.824644/0.875209. ViT38 after the candidate logical inverse has
+0.492046/0.835451, decoder39 0.721867/0.857611, block47
+0.595864/0.845302, block55 0.803135/0.911324, block61
+0.979453/0.968311, block65 1.094617/0.986975, and block69
+0.639378/0.996358. These stage metrics compare a native-style FP8
+candidate with the optimized public FP16 graph; they are diagnostic and
+do not prove original-kernel correctness.
+
+The full 256×256 candidate head passes 12 HIP/scalar body checks for each
+of 1,024 windows and exact outer checks at both gain values. An independent
+direct GPU-buffer replay passes merge, body, native-gain RGB and public-gain
+RGB. At public gain with the public final blend, candidate RGB differs from
+the same-frame public FP16 final by 0.004528 MAE/0.999537 correlation; the
+input color baseline is 0.005364 MAE. Before blending, candidate enhanced
+RGB differs from public enhanced RGB by 0.017400 MAE. The images appear
+similar at 256×256, so the blended metric should not be read as a meaningful
+in-game quality gain. The game DLL was restored to its prior playable state
+after the diagnostic capture.
+
+This is an offline single-frame chain. The public ONNX graph still supplies
+the block4 entry, decoder block4 skip, preblock skip, and comparison image;
+the 256×256 crop/color mapping has not been checked against the original
+NVIDIA frontend. Original C256/C32 body maps, 16-token attention reduction,
+physical ViT bridge, native game inference and performance remain open.
+
 ## Connected experimental encoder5–head branch
 
 The newest branch starts at the pinned public block4 downsample. One ONNX

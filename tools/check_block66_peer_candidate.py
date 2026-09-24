@@ -59,19 +59,23 @@ def save(folder,values):
         array.tofile(folder/f'{name}.f32')
 
 
-def run(block=66,case='seeded',first_window=False,width=WIDTH,height=HEIGHT):
+def run(block=66,case='seeded',first_window=False,width=WIDTH,height=HEIGHT,
+        previous=None,output_root=None):
     if block not in range(66,70):raise ValueError('block must be 66..69')
     if case not in ('seeded','zero','image_half','image_fp8','from62_fp8','from56_fp8','from48_fp8','from39_fp8','from38_fp8','from_encoder_skip30_fp8','from_candidate_vit16_fp8','from_candidate_encoder22_fp8','from_candidate_encoder14_fp8','from_candidate_encoder8_fp8'):
         raise ValueError('unknown skip case')
     if first_window and block!=66:raise ValueError('first-window mode only supports block66')
     if width<8 or height<8 or width%8 or height%8:
         raise ValueError('C32 extent must be multiples of 8')
+    if (previous is None) != (output_root is None):
+        raise ValueError('custom C32 input needs a distinct output root')
     audit_basis(verbose=False)
     shifts={66:0,67:3,68:1,69:2}
     shift=shifts[block]
     offload=Path.home()/'DLSS5FSR-build-offload'
     suffix='encoder_skip30' if case=='from_encoder_skip30_fp8' else 'candidate_vit16' if case=='from_candidate_vit16_fp8' else 'candidate_encoder22' if case=='from_candidate_encoder22_fp8' else 'candidate_encoder14' if case=='from_candidate_encoder14_fp8' else 'candidate_encoder8' if case=='from_candidate_encoder8_fp8' else case.removesuffix('_fp8')
-    source=((offload/f'upsample66_{suffix}'/'merged_device.f32' if block==66 else
+    source=(Path(previous) if previous is not None else
+            (offload/f'upsample66_{suffix}'/'merged_device.f32' if block==66 else
              offload/f'peer_decoder66_{suffix}'/f'block{block-1}/output/output_device.f32')
             if case in ('from39_fp8','from38_fp8','from_encoder_skip30_fp8','from_candidate_vit16_fp8','from_candidate_encoder22_fp8','from_candidate_encoder14_fp8','from_candidate_encoder8_fp8') else
             ROOT/'build/upsample66_prefix_derived'/case/'merged_device.f32' if block==66
@@ -86,7 +90,8 @@ def run(block=66,case='seeded',first_window=False,width=WIDTH,height=HEIGHT):
     peer=native[...,map32]
     padded=np.pad(peer,((py,hh-height-py),(px,ww-width-px),(0,0)))
     windows=padded.reshape(hh//8,8,ww//8,8,CHANNELS).transpose(0,2,1,3,4).reshape(-1,64,CHANNELS)
-    root=(offload/f'peer_decoder66_{suffix}'/f'block{block}' if case in ('from39_fp8','from38_fp8','from_encoder_skip30_fp8','from_candidate_vit16_fp8','from_candidate_encoder22_fp8','from_candidate_encoder14_fp8','from_candidate_encoder8_fp8') else
+    root=(Path(output_root) if output_root is not None else
+          offload/f'peer_decoder66_{suffix}'/f'block{block}' if case in ('from39_fp8','from38_fp8','from_encoder_skip30_fp8','from_candidate_vit16_fp8','from_candidate_encoder22_fp8','from_candidate_encoder14_fp8','from_candidate_encoder8_fp8') else
           ROOT/'build'/('block66_peer_first_window' if first_window else 'block66_peer_candidate')/case
           if block==66 else ROOT/'build'/f'decoder{block}_peer_candidate'/case)
     spatial=root/'spatial';save(spatial,dict(input=native,windows=windows))

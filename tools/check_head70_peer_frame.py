@@ -53,19 +53,27 @@ def checked_command(command, log):
     return result.stdout.count('PASS')
 
 
-def run(size=256,chunk_windows=32,latent_case='public',output_root=None):
+def run(size=256,chunk_windows=32,latent_case='public',output_root=None,
+        source_dir=None,candidate_latent=None,candidate_report=None):
     if size<16 or size>256 or size%8 or chunk_windows<1:
         raise ValueError('size must be 16..256 multiple of 8; chunk positive')
-    if latent_case not in ('public','image_half','image_fp8','from62_fp8','from56_fp8','from48_fp8','from39_fp8','from38_fp8','from_encoder_skip30_fp8','from_candidate_vit16_fp8','from_candidate_encoder22_fp8','from_candidate_encoder14_fp8','from_candidate_encoder8_fp8'):
+    if latent_case not in ('public','image_half','image_fp8','from62_fp8','from56_fp8','from48_fp8','from39_fp8','from38_fp8','from_encoder_skip30_fp8','from_candidate_vit16_fp8','from_candidate_encoder22_fp8','from_candidate_encoder14_fp8','from_candidate_encoder8_fp8','capture_candidate'):
         raise ValueError('unknown latent source')
+    if latent_case=='capture_candidate' and any(v is None for v in
+            (source_dir,candidate_latent,candidate_report)):
+        raise ValueError('capture candidate needs source directory, latent and report')
+    if latent_case!='capture_candidate' and any(v is not None for v in
+            (source_dir,candidate_latent,candidate_report)):
+        raise ValueError('custom capture inputs require capture_candidate case')
     audit_basis(verbose=False)
-    source_report=json.loads((SOURCE/'manifest.json').read_text())
+    source_root=Path(source_dir).resolve() if source_dir is not None else SOURCE
+    source_report=json.loads((source_root/'manifest.json').read_text())
     for name,key in [('skip_peer','skip_peer_sha256'),
                      ('latent_peer','latent_peer_sha256'),
                      ('color_linear','color_linear_sha256'),
                      ('enhanced_rgb','enhanced_rgb_sha256'),
                      ('final_rgb','final_rgb_sha256')]:
-        if digest(SOURCE/f'{name}.f32')!=source_report[key]:
+        if digest(source_root/f'{name}.f32')!=source_report[key]:
             raise ValueError(f'public source hash differs: {name}')
     if not source_report['same_inference_call']:
         raise ValueError('latent/skip/color are not coherent')
@@ -75,10 +83,23 @@ def run(size=256,chunk_windows=32,latent_case='public',output_root=None):
     out.mkdir(parents=True,exist_ok=True)
     channel_map=peer_to_native(np.arange(32))
     if latent_case=='public':
-        peer_main=np.fromfile(SOURCE/'latent_peer.f32','<f4').reshape(128,128,32)[:size//2,:size//2]
+        peer_main=np.fromfile(source_root/'latent_peer.f32','<f4').reshape(128,128,32)[:size//2,:size//2]
         main=np.empty_like(peer_main);main[...,channel_map]=peer_main
         latent_hash=source_report['latent_peer_sha256']
         latent_origin='same-image optimized public FP16 block69'
+    elif latent_case=='capture_candidate':
+        candidate_path=Path(candidate_latent).resolve()
+        candidate_record=json.loads(Path(candidate_report).read_text())
+        if (candidate_record['source_model_sha256']!=source_report['model_sha256'] or
+                candidate_record['source_capture_sha256']!=source_report['source_capture_sha256'] or
+                candidate_record['color_linear_sha256']!=source_report['color_linear_sha256'] or
+                candidate_record['public_boundary_sha256']['block69']!=source_report['latent_peer_sha256'] or
+                candidate_record['final_device_sha256']!=digest(candidate_path) or
+                not candidate_record['hip_scalar_exact']):
+            raise ValueError('capture candidate block69 ancestry differs')
+        main=np.fromfile(candidate_path,'<f4').reshape(128,128,32)[:size//2,:size//2].copy()
+        latent_hash=digest(candidate_path)
+        latent_origin='captured-input AMD candidate encoder5-30, ViT31-38, decoder39-69; public block4 boundary and decoder skip, original maps unverified'
     else:
         tail_path=ROOT/'build'/('peer_decoder66_tail_audit_candidate_encoder14' if latent_case=='from_candidate_encoder14_fp8' else
                                'peer_decoder66_tail_audit_candidate_encoder8' if latent_case=='from_candidate_encoder8_fp8' else
@@ -112,11 +133,11 @@ def run(size=256,chunk_windows=32,latent_case='public',output_root=None):
                        f'RX9070XT candidate split encoder23-30 skip and decoder{first_block}-69, public ViT38/other skips'
                        if latent_case=='from_encoder_skip30_fp8' else
                        f'RX9070XT candidate decoder{first_block}-69, {latent_case} public boundary inputs')
-    peer_skip=np.fromfile(SOURCE/'skip_peer.f32','<f4').reshape(256,256,32)[:size,:size]
+    peer_skip=np.fromfile(source_root/'skip_peer.f32','<f4').reshape(256,256,32)[:size,:size]
     skip=np.empty_like(peer_skip);skip[...,channel_map]=peer_skip
-    color=np.fromfile(SOURCE/'color_linear.f32','<f4').reshape(256,256,3)[:size,:size].copy()
-    public_enhanced=np.fromfile(SOURCE/'enhanced_rgb.f32','<f4').reshape(256,256,3)[:size,:size].copy()
-    public_final=np.fromfile(SOURCE/'final_rgb.f32','<f4').reshape(256,256,3)[:size,:size].copy()
+    color=np.fromfile(source_root/'color_linear.f32','<f4').reshape(256,256,3)[:size,:size].copy()
+    public_enhanced=np.fromfile(source_root/'enhanced_rgb.f32','<f4').reshape(256,256,3)[:size,:size].copy()
+    public_final=np.fromfile(source_root/'final_rgb.f32','<f4').reshape(256,256,3)[:size,:size].copy()
     raw=(ROOT/'dlss5-analysis/tensors/tensor_150.bin').read_bytes()
     stage=(ROOT/'dlss5-analysis/tensors/tensor_001.bin').read_bytes()
     ordinary,sm,ss,coeff,pad=extract(raw,stage[PAD_AT:PAD_AT+16])
@@ -199,6 +220,7 @@ def run(size=256,chunk_windows=32,latent_case='public',output_root=None):
                 input_color_vs_public_final=metrics(color,public_final),
                 original_kernel_executed=False,original_runtime_validation=False,
                 native_amd_encoder_decoder_executed=False,
+                captured_input_candidate_executed=latent_case=='capture_candidate',
                 native_amd_split_encoder23_30_executed=latent_case in ('from_encoder_skip30_fp8','from_candidate_vit16_fp8','from_candidate_encoder22_fp8','from_candidate_encoder14_fp8','from_candidate_encoder8_fp8'),
                 native_amd_encoder5_8_candidate_executed=latent_case=='from_candidate_encoder8_fp8',
                 native_amd_encoder9_14_candidate_executed=latent_case in ('from_candidate_encoder14_fp8','from_candidate_encoder8_fp8'),
@@ -219,6 +241,10 @@ if __name__=='__main__':
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--size',type=int,default=256)
     parser.add_argument('--chunk-windows',type=int,default=32)
-    parser.add_argument('--latent-case',choices=('public','image_half','image_fp8','from62_fp8','from56_fp8','from48_fp8','from39_fp8','from38_fp8','from_encoder_skip30_fp8','from_candidate_vit16_fp8','from_candidate_encoder22_fp8','from_candidate_encoder14_fp8','from_candidate_encoder8_fp8'),default='public')
+    parser.add_argument('--latent-case',choices=('public','image_half','image_fp8','from62_fp8','from56_fp8','from48_fp8','from39_fp8','from38_fp8','from_encoder_skip30_fp8','from_candidate_vit16_fp8','from_candidate_encoder22_fp8','from_candidate_encoder14_fp8','from_candidate_encoder8_fp8','capture_candidate'),default='public')
     parser.add_argument('--output-root',type=Path)
-    a=parser.parse_args();run(a.size,a.chunk_windows,a.latent_case,a.output_root)
+    parser.add_argument('--source-dir',type=Path)
+    parser.add_argument('--candidate-latent',type=Path)
+    parser.add_argument('--candidate-report',type=Path)
+    a=parser.parse_args();run(a.size,a.chunk_windows,a.latent_case,a.output_root,
+                              a.source_dir,a.candidate_latent,a.candidate_report)
