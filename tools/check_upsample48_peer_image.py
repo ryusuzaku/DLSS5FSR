@@ -5,6 +5,7 @@ The public model is FP16 and this candidate uses native-style FP8 input
 rounding. Exact HIP/scalar agreement is not original NVIDIA-kernel parity.
 """
 from pathlib import Path
+import argparse
 import hashlib
 import json
 import subprocess
@@ -35,7 +36,7 @@ def metrics(a, b):
                 correlation=float(np.corrcoef(a.ravel(), b.ravel())[0, 1]))
 
 
-def run():
+def run(split512=False, output_root=None):
     src = json.loads((SOURCE / 'manifest.json').read_text())
     for name in ('block47', 'skip22', 'merge48'):
         if digest(SOURCE / f'{name}_peer.f32') != src['tensor_sha256'][name]:
@@ -45,6 +46,16 @@ def run():
     xpeer = F(np.fromfile(SOURCE / 'block47_peer.f32', '<f4').reshape(8, 8, 512))
     speer = F(np.fromfile(SOURCE / 'skip22_peer.f32', '<f4').reshape(16, 16, 256))
     x = np.empty_like(xpeer); x[..., p512] = xpeer
+    source_block47_native_sha256 = None
+    if split512:
+        chain = json.loads((ROOT / 'build/split512_peer_image_report.json').read_text())
+        if chain['source_model_sha256'] != src['model_sha256'] or chain['source_image_sha256'] != src['image_sha256']:
+            raise ValueError('split512 source model/image differs')
+        candidate = Path(chain['output_root']) / 'block47-8x8-s2' / 'final_device.f32'
+        if digest(candidate) != chain['final_device_sha256']:
+            raise ValueError('split512 block47 device hash differs')
+        x = np.fromfile(candidate, '<f4').reshape(8, 8, 512)
+        source_block47_native_sha256 = digest(candidate)
     skip = np.empty_like(speer); skip[..., p256] = speer
 
     raw_path = ROOT / 'dlss5-analysis/tensors/tensor_124.bin'
@@ -68,7 +79,7 @@ def run():
     low = multiply(x, weights)
     merged_half = H(np.repeat(np.repeat(low, 2, axis=0), 2, axis=1) + skip * scale)
     merged = F(merged_half)
-    out = ROOT / 'build/upsample48_prefix_derived/image_fp8'
+    out = Path(output_root) if output_root is not None else (ROOT / 'build/upsample48_prefix_derived/image_fp8')
     out.mkdir(parents=True, exist_ok=True)
     for name, array in dict(input=x, weights=weights, scale=scale, skip=skip,
                             low=low, merged=merged).items():
@@ -82,10 +93,11 @@ def run():
     if (out / 'merged_device.f32').read_bytes() != (out / 'merged.f32').read_bytes():
         raise AssertionError('prefix HIP/scalar merge differs')
     public = np.fromfile(SOURCE / 'merge48_peer.f32', '<f4').reshape(16, 16, 256)
-    report = dict(case='image_fp8', input_extent=[8, 8, 512],
+    report = dict(case='image_fp8_from39' if split512 else 'image_fp8', input_extent=[8, 8, 512],
                   output_extent=[16, 16, 256],
                   source_model_sha256=src['model_sha256'],
                   source_block47_peer_sha256=src['tensor_sha256']['block47'],
+                  source_block47_native_sha256=source_block47_native_sha256,
                   source_skip22_peer_sha256=src['tensor_sha256']['skip22'],
                   block48_tensor_sha256=digest(raw_path),
                   peer_native_projection_indices_exact=count,
@@ -103,4 +115,12 @@ def run():
 
 
 if __name__ == '__main__':
-    run()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--split512', action='store_true',
+                        help='use the connected C512 candidate block47 device output')
+    parser.add_argument('--output-root', type=Path,
+                        help='fixture directory (use a spacious drive for --split512)')
+    args = parser.parse_args()
+    if args.split512 and args.output_root is None:
+        args.output_root = Path.home() / 'DLSS5FSR-build-offload' / 'upsample48_from39'
+    run(args.split512, args.output_root)

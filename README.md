@@ -23,8 +23,8 @@ the same tool checks all 14 ordinary C256 blocks without fitting C256 maps.
 `ORIGINAL_MAP_VALIDATION.md` records which claims are
 local checks and which are attributed to other projects.
 
-[CANDIDATE_IMAGE_CHAIN.md](CANDIDATE_IMAGE_CHAIN.md) records a same-image
-block47→56 candidate run. The matching encoder22 skip is now used at block48;
+[CANDIDATE_IMAGE_CHAIN.md](CANDIDATE_IMAGE_CHAIN.md) records same-image
+block39→48 and block47→56 candidate runs. The matching encoder22 skip is used at block48;
 its AMD/scalar checks are exact, while comparisons to the public FP16 ONNX
 model are approximate because the candidate rounds activations to FP8.
 The same-image candidate has also been propagated through blocks56–69 and
@@ -50,7 +50,12 @@ FP16 ONNX model and its blue-marble example from
 `extract_peer_preblock0_skip.py`, `extract_peer_coherent_head_inputs.py`,
 `extract_peer_decoder66_inputs.py`, `extract_peer_decoder62_inputs.py`,
 `extract_peer_decoder56_inputs.py`, then
-`extract_peer_decoder48_inputs.py`. Run
+`extract_peer_decoder48_inputs.py`, then `extract_peer_split512_inputs.py`.
+Run `check_split512_peer_image.py --teacher-forced` for the native C512
+window schedule and `check_split512_peer_image.py --unshifted-control
+--teacher-forced` for the public ONNX window control. The public model's C512
+blocks use zero-shift windows, so its FP16 outputs cannot validate the
+native shifted schedule. Run
 `check_upsample48_peer_image.py`, `check_decoder48_55_peer_image.py`, and
 `check_upsample56_peer_image.py --candidate-block55` after building the HIP
 test executables with `tools/build_split512_block.sh`.

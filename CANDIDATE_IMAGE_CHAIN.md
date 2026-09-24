@@ -6,6 +6,32 @@ skip, block48 merge, and blocks48–55. Its block55 bytes match the earlier
 independently extracted block55 boundary exactly. The ONNX model SHA256 is
 `7aa891c46f90f3d0a4539701ba009131ac333602634a62ad8675da90d0f8a173`.
 
+## Upstream C512 same-image boundary
+
+`tools/extract_peer_split512_inputs.py` extracts public block39 and blocks40–47
+from the same 256×256 image and model. Its block47 bytes match the independent
+block48 input extraction. `tools/check_split512_peer_image.py --teacher-forced`
+feeds public block39 through candidate AMD blocks40–47 at 8×8 using the native
+0,3,1,2,0,3,1,2 window schedule. All 104 GPU/scalar stage checks and all eight
+device handoffs pass exactly. After the FP8-rounded input, connected block47
+has 0.96215 correlation and 0.39006 mean absolute error against the public
+FP16 block47. Feeding its device bytes to
+`tools/check_upsample48_peer_image.py --split512` gives exact AMD/scalar
+projection and merge checks; the merge is 0.98027 correlated with the public
+FP16 merge, with 0.50072 mean absolute error. This path starts at public
+block39, so its ViT/decoder39 upstream remains unverified on the image.
+
+The public ONNX `SplitSwinBlock` uses zero-shift attention in every block;
+the optimized ONNX graph has no attention Pad node in blocks40, 41, or 45.
+The candidate native schedule includes shifted windows. Teacher-forcing each
+block from its public predecessor isolates this difference: block41/45 native
+schedule mean absolute errors are 0.25986/0.21202, while zero-shift controls
+are 0.06147/0.05773. A connected all-zero-shift control reaches block47 at
+0.99621 correlation and 0.11888 mean absolute error. That control explains
+why the public model is an imperfect oracle for native shifted windows; it is
+not an alternate native-kernel validation. Both schedules and their metrics
+are recorded separately by the script.
+
 `tools/check_upsample48_peer_image.py` converts the public C512/C256 channel
 bases to candidate native order and rounds the activations to FP8. Its
 projection index map agrees with the public QMMA decoder at all 131,072 raw
@@ -88,3 +114,17 @@ python tools/check_head70_peer_gpu_chain.py --latent-case from48_fp8 --frame-dir
 
 The example output directory should be changed to a drive with ample free
 space. All generated fixtures stay outside Git.
+
+The upstream C512 comparison can be replayed separately after the same-image
+public extraction and C512 HIP test build:
+
+```powershell
+& build/peer_onnx_venv/Scripts/python.exe tools/extract_peer_split512_inputs.py
+& build/peer_onnx_venv/Scripts/python.exe tools/check_split512_peer_image.py --teacher-forced
+& build/peer_onnx_venv/Scripts/python.exe tools/check_split512_peer_image.py --unshifted-control --teacher-forced
+& build/peer_onnx_venv/Scripts/python.exe tools/check_upsample48_peer_image.py --split512
+```
+
+The scripts default their large C512 fixtures to a home-directory offload
+folder; `--output-root` can select another spacious drive for the C512 runner
+or block48 prefix. The small source tensors and reports stay under `build/`.
