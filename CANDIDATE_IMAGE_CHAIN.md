@@ -32,6 +32,17 @@ why the public model is an imperfect oracle for native shifted windows; it is
 not an alternate native-kernel validation. Both schedules and their metrics
 are recorded separately by the script.
 
+`tools/check_decoder48_55_peer_image.py --split512` continues the native
+schedule's block48 merge through candidate C256 blocks48–55 on AMD; every
+stage and device handoff again agrees exactly with its scalar candidate.
+Block55 vs public FP16 has 0.96097 correlation and 0.71727 mean absolute
+error. `tools/check_upsample56_peer_image.py --from39` consumes that device
+output and the same-image encoder14 skip. Its C256→C128 projection (32,768
+values) and skip merge (131,072 values) pass exactly; the FP8 merge vs public
+FP16 has 0.97930 correlation and 0.73654 mean absolute error. This connected
+native-schedule path now reaches the block56 body input. It has not yet been
+propagated through the rest of the full-frame image chain.
+
 `tools/check_upsample48_peer_image.py` converts the public C512/C256 channel
 bases to candidate native order and rounds the activations to FP8. Its
 projection index map agrees with the public QMMA decoder at all 131,072 raw
@@ -123,8 +134,13 @@ public extraction and C512 HIP test build:
 & build/peer_onnx_venv/Scripts/python.exe tools/check_split512_peer_image.py --teacher-forced
 & build/peer_onnx_venv/Scripts/python.exe tools/check_split512_peer_image.py --unshifted-control --teacher-forced
 & build/peer_onnx_venv/Scripts/python.exe tools/check_upsample48_peer_image.py --split512
+& build/peer_onnx_venv/Scripts/python.exe tools/check_decoder48_55_peer_image.py --split512
+& build/peer_onnx_venv/Scripts/python.exe tools/check_upsample56_peer_image.py --from39
 ```
 
 The scripts default their large C512 fixtures to a home-directory offload
 folder; `--output-root` can select another spacious drive for the C512 runner
-or block48 prefix. The small source tensors and reports stay under `build/`.
+or block48 prefix. The C256 runner also accepts `--prefix-root` and
+`--output-root`; block56 accepts `--chain-root` and `--output-root` to follow
+those custom locations. The small source tensors and reports stay under
+`build/`.

@@ -100,7 +100,7 @@ def run(block=49,previous=None,width=WIDTH,height=HEIGHT,output_root=None):
                 tensor_sha256=digest(raw_path),input_device_sha256=digest(previous),
                 output_device_sha256=digest(output_device),
                 exact_stage_checks=['spatial gather/scatter','FFN x4','attention x8','output scatter'],
-                input_provenance=str(previous.relative_to(ROOT)),
+                input_provenance=str(previous.resolve()),
                 encoder22_skip=('same-image public FP16 converted to candidate native FP8'
                                 if output_root is not None else 'synthetic control inherited from block48'),
                 map_status='candidate C256 extension and PTX-supported residual order transfer',

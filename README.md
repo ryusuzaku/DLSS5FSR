@@ -29,7 +29,9 @@ its AMD/scalar checks are exact, while comparisons to the public FP16 ONNX
 model are approximate because the candidate rounds activations to FP8.
 The same-image candidate has also been propagated through blocks56–69 and
 the full-frame head; the document gives the measured RGB comparison and
-original-kernel validation limits.
+original-kernel validation limits. A separate native-window C512 extension
+now reaches the block56 body input from public block39; the earlier full-frame
+run still begins at public block47.
 
 The research scripts expect a local `dlss5-analysis/` generated from a
 matching, independently obtained `nvngx_dlssnr.dll`. Some also import the
