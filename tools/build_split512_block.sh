@@ -35,6 +35,8 @@ MSYS_NO_PATHCONV=1 "$ROCM/bin/hipcc.exe" -std=c++17 -O2 -ffp-contract=off -D_CRT
 MSYS_NO_PATHCONV=1 "$ROCM/bin/hipcc.exe" -std=c++17 -O2 -ffp-contract=off -D_CRT_SECURE_NO_WARNINGS \
   --offload-arch=gfx1201 hip/mvp1/c128_attention_candidate_test.hip -o build/c128_attention_candidate_test.exe
 MSYS_NO_PATHCONV=1 "$ROCM/bin/hipcc.exe" -std=c++17 -O2 -ffp-contract=off -D_CRT_SECURE_NO_WARNINGS \
+  --offload-arch=gfx1201 hip/mvp1/encoder128_downsample_test.hip -o build/encoder128_downsample_test.exe
+MSYS_NO_PATHCONV=1 "$ROCM/bin/hipcc.exe" -std=c++17 -O2 -ffp-contract=off -D_CRT_SECURE_NO_WARNINGS \
   --offload-arch=gfx1201 hip/mvp1/spatial128_test.hip -o build/spatial128_test.exe
 MSYS_NO_PATHCONV=1 "$ROCM/bin/hipcc.exe" -std=c++17 -O2 -ffp-contract=off -D_CRT_SECURE_NO_WARNINGS \
   --offload-arch=gfx1201 hip/mvp1/spatial128_output_test.hip -o build/spatial128_output_test.exe

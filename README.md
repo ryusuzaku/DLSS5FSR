@@ -84,4 +84,12 @@ RGB measurements, and original-map limits are in
 [CANDIDATE_IMAGE_CHAIN.md](CANDIDATE_IMAGE_CHAIN.md). The C256 maps remain
 candidate extensions pending independent logical assets or an original oracle.
 
+An experimental upstream branch now starts at the public block8 downsample,
+runs candidate AMD encoder9–14, and carries its block14 downsample through
+encoder15–22. The C128 coefficient and downsample maps have measured upstream
+support; their native attention residual order and this full-image output still
+need original-kernel validation. This branch currently compares worse to the
+public FP16 graph at block22 than the public-block14-start branch; details and
+replay commands are in [CANDIDATE_IMAGE_CHAIN.md](CANDIDATE_IMAGE_CHAIN.md).
+
 Source code here is experimental. No NVIDIA binaries or weights are bundled.

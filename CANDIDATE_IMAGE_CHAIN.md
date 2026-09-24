@@ -1,5 +1,49 @@
 # Same-image candidate decoder chain (2026-09-24)
 
+## Upstream experimental encoder8–22 branch
+
+`tools/extract_peer_encoder128_inputs.py` extracts public block8 downsample,
+encoder9–13, and both block14 outputs from one pinned 256×256 image/model call.
+The block14 skip and downsample bytes match their previous independent public
+extractions. `tools/check_encoder128_peer_image.py` rounds block8 to the native
+FP8 boundary and runs blocks9–14 on AMD using the front-chain 0,3,1,2,0,3
+shift schedule. The C128 matrix/bias coordinates and downsample map come from
+upstream measured C128 work; the attention residual order is a PTX-supported
+candidate. Every HIP stage and interblock handoff is exact against its scalar
+candidate. Block14 has a separate raw body output for 2×2 pooling and an FP8
+output for the decoder skip. The raw pool and measured C128→C256 projection
+also pass exact HIP/scalar checks in `tools/check_encoder14_downsample_peer_image.py`.
+
+The same-image public FP16 comparison at block14 is 0.51397 MAE/0.98629
+correlation for its skip and 0.34070/0.99456 for its downsample. Feeding that
+candidate downsample through encoder15–22 remains exact against the declared
+AMD/scalar arithmetic. At block22 the skip is 0.86385/0.96595 and downsample
+is 0.50630/0.98511 against public FP16. The earlier branch starting at public
+block14 reaches 0.75429/0.97224 and 0.45211/0.98795 respectively. The
+candidate upstream boundary therefore increases the public-graph discrepancy;
+the original C128 residual order, shift interpretation, and C256 maps remain
+validation targets. This is a diagnostic comparison, not proof of native image
+quality or original-kernel parity. The branch stops at block22 for now; the
+previous full-frame result still uses the public block14 boundary.
+
+After building `tools/build_split512_block.sh` and preparing the public ONNX
+fixtures described below, replay this branch with:
+
+```powershell
+& build/peer_onnx_venv/Scripts/python.exe tools/extract_peer_encoder128_inputs.py
+& build/peer_onnx_venv/Scripts/python.exe tools/check_encoder128_peer_image.py
+& build/peer_onnx_venv/Scripts/python.exe tools/check_encoder14_downsample_peer_image.py
+$homeOffload = Join-Path $env:USERPROFILE 'DLSS5FSR-build-offload'
+$enc256 = Join-Path $homeOffload 'peer_encoder256_from14_candidate'
+& build/peer_onnx_venv/Scripts/python.exe tools/check_encoder256_peer_image.py --candidate-block14-down (Join-Path $homeOffload 'peer_encoder14_down_candidate/output_device.f32') --output-root $enc256
+& build/peer_onnx_venv/Scripts/python.exe tools/check_decoder49_candidate.py --block 22 --input (Join-Path $enc256 'block21/output/output_device.f32') --width 16 --height 16 --output-root (Join-Path $enc256 'block22')
+& build/peer_onnx_venv/Scripts/python.exe tools/check_encoder22_downsample_peer_image.py --encoder-root $enc256 --output-root (Join-Path $homeOffload 'peer_encoder22_down_from14_candidate')
+```
+
+The large generated fixtures live in the home-directory offload folder and
+remain outside Git. The original model, packed tensors, DLLs, and cubins are
+also excluded from the public checkout.
+
 The optimized public FP16 ONNX model was run once on its 256×256 blue-marble
 example. `tools/extract_peer_decoder48_inputs.py` extracted block47, encoder22
 skip, block48 merge, and blocks48–55. Its block55 bytes match the earlier
