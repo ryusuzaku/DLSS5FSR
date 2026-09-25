@@ -7,10 +7,10 @@ import hashlib
 import json
 
 import numpy as np
-import onnx
 import onnxruntime as ort
 
 from extract_peer_coherent_head_inputs import SKIP, LATENT, FUSED, BODY, ENHANCED
+from cached_public_branch import extract_cached
 from extract_peer_preblock0_skip import MODEL, MODEL_SHA256
 
 
@@ -50,7 +50,7 @@ def run(prepared_dir, decoder69_dir, output_root):
         raise ValueError('prepared RGB contains nonfinite values')
     out.mkdir(parents=True, exist_ok=True)
     branch_file = out / 'head_controls.onnx'
-    onnx.utils.extract_model(str(MODEL), str(branch_file), ['rgb'], list(NODES.values()))
+    extract_cached(MODEL, branch_file, ['rgb'], list(NODES.values()), MODEL_SHA256)
     session = ort.InferenceSession(str(branch_file), providers=['CPUExecutionProvider'])
     arrays = session.run(None, {'rgb': rgb.transpose(2, 0, 1)[None]})
     outputs = {}

@@ -8,7 +8,6 @@ import json
 import subprocess
 
 import numpy as np
-import onnx
 import onnxruntime as ort
 
 from audit_peer_native_c32_basis import peer_to_native_multihead
@@ -17,6 +16,7 @@ from check_upsample56_peer_image import metrics
 from check_c256_ffn_candidate import bits
 from decode_tinlayout_global import e4m3fn
 from extract_peer_decoder56_inputs import NODES
+from cached_public_branch import extract_cached
 from extract_peer_preblock0_skip import MODEL, MODEL_SHA256
 from native_c64_reference import multiply
 from native_c32_reference import H, F
@@ -68,7 +68,7 @@ def run(prepared_dir, encoder22_dir, decoder55_dir, output_root):
     public_dir = out / 'public_boundary'
     public_dir.mkdir(exist_ok=True)
     branch_file = public_dir / 'decoder55_61.onnx'
-    onnx.utils.extract_model(str(MODEL), str(branch_file), ['rgb'], list(NODES.values()))
+    extract_cached(MODEL, branch_file, ['rgb'], list(NODES.values()), MODEL_SHA256)
     session = ort.InferenceSession(str(branch_file), providers=['CPUExecutionProvider'])
     arrays = session.run(None, {'rgb': rgb.transpose(2, 0, 1)[None]})
     public = {}

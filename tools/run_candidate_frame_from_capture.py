@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Run the offline candidate through the head from one prepared 256x256 input.
 
-Each stage checks the previous candidate device hash and re-extracts its public
-FP16 comparison boundaries from the same input. This is not a live game path.
+Each stage checks the previous candidate device hash and runs its public FP16
+comparison boundaries on the same input. Graph extraction is cached by source
+model and nodes; comparison outputs are recomputed for every frame. This is
+not a live game path.
 """
 
 from pathlib import Path

@@ -75,6 +75,13 @@ gain-1 candidate enhanced images differed by RGB MAE `0.0216`. The paired
 HIP-input mode therefore matters for a prospective GPU runtime. Both gain
 variants remain diagnostic choices, not proven original visual parity.
 
+Each stage reuses its extracted public ONNX branch after the first pass when
+the source-model hash, output nodes and branch-file hash still match. It
+recomputes the public outputs and candidate checks for every capture; the
+cache only saves graph extraction time. A corrupt or mismatched branch is
+rebuilt automatically. This trims several seconds per stage on repeated
+previews but does not make the pipeline real-time.
+
 To process an already saved capture without a game, pass `--existing-capture
 --max-updates 1` with its path. To return to normal rendering, stop the
 sidecar, set `DebugView=0`, clear `CandidatePreviewPath` and

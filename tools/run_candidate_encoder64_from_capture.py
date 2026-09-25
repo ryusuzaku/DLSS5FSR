@@ -13,7 +13,6 @@ import json
 import subprocess
 
 import numpy as np
-import onnx
 import onnxruntime as ort
 
 from audit_peer_native_c32_basis import peer_to_native_multihead
@@ -26,6 +25,7 @@ from decode_tinlayout_global import e4m3fn
 from extract_peer_encoder64_inputs import NODES as C64_NODES
 from extract_peer_encoder128_inputs import NODES as C128_NODES
 from extract_peer_encoder256_inputs import NODES as C256_NODES
+from cached_public_branch import extract_cached
 from extract_peer_preblock0_skip import MODEL, MODEL_SHA256
 from native_split_reference import F
 from native_c64_reference import multiply
@@ -67,7 +67,7 @@ def run(prepared_dir, output_root, last_block=8, through_block14=False,
     branch_path = public_dir / ('encoder4_22.onnx' if through_block22 else
                                 'encoder4_14.onnx' if through_block14 else
                                 'encoder4_8.onnx')
-    onnx.utils.extract_model(str(MODEL), str(branch_path), ['rgb'], list(nodes.values()))
+    extract_cached(MODEL, branch_path, ['rgb'], list(nodes.values()), MODEL_SHA256)
     session = ort.InferenceSession(str(branch_path), providers=['CPUExecutionProvider'])
     arrays = session.run(None, {'rgb': rgb.transpose(2, 0, 1)[None]})
     public = {}
