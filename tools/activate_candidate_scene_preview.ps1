@@ -44,7 +44,7 @@ $settings = [ordered]@{
     CandidateInputCapturePath = (Join-Path $runtime 'game_capture.bin')
     CandidateInputCaptureTrigger = '1'
     CandidateInputCaptureRepeat = '1'
-    CandidateInputGpuPath = ''
+    CandidateInputGpuPath = (Join-Path $runtime 'game_input_gpu.f32')
 }
 $ini = Join-Path $game 'dlssnr_shim.ini'
 $lines = [Collections.Generic.List[string]]::new()

@@ -133,7 +133,11 @@ and some later-rendered elements still appear above the diagnostic view.
 
 For a slow scene-reactive experiment, the [scene preview guide](SCENE_PREVIEW.md)
 connects repeated staged captures to the offline candidate runner and lets
-the game reload each completed preview. It takes minutes per update and keeps
+the game reload each completed preview. Live game passes have taken 6.7–8.1
+minutes per update on the development machine. The paired HIP-input mode
+checks and uses the game's same-frame GPU-prepared tensor; on one scene, tiny
+CPU/HIP input rounding differences materially changed the gain-1 candidate
+image. Both modes keep
 the model assumptions above; it is not a real-time full-network game path.
 
 For the next live-input boundary, `CandidateInputCapturePath` in
