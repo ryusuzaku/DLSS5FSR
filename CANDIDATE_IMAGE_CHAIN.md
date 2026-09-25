@@ -682,8 +682,8 @@ FP16 `513ae1d5f9d5d7283da7356452ca9f32c484e7019bbe2f1443127dd2bb1729a4`).
 Against the CPU converter, the RGBA8 tensor had MAE `3.736e-9` and the FP16
 tensor `2.746e-9`, both with maximum absolute difference `5.960e-8`.
 The opt-in harness passed 128/128 checks and the default 117/117; the debug
-layer reported zero errors. The installed Cyberpunk DLL/config were not
-changed, so an actual-game run of this new live GPU boundary remains pending.
+layer reported zero errors. These harness results do not by themselves
+establish an actual-game run of this new live GPU boundary.
 
 The captured game proxy's prior CPU/GPU tensors differ at 47,598 of 196,608
 float32 values, each by at most `5.960e-8`. Only six of those values round to
@@ -693,3 +693,14 @@ stable values and did not consistently remove the six discrepancies. No
 arbitrary input correction was added; this boundary remains a diagnostic
 until gain and quantization behavior can be validated against an original
 oracle.
+
+Validate a paired raw/GPU capture with:
+
+```powershell
+& build/peer_onnx_venv/Scripts/python.exe tools/validate_candidate_input_pair.py '<capture.bin>' '<gpu-input.f32>' --output-dir '<private-output-directory>' --standalone-exe build/candidate_input_256_test.exe
+```
+
+The report records the raw and tensor hashes, capture format, crop, clipped
+fraction, CPU/GPU error over all 196,608 values, and whether the standalone
+HIP output matches byte-for-byte. It checks this project's diagnostic
+preprocessing only; it cannot establish original frontend parity.

@@ -210,6 +210,12 @@ files on the capture path's `.go` trigger. This is a one-shot diagnostic and
 does not change the rendered output. In the D3D12/HIP harness, the live-path
 GPU tensor was byte-for-byte identical to the standalone HIP result for both
 RGBA8 and FP16 proxy formats; all 128 checks passed. A default run passed
-117/117. No new DLL was installed in the game for this stage.
+117/117. An actual Cyberpunk paired capture is still needed to validate a
+game scene through this path.
+
+For a paired capture, run `tools/validate_candidate_input_pair.py` with the
+raw `.bin` and GPU `.f32` paths. It prepares the CPU tensor, checks every
+float, and can run `build/candidate_input_256_test.exe` for a byte-exact
+standalone HIP comparison. Generated images and tensors remain outside Git.
 
 Source code here is experimental. No NVIDIA binaries or weights are bundled.
