@@ -11,6 +11,7 @@ from contextlib import redirect_stdout
 import hashlib
 from io import StringIO
 import json
+import shutil
 import subprocess
 
 import numpy as np
@@ -72,12 +73,24 @@ def run(capture, gpu_tensor, output_dir, standalone_exe=None):
         report['standalone_gpu_sha256'] = digest(standalone_out)
         report['standalone_gpu_exact'] = (
             report['gpu_tensor_sha256'] == report['standalone_gpu_sha256'])
-    (output_dir / 'report.json').write_text(json.dumps(report, indent=2) + '\n')
-    print(json.dumps(report, indent=2))
     if report['gpu_vs_cpu_max_abs'] > 5e-6:
+        (output_dir / 'report.json').write_text(json.dumps(report, indent=2) + '\n')
         raise AssertionError('GPU/CPU diagnostic input differs above tolerance')
     if report['standalone_gpu_exact'] is False:
+        (output_dir / 'report.json').write_text(json.dumps(report, indent=2) + '\n')
         raise AssertionError('live GPU and standalone HIP tensors differ')
+    gpu_prepared = output_dir / 'gpu_prepared'
+    gpu_prepared.mkdir(exist_ok=True)
+    shutil.copyfile(gpu_tensor, gpu_prepared / 'color_linear.f32')
+    shutil.copyfile(prepared_dir / 'proxy_256.png', gpu_prepared / 'proxy_256.png')
+    gpu_manifest = dict(prepared)
+    gpu_manifest['color_linear_sha256'] = report['gpu_tensor_sha256']
+    gpu_manifest['input_tensor_source'] = 'same-frame HIP GPU diagnostic'
+    (gpu_prepared / 'manifest.json').write_text(
+        json.dumps(gpu_manifest, indent=2) + '\n')
+    report['gpu_prepared_manifest_sha256'] = digest(gpu_prepared / 'manifest.json')
+    (output_dir / 'report.json').write_text(json.dumps(report, indent=2) + '\n')
+    print(json.dumps(report, indent=2))
     return report
 
 

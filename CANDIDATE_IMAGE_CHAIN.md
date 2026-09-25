@@ -704,3 +704,27 @@ The report records the raw and tensor hashes, capture format, crop, clipped
 fraction, CPU/GPU error over all 196,608 values, and whether the standalone
 HIP output matches byte-for-byte. It checks this project's diagnostic
 preprocessing only; it cannot establish original frontend parity.
+On success, it writes `gpu_prepared/manifest.json`, `color_linear.f32`,
+and the visual PNG so the GPU input can be replayed without manually
+editing a manifest.
+
+The first actual Cyberpunk run of this boundary captured a 991×620 FP16
+staged proxy at the Hacked and Coke storefront (pitch 7,936 bytes). The
+one-shot trigger was consumed; the raw capture was 4,920,356 bytes including
+its header, and the GPU tensor was 786,432 bytes. The raw SHA256 was
+`ce8c1dc8bbb4e0607b2d279844a0713b7ef939d6cf673cf59a17a2e194a4f183`;
+the GPU tensor SHA256 was
+`384208621c29c72b268917ef4d13e40c552abb10b956c03c39dcccf9112d5516`.
+GPU output matched the standalone HIP kernel byte-for-byte. Against the
+diagnostic CPU converter, MAE was `3.069e-9`, maximum difference
+`5.960e-8`, zero values above `1e-6`, and zero clipped channels. The game
+log recorded both writes in sequence and no capture error.
+
+That exact live GPU tensor then ran through the eleven-stage offline
+candidate encoder5–head70 replay. All declared HIP/scalar stage, device
+handoff, full-head and direct GPU-buffer checks passed. Public-gain blended
+RGB versus same-input public FP16 final had MAE `0.00555692` and correlation
+`0.99912458` over 196,608 values; input versus public final MAE was
+`0.00771973`. The candidate and public PNGs look close at 256×256. These
+results validate the live preprocessing handoff and offline candidate
+arithmetic, while the renderer still runs its older live 64-token path.

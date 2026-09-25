@@ -70,6 +70,22 @@ GPU execution remain separate evidence.
 
 ## Blackwell owner: direct original oracle
 
+Before a volunteer installs anything, ask for the exact GPU model (the first
+lines of `nvidia-smi`) and the SHA256 of any personally obtained
+`nvngx_dlssnr.dll`:
+
+```powershell
+Get-FileHash "C:\path\to\nvngx_dlssnr.dll" -Algorithm SHA256
+```
+
+An RTX 5080 is listed at compute capability 12.0 on NVIDIA's table below.
+The first inventory task above needs only [Python 3.12.10 for Windows
+(64-bit)](https://www.python.org/downloads/release/python-31210/) and **no
+pip add-ons**; `inspect_dlss5_logical_assets.py` uses the Python standard
+library. Do not have a volunteer install Python, CUDA or Visual Studio until
+the GPU/model-build match and chosen task are clear. Direct original-kernel
+probing uses CUDA/C++ and needs a separate, tested run recipe.
+
 The signed DLL and extracted SM120 cubins are in the maintainer's private
 workspace; they are not in the public repository. The
 [NVIDIA compute-capability table](https://developer.nvidia.com/cuda/gpus)

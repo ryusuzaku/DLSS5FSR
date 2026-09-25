@@ -210,12 +210,22 @@ files on the capture path's `.go` trigger. This is a one-shot diagnostic and
 does not change the rendered output. In the D3D12/HIP harness, the live-path
 GPU tensor was byte-for-byte identical to the standalone HIP result for both
 RGBA8 and FP16 proxy formats; all 128 checks passed. A default run passed
-117/117. An actual Cyberpunk paired capture is still needed to validate a
-game scene through this path.
+117/117. A Cyberpunk scene capture at 991×620 FP16 subsequently passed the
+same-frame paired check: the live GPU tensor exactly matched standalone HIP
+output, with CPU-converter MAE `3.07e-9` and no clipped channels.
 
 For a paired capture, run `tools/validate_candidate_input_pair.py` with the
 raw `.bin` and GPU `.f32` paths. It prepares the CPU tensor, checks every
 float, and can run `build/candidate_input_256_test.exe` for a byte-exact
-standalone HIP comparison. Generated images and tensors remain outside Git.
+standalone HIP comparison. On success it also writes a `gpu_prepared`
+directory that can be passed directly to the full offline replay runner.
+Generated images and tensors remain outside Git.
+
+The storefront capture's GPU-prepared input completed that eleven-stage
+offline replay, including all declared candidate stage and direct head-buffer
+checks. Its public-gain blended output had MAE `0.005557` against the
+same-input public FP16 final frame, versus `0.007720` for the input baseline.
+This remains a 256×256 offline candidate image, not live full-network output
+or original NVIDIA-kernel validation.
 
 Source code here is experimental. No NVIDIA binaries or weights are bundled.
