@@ -156,11 +156,13 @@ struct Config {
     // the model texture with DebugView=2. This is fixed-image output, not live
     // network inference; empty keeps the normal model path.
     std::wstring candidatePreviewPath;
+    bool candidatePreviewReload = false;  // poll for atomically replaced preview
 
     // Diagnostic one-shot capture of the completed staged proxy. This is the
     // input boundary for a future full-frame candidate, not a model output.
     std::wstring candidateInputCapturePath;
     bool candidateInputCaptureTrigger = false;  // wait for <path>.go
+    bool candidateInputCaptureRepeat = false;   // re-arm after each consumed trigger
     // Optional same-frame GPU-prepared 256x256 linear RGB tensor. Written
     // only when CandidateInputCapturePath captures; never changes the model.
     std::wstring candidateInputGpuPath;
@@ -535,8 +537,8 @@ bool HipC256blkBlockTest(); // connected C=256 block (S169)
 bool HipC32blkBlockTest();  // connected C=32 block (S170)  // one-shot CONNECTED C=64 BLOCK, FFN->QKV->attn->proj (§116, Test-25)
 void HipFeBlockView();  // level-2 cached-block view into sharedOut (§34)
 bool HipFeBlockStaged();  // level-3 staged-window run, real pixels (§34)
-bool HipCandidatePreview();  // fixed-image model-texture bridge, DebugView=2 only
-bool HipCandidateInputCapture();  // one-shot staged-proxy capture
+bool HipCandidatePreview();  // opt-in model-texture bridge, DebugView=2 only
+bool HipCandidateInputCapture();  // one-shot or triggered-repeat staged-proxy capture
 UINT64 HipStagingRowPitch();
 UINT64 HipStagingBytes();
 ID3D12Resource* HipStagingIn();

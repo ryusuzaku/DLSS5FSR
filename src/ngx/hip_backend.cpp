@@ -101,6 +101,9 @@ struct State {
     // only pays for one upload; the normal network path never reads this.
     std::wstring previewPath;
     bool previewLoadAttempted = false;
+    bool previewFileKnown = false;
+    FILETIME previewFileTime{};
+    uint64_t previewFileBytes = 0, previewChecks = 0;
     std::vector<unsigned char> preview8, preview16, previewFrame;
     unsigned int previewW = 0, previewH = 0, previewBpp = 0;
     UINT64 previewPitch = 0;
@@ -631,12 +634,20 @@ bool CandidateInputGpuTensor(const std::wstring& path) {
 bool CandidateInputCapture() {
     State& s = S();
     const Config& cfg = Cfg();
-    if (cfg.candidateInputCapturePath.empty() || s.candidateInputCaptureAttempted)
-        return true;
+    if (cfg.candidateInputCapturePath.empty()) return true;
     const std::wstring trigger = cfg.candidateInputCapturePath + L".go";
-    if (cfg.candidateInputCaptureTrigger &&
-        GetFileAttributesW(trigger.c_str()) == INVALID_FILE_ATTRIBUTES)
+    const bool repeat = cfg.candidateInputCaptureTrigger && cfg.candidateInputCaptureRepeat;
+    if (repeat) {
+        if (GetFileAttributesW(trigger.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            s.candidateInputCaptureAttempted = false;
+            return true;
+        }
+    } else if (s.candidateInputCaptureAttempted ||
+               (cfg.candidateInputCaptureTrigger &&
+                GetFileAttributesW(trigger.c_str()) == INVALID_FILE_ATTRIBUTES)) {
         return true;
+    }
+    if (s.candidateInputCaptureAttempted) return true;
     s.candidateInputCaptureAttempted = true;
     if (!s.usable || !s.ptrIn || !s.w || !s.h ||
         (s.bpp != 4 && s.bpp != 8) || s.w > 4096 || s.h > 4096 ||
@@ -714,39 +725,61 @@ bool CandidatePreview() {
     if (s.previewPath != cfg.candidatePreviewPath) {
         s.previewPath = cfg.candidatePreviewPath;
         s.previewLoadAttempted = false;
+        s.previewFileKnown = false;
+        s.previewChecks = 0;
         s.preview8.clear(); s.preview16.clear(); s.previewFrame.clear();
         s.previewRuns = 0;
+    }
+    // The sidecar atomically replaces the file after a whole offline pass.
+    // Poll metadata infrequently so the render path does not do file I/O on
+    // every frame. Keep the last valid image if a replacement is malformed.
+    if (cfg.candidatePreviewReload && (++s.previewChecks % 60) == 0) {
+        WIN32_FILE_ATTRIBUTE_DATA info{};
+        if (GetFileAttributesExW(s.previewPath.c_str(), GetFileExInfoStandard, &info) &&
+            (!s.previewFileKnown ||
+             CompareFileTime(&info.ftLastWriteTime, &s.previewFileTime) != 0 ||
+             (((uint64_t)info.nFileSizeHigh << 32) | info.nFileSizeLow) != s.previewFileBytes))
+            s.previewLoadAttempted = false;
     }
     if (!s.previewLoadAttempted) {
         s.previewLoadAttempted = true;
         FILE* file = _wfopen(s.previewPath.c_str(), L"rb");
         if (!file) {
-            LOGE("hip: fixed candidate preview not readable: %ls", s.previewPath.c_str());
-            return false;
+            if (s.preview8.empty())
+                LOGW("hip: candidate preview waiting for %ls", s.previewPath.c_str());
+        } else {
+            const size_t n8 = 256u * 256u * 4u, n16 = n8 * 2u;
+            unsigned char header[16]{};
+            bool valid = fread(header, 1, sizeof(header), file) == sizeof(header);
+            const unsigned char magic[8] = {'D','5','P','R','E','V','0','1'};
+            unsigned int w = 0, h = 0;
+            if (valid) {
+                memcpy(&w, header + 8, 4); memcpy(&h, header + 12, 4);
+                valid = memcmp(header, magic, 8) == 0 && w == 256 && h == 256;
+            }
+            std::vector<unsigned char> next8, next16;
+            if (valid) {
+                next8.resize(n8); next16.resize(n16);
+                valid = fread(next8.data(), 1, n8, file) == n8 &&
+                        fread(next16.data(), 1, n16, file) == n16 &&
+                        fgetc(file) == EOF;
+            }
+            fclose(file);
+            if (!valid) {
+                LOGE("hip: candidate preview has wrong header or size; keeping previous image");
+            } else {
+                s.preview8.swap(next8); s.preview16.swap(next16);
+                s.previewFrame.clear();
+                WIN32_FILE_ATTRIBUTE_DATA info{};
+                if (GetFileAttributesExW(s.previewPath.c_str(), GetFileExInfoStandard, &info)) {
+                    s.previewFileTime = info.ftLastWriteTime;
+                    s.previewFileBytes = ((uint64_t)info.nFileSizeHigh << 32) | info.nFileSizeLow;
+                    s.previewFileKnown = true;
+                }
+                LOGI("hip: fixed 256x256 candidate preview loaded (%ls); offline replay, not real-time inference",
+                     s.previewPath.c_str());
+            }
         }
-        const size_t n8 = 256u * 256u * 4u, n16 = n8 * 2u;
-        unsigned char header[16]{};
-        bool valid = fread(header, 1, sizeof(header), file) == sizeof(header);
-        const unsigned char magic[8] = {'D','5','P','R','E','V','0','1'};
-        unsigned int w = 0, h = 0;
-        if (valid) {
-            memcpy(&w, header + 8, 4); memcpy(&h, header + 12, 4);
-            valid = memcmp(header, magic, 8) == 0 && w == 256 && h == 256;
-        }
-        if (valid) {
-            s.preview8.resize(n8); s.preview16.resize(n16);
-            valid = fread(s.preview8.data(), 1, n8, file) == n8 &&
-                    fread(s.preview16.data(), 1, n16, file) == n16 &&
-                    fgetc(file) == EOF;
-        }
-        fclose(file);
-        if (!valid) {
-            s.preview8.clear(); s.preview16.clear();
-            LOGE("hip: fixed candidate preview has wrong header or size");
-            return false;
-        }
-        LOGI("hip: fixed 256x256 candidate preview loaded (%ls); this is replay, not live inference",
-             s.previewPath.c_str());
     }
     if (s.preview8.empty() || s.preview16.empty()) return false;
     if (s.previewFrame.empty() || s.previewW != s.w || s.previewH != s.h ||

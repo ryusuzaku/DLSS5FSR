@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Export the pinned offline candidate RGB frame for a fixed in-game preview.
+"""Export a provenance-checked offline candidate RGB frame for the game preview.
 
-The result only tests the game's model-texture bridge. It does not run the
-candidate network on the game's current scene.
+The result tests the game's model-texture bridge. With repeated capture and
+reload, an external sidecar can update it after slow offline inference.
 """
 from pathlib import Path
 import argparse
@@ -26,7 +26,7 @@ def run(frame_dir, connected_dir, output):
     frame = json.loads((frame_dir / 'manifest.json').read_text())
     connected = json.loads((connected_dir / 'manifest.json').read_text())
     if (frame['size'] != [256, 256] or
-            frame['latent_case'] != 'from_candidate_encoder8_fp8' or
+            frame['latent_case'] not in ('from_candidate_encoder8_fp8', 'capture_candidate') or
             frame['source_model_sha256'] != connected['source_model_sha256'] or
             connected['latent_case'] != frame['latent_case'] or
             connected['source_frame_manifest_sha256'] != digest(frame_dir / 'manifest.json') or
@@ -53,7 +53,8 @@ def run(frame_dir, connected_dir, output):
                   source_frame_manifest_sha256=digest(frame_dir / 'manifest.json'),
                   source_connected_manifest_sha256=digest(connected_dir / 'manifest.json'),
                   source_image_sha256=digest(frame_path), size=[256, 256],
-                  purpose='fixed-image game model-texture diagnostic; not live inference')
+                  purpose='offline candidate game model-texture diagnostic; not real-time inference',
+                  latent_case=frame['latent_case'])
     output.with_suffix('.json').write_text(json.dumps(report, indent=2) + '\n')
     print(json.dumps(report, indent=2))
     return report

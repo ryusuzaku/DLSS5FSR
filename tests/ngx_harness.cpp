@@ -507,8 +507,11 @@ struct IniValues {
     int hipFeLive = 0;
     int hipFeTransition = 0;
     std::string candidatePreviewPath;
+    int candidatePreviewReload = 0;
+    std::string candidatePreviewSwapPath;  // harness-only replacement source
     std::string candidateInputCapturePath;
     int candidateInputCaptureTrigger = 0;
+    int candidateInputCaptureRepeat = 0;
     std::string candidateInputGpuPath;
     // S231 step 3: the default is the SHIPPED reading (2, our map), so a green run
     // means the path the game runs is right. Only the c256f2 check consults this --
@@ -552,8 +555,10 @@ static bool WriteIni(const std::string& dir, const IniValues& v) {
             "HipFeLive=%d\n"
             "HipFeTransition=%d\n"
             "CandidatePreviewPath=%s\n"
+            "CandidatePreviewReload=%d\n"
             "CandidateInputCapturePath=%s\n"
             "CandidateInputCaptureTrigger=%d\n"
+            "CandidateInputCaptureRepeat=%d\n"
             "CandidateInputGpuPath=%s\n"
             "HipFfnTranspose=%d\n"
             "DumpField=%d\n",
@@ -565,8 +570,9 @@ static bool WriteIni(const std::string& dir, const IniValues& v) {
             v.maxRatio,
             v.passthrough, v.debugView, v.dumpFrames, v.dumpEvery,
             v.hipFeLive, v.hipFeTransition, v.candidatePreviewPath.c_str(),
+            v.candidatePreviewReload,
             v.candidateInputCapturePath.c_str(),
-            v.candidateInputCaptureTrigger,
+            v.candidateInputCaptureTrigger, v.candidateInputCaptureRepeat,
             v.candidateInputGpuPath.c_str(),
             v.hipFfnTranspose, v.dumpField);
     fclose(f);
@@ -614,6 +620,8 @@ struct PassResult {
     int evalFailures = 0;
     bool created = false;
     bool triggerWrote = false;
+    bool secondTriggerWrote = false;
+    bool previewSwapped = false;
 };
 
 // Init -> create -> evaluate -> read back -> release -> shutdown, with a fresh
@@ -674,6 +682,19 @@ static PassResult RunPass(Ngx& ngx, D3D& d, const std::string& iniDir,
             const std::string trigger = v.candidateInputCapturePath + ".go";
             FILE* f = fopen(trigger.c_str(), "wb");
             if (f) { pr.triggerWrote = fwrite("go", 1, 2, f) == 2; fclose(f); }
+        }
+        if (i == 4 && v.candidateInputCaptureRepeat &&
+            !v.candidateInputCapturePath.empty()) {
+            const std::string trigger = v.candidateInputCapturePath + ".go";
+            FILE* f = fopen(trigger.c_str(), "wb");
+            if (f) { pr.secondTriggerWrote = fwrite("go", 1, 2, f) == 2; fclose(f); }
+        }
+        if (i == 3 && !v.candidatePreviewSwapPath.empty()) {
+            const std::string temp = v.candidatePreviewPath + ".tmp";
+            pr.previewSwapped = CopyFileA(v.candidatePreviewSwapPath.c_str(),
+                                          temp.c_str(), FALSE) &&
+                                MoveFileExA(temp.c_str(), v.candidatePreviewPath.c_str(),
+                                            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
         }
     }
 
@@ -1344,6 +1365,22 @@ int main(int argc, char** argv) {
         for (size_t k = 0; opaque && k < (size_t)DST_W * DST_H; ++k)
             opaque = pp.rb.pixels[k * 4 + 3] == 255;
         Check(opaque, "candidate debug view stays opaque over zero-alpha scene");
+        const char* swapEnv = getenv("DLSS5_CANDIDATE_PREVIEW_SWAP");
+        if (swapEnv && *swapEnv) {
+            const std::string current = iniDir + "/harness_candidate_reload.bin";
+            Check(CopyFileA(previewEnv, current.c_str(), FALSE) != 0,
+                  "candidate reload starts with a local preview copy");
+            IniValues reload = preview;
+            reload.candidatePreviewPath = current;
+            reload.candidatePreviewReload = 1;
+            reload.candidatePreviewSwapPath = swapEnv;
+            PassResult rp = RunPass(ngx, d, iniDir, reload, color.Get(),
+                                    output.Get(), SRC_W, SRC_H, DST_W, DST_H, 66);
+            Check(rp.evalFailures == 0 && rp.previewSwapped,
+                  "candidate preview replacement evaluates");
+            Check(MaxChannelDiff(pp.rb, rp.rb) > 20,
+                  "candidate preview hot reload changes the model texture");
+        }
     }
 
     // Opt-in readback of the actual staged model input. It must be the
@@ -1357,16 +1394,21 @@ int main(int argc, char** argv) {
         IniValues capture;
         capture.candidateInputCapturePath = captureEnv;
         capture.candidateInputCaptureTrigger = EnvInt("DLSS5_CANDIDATE_INPUT_TRIGGER", 0);
+        capture.candidateInputCaptureRepeat = EnvInt("DLSS5_CANDIDATE_INPUT_REPEAT", 0);
         capture.candidateInputGpuPath = std::string(captureEnv) + ".f32";
         remove(capture.candidateInputGpuPath.c_str());
         PassResult cp = RunPass(ngx, d, iniDir, capture, color.Get(),
                                 output.Get(), SRC_W, SRC_H, DST_W, DST_H,
-                                kFrames);
+                                capture.candidateInputCaptureRepeat ? 7 : kFrames);
         Check(cp.evalFailures == 0, "candidate input capture frame evaluates");
         if (capture.candidateInputCaptureTrigger)
             Check(cp.triggerWrote &&
                   GetFileAttributesA(captureTrigger.c_str()) == INVALID_FILE_ATTRIBUTES,
                   "candidate capture waits for and consumes the scene trigger");
+        if (capture.candidateInputCaptureRepeat)
+            Check(cp.secondTriggerWrote &&
+                  GetFileAttributesA(captureTrigger.c_str()) == INVALID_FILE_ATTRIBUTES,
+                  "candidate capture re-arms after the first consumed trigger");
         FILE* raw = fopen(captureEnv, "rb");
         bool valid = raw != nullptr;
         unsigned char header[36]{};
@@ -2103,6 +2145,8 @@ int main(int argc, char** argv) {
             // S223c's f16 dump pass and S223d's live-chain pass (one arm per
             // process, chosen by DLSS5_ARM) are one single pass each.
             Check(inits == 1 + 8 + 2 + 1 + ((previewEnv && *previewEnv) ? 1 : 0) +
+                      ((getenv("DLSS5_CANDIDATE_PREVIEW_SWAP") &&
+                        *getenv("DLSS5_CANDIDATE_PREVIEW_SWAP")) ? 1 : 0) +
                       ((captureEnv && *captureEnv) ? 1 : 0),
                   "every pass initialised the shim");
             Check(hipReady >= 1, "the HIP model ran at least once");

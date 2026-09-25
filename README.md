@@ -131,6 +131,11 @@ confirmed the candidate square, exact HIP readback and model-texture copies
 without device errors. `DebugView=2` now outputs opaque alpha; the game's HUD
 and some later-rendered elements still appear above the diagnostic view.
 
+For a slow scene-reactive experiment, the [scene preview guide](SCENE_PREVIEW.md)
+connects repeated staged captures to the offline candidate runner and lets
+the game reload each completed preview. It takes minutes per update and keeps
+the model assumptions above; it is not a real-time full-network game path.
+
 For the next live-input boundary, `CandidateInputCapturePath` in
 `dlssnr_shim.ini` writes one completed staged proxy frame to an absolute `.bin`
 path. This capture does not alter the model output. Run
