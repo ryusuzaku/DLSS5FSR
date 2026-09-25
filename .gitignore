@@ -10,12 +10,14 @@
 !/hip/
 !/tools/
 !/tests/
+!/volunteer_5080/
 
 # Source trees only; generated binaries, captures, models and local settings
 # are deliberately never part of the public repository.
 /hip/*
 !/hip/mvp1/
 /tools/nv_probe/
+/volunteer_5080/results/
 **/__pycache__/
 **/*.pyc
 **/*.pyo

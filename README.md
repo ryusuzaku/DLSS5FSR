@@ -23,6 +23,11 @@ the same tool checks all 14 ordinary C256 blocks without fitting C256 maps.
 `ORIGINAL_MAP_VALIDATION.md` records which claims are
 local checks and which are attributed to other projects.
 
+An RTX 5080 volunteer can download the standalone
+[volunteer kit](volunteer_5080/README.md). It records model/asset provenance and
+runs a small original ViT repack probe without CUDA Toolkit; C256/C32 fused
+kernel parity still requires a separate follow-up harness.
+
 [CANDIDATE_IMAGE_CHAIN.md](CANDIDATE_IMAGE_CHAIN.md) records same-image
 block39→head and block47→head candidate runs, plus an AMD block39→head path
 started from public ViT38 and split-encoder30 tensors. The matching encoder22 skip is used at block48;
