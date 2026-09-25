@@ -108,6 +108,9 @@ struct State {
 
     // One completed proxy frame, captured only when explicitly requested.
     bool candidateInputCaptureAttempted = false;
+    hipModule_t candidateInputModule = nullptr;
+    hipFunction_t candidateInputKernel = nullptr;
+    void* candidateInputRgb = nullptr;
 
     // The FP8 GEMM self-test: runs once when configured, proves the whole
     // "real weights through rocWMMA inside the shim" chain bit-exactly.
@@ -208,6 +211,8 @@ extern "C" __global__ void model_copy(const unsigned char* src, unsigned char* d
     dst[i] = src[i];
 }
 )HIP";
+
+#include "../../hip/mvp1/candidate_input_256_source.inc"
 
 bool CompileKernel() {
     State& s = S();
@@ -343,6 +348,15 @@ bool Startup() {
 void Shutdown() {
     State& s = S();
     DropStaging();
+    if (s.candidateInputRgb) {
+        s.Free(s.candidateInputRgb);
+        s.candidateInputRgb = nullptr;
+    }
+    if (s.candidateInputModule) {
+        s.ModuleUnload(s.candidateInputModule);
+        s.candidateInputModule = nullptr;
+        s.candidateInputKernel = nullptr;
+    }
     if (s.stream) {
         s.StreamSynchronize(s.stream);
         s.StreamDestroy(s.stream);
@@ -529,6 +543,91 @@ bool RunModel() {
     return true;
 }
 
+bool CandidateInputGpuTensor(const std::wstring& path) {
+    State& s = S();
+    constexpr size_t tensorBytes = 256u * 256u * 3u * sizeof(float);
+    if (!s.candidateInputKernel) {
+        _hiprtcProgramDummy* prog = nullptr;
+        int rr = s.RtcCreateProgram(&prog, kCandidateInput256Source,
+                                    "candidate_input_256.hip", 0, nullptr, nullptr);
+        if (rr != 0) {
+            LOGE("hip: candidate input hiprtcCreateProgram failed: %s",
+                 s.RtcGetErrorString(rr));
+            return false;
+        }
+        const char* options[] = {"-std=c++17", "-O2", "-ffp-contract=off"};
+        rr = s.RtcCompileProgram(prog, 3, options);
+        if (rr != 0) {
+            size_t logSize = 0;
+            const int logSizeResult = s.RtcGetProgramLogSize(prog, &logSize);
+            std::vector<char> log(logSize + 1, 0);
+            const int logResult = logSize ? s.RtcGetProgramLog(prog, log.data()) : -1;
+            LOGE("hip: candidate input hiprtc compile failed (%s, logSize=%llu/%d, log=%d): %s",
+                 s.RtcGetErrorString(rr), (unsigned long long)logSize,
+                 logSizeResult, logResult, log.data());
+            s.RtcDestroyProgram(&prog);
+            return false;
+        }
+        size_t codeSize = 0;
+        if (s.RtcGetCodeSize(prog, &codeSize) != 0 || codeSize == 0) {
+            s.RtcDestroyProgram(&prog);
+            LOGE("hip: candidate input hiprtc code size unavailable");
+            return false;
+        }
+        std::vector<char> code(codeSize);
+        rr = s.RtcGetCode(prog, code.data());
+        s.RtcDestroyProgram(&prog);
+        if (rr != 0 ||
+            s.ModuleLoadData(&s.candidateInputModule, code.data()) != hipSuccess ||
+            s.ModuleGetFunction(&s.candidateInputKernel, s.candidateInputModule,
+                                "k_candidate_input_256") != hipSuccess) {
+            LOGE("hip: candidate input module/kernel load failed");
+            return false;
+        }
+    }
+    if (!s.candidateInputRgb &&
+        s.Malloc(&s.candidateInputRgb, tensorBytes) != hipSuccess) {
+        LOGE("hip: candidate input GPU tensor allocation failed");
+        return false;
+    }
+    void* src = s.ptrIn;
+    void* dst = s.candidateInputRgb;
+    int width = (int)s.w, height = (int)s.h;
+    int pitch = (int)s.pitch, bpp = (int)s.bpp;
+    void* args[] = {&src, &dst, &width, &height, &pitch, &bpp};
+    hipError_t e = s.ModuleLaunchKernel(
+        s.candidateInputKernel, 256, 1, 1, 256, 1, 1, 0, s.stream, args, nullptr);
+    if (e == hipSuccess) e = s.StreamSynchronize(s.stream);
+    std::vector<float> tensor(tensorBytes / sizeof(float));
+    if (e == hipSuccess)
+        e = s.Memcpy(tensor.data(), s.candidateInputRgb, tensorBytes,
+                     hipMemcpyDeviceToHost);
+    if (e != hipSuccess) {
+        LOGE("hip: candidate input GPU tensor failed: %s", s.GetErrorString(e));
+        return false;
+    }
+    const std::wstring tmp = path + L".tmp";
+    FILE* f = _wfopen(tmp.c_str(), L"wb");
+    if (!f) {
+        LOGE("hip: candidate input GPU tensor cannot open %ls", tmp.c_str());
+        return false;
+    }
+    const bool written = fwrite(tensor.data(), 1, tensorBytes, f) == tensorBytes &&
+                         fflush(f) == 0;
+    const bool closed = fclose(f) == 0;
+    if (!written || !closed ||
+        !MoveFileExW(tmp.c_str(), path.c_str(),
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        _wremove(tmp.c_str());
+        LOGE("hip: candidate input GPU tensor write/rename failed at %ls",
+             path.c_str());
+        return false;
+    }
+    LOGI("hip: candidate input GPU tensor saved 256x256 RGB f32 (%llu bytes) at %ls",
+         (unsigned long long)tensorBytes, path.c_str());
+    return true;
+}
+
 bool CandidateInputCapture() {
     State& s = S();
     const Config& cfg = Cfg();
@@ -585,10 +684,12 @@ bool CandidateInputCapture() {
     LOGI("hip: candidate input captured %ux%u bpp=%u pitch=%llu bytes=%llu at %ls",
          s.w, s.h, s.bpp, (unsigned long long)s.pitch,
          (unsigned long long)s.bytes, cfg.candidateInputCapturePath.c_str());
+    const bool gpuOk = cfg.candidateInputGpuPath.empty() ||
+                       CandidateInputGpuTensor(cfg.candidateInputGpuPath);
     if (cfg.candidateInputCaptureTrigger && !DeleteFileW(trigger.c_str()))
         LOGW("hip: candidate input capture could not remove trigger %ls",
              trigger.c_str());
-    return true;
+    return gpuOk;
 }
 
 bool CandidatePreview() {

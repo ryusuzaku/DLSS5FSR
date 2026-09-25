@@ -14,7 +14,7 @@ __device__ __forceinline__ float candidate_proxy_channel(
     return __half2float(__ushort_as_half(bits));
 }
 
-__global__ void k_candidate_input_256(const unsigned char* src, float* output,
+extern "C" __global__ void k_candidate_input_256(const unsigned char* src, float* output,
                                        int width, int height, int pitch, int bpp) {
     const int pixel = (int)(blockIdx.x * blockDim.x + threadIdx.x);
     if (pixel >= 256*256) return;

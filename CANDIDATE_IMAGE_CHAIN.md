@@ -662,3 +662,34 @@ To replay the GPU bytes instead of the CPU-prepared bytes, place the emitted
 `color_linear_sha256` manifest field. Preserve the original capture digest;
 the source capture and proxy PNG do not change. Generated capture, model and
 frame files stay outside the public repository.
+
+### One-shot live GPU input boundary
+
+Set both `CandidateInputCapturePath` (raw `.bin`) and
+`CandidateInputGpuPath` (linear RGB `.f32`) to distinct absolute paths in
+an existing writable directory. The shim waits for its established completed
+frame counter, then captures the raw staged proxy and launches the same
+256×256 HIP kernel on that imported D3D12 buffer. With
+`CandidateInputCaptureTrigger=1`, the capture-path `.go` file gates both
+outputs; the GPU path is never run by itself. The model output remains the
+normal identity/live-64-token path.
+
+The D3D12/HIP harness captured both RGBA8 and FP16 proxy formats through this
+path. Each GPU tensor was exactly 786,432 bytes and had the **same SHA256**
+as the standalone HIP kernel applied to its matching raw capture (RGBA8
+`e7ca3fd75ddfe35f508bf27b0c18093b5eb3170c1258ea3a3e7813b46e14aeaa`;
+FP16 `513ae1d5f9d5d7283da7356452ca9f32c484e7019bbe2f1443127dd2bb1729a4`).
+Against the CPU converter, the RGBA8 tensor had MAE `3.736e-9` and the FP16
+tensor `2.746e-9`, both with maximum absolute difference `5.960e-8`.
+The opt-in harness passed 128/128 checks and the default 117/117; the debug
+layer reported zero errors. The installed Cyberpunk DLL/config were not
+changed, so an actual-game run of this new live GPU boundary remains pending.
+
+The captured game proxy's prior CPU/GPU tensors differ at 47,598 of 196,608
+float32 values, each by at most `5.960e-8`. Only six of those values round to
+different FP16 values, enough to seed the candidate public-gain sensitivity
+above. Tested blanket biases and decimal rounding changed many otherwise
+stable values and did not consistently remove the six discrepancies. No
+arbitrary input correction was added; this boundary remains a diagnostic
+until gain and quantization behavior can be validated against an original
+oracle.

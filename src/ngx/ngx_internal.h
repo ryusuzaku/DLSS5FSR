@@ -161,6 +161,9 @@ struct Config {
     // input boundary for a future full-frame candidate, not a model output.
     std::wstring candidateInputCapturePath;
     bool candidateInputCaptureTrigger = false;  // wait for <path>.go
+    // Optional same-frame GPU-prepared 256x256 linear RGB tensor. Written
+    // only when CandidateInputCapturePath captures; never changes the model.
+    std::wstring candidateInputGpuPath;
 
     // Scene value the game's tonemapper calls white. Everything the encode
     // does is relative to it, and getting it wrong is not a subtle error: the

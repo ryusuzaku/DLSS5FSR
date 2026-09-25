@@ -509,6 +509,7 @@ struct IniValues {
     std::string candidatePreviewPath;
     std::string candidateInputCapturePath;
     int candidateInputCaptureTrigger = 0;
+    std::string candidateInputGpuPath;
     // S231 step 3: the default is the SHIPPED reading (2, our map), so a green run
     // means the path the game runs is right. Only the c256f2 check consults this --
     // it is the one staged check that applies the same un-permutation the live
@@ -553,6 +554,7 @@ static bool WriteIni(const std::string& dir, const IniValues& v) {
             "CandidatePreviewPath=%s\n"
             "CandidateInputCapturePath=%s\n"
             "CandidateInputCaptureTrigger=%d\n"
+            "CandidateInputGpuPath=%s\n"
             "HipFfnTranspose=%d\n"
             "DumpField=%d\n",
             v.nrPasses, v.hipBackend, v.hipWeightsDir.c_str(),
@@ -565,6 +567,7 @@ static bool WriteIni(const std::string& dir, const IniValues& v) {
             v.hipFeLive, v.hipFeTransition, v.candidatePreviewPath.c_str(),
             v.candidateInputCapturePath.c_str(),
             v.candidateInputCaptureTrigger,
+            v.candidateInputGpuPath.c_str(),
             v.hipFfnTranspose, v.dumpField);
     fclose(f);
     return true;
@@ -1117,6 +1120,8 @@ int main(int argc, char** argv) {
             if (captureF16Env && *captureF16Env) {
                 remove(captureF16Env);
                 hdr.candidateInputCapturePath = captureF16Env;
+                hdr.candidateInputGpuPath = std::string(captureF16Env) + ".f32";
+                remove(hdr.candidateInputGpuPath.c_str());
             }
             PassResult p6b = RunPass(ngx, d, iniDir, hdr, color16.Get(),
                                      output16.Get(), SRC_W, SRC_H, DST_W, DST_H,
@@ -1146,6 +1151,11 @@ int main(int argc, char** argv) {
                 Check(valid, "HDR candidate capture has full FP16 proxy extent");
                 Check(valid && green >= 0x39DF && green <= 0x39E5,
                       "HDR candidate capture preserves encoded half green");
+                FILE* gpu = fopen(hdr.candidateInputGpuPath.c_str(), "rb");
+                bool gpuValid = gpu && fseek(gpu, 0, SEEK_END) == 0 &&
+                                ftell(gpu) == 256L * 256L * 3L * 4L;
+                if (gpu) fclose(gpu);
+                Check(gpuValid, "HDR candidate GPU input has complete RGB tensor");
             }
 
             // Frame 0 of the pass is the one that dumps. The writer runs on its
@@ -1347,6 +1357,8 @@ int main(int argc, char** argv) {
         IniValues capture;
         capture.candidateInputCapturePath = captureEnv;
         capture.candidateInputCaptureTrigger = EnvInt("DLSS5_CANDIDATE_INPUT_TRIGGER", 0);
+        capture.candidateInputGpuPath = std::string(captureEnv) + ".f32";
+        remove(capture.candidateInputGpuPath.c_str());
         PassResult cp = RunPass(ngx, d, iniDir, capture, color.Get(),
                                 output.Get(), SRC_W, SRC_H, DST_W, DST_H,
                                 kFrames);
@@ -1377,6 +1389,11 @@ int main(int argc, char** argv) {
         Check(valid && center[0] >= 175 && center[0] <= 200 &&
               center[1] >= 175 && center[1] <= 200,
               "candidate captured center is the encoded gradient");
+        FILE* gpu = fopen(capture.candidateInputGpuPath.c_str(), "rb");
+        bool gpuValid = gpu && fseek(gpu, 0, SEEK_END) == 0 &&
+                        ftell(gpu) == 256L * 256L * 3L * 4L;
+        if (gpu) fclose(gpu);
+        Check(gpuValid, "candidate GPU input has complete RGB tensor");
     }
     if (captureF16Env && *captureF16Env) {
         FILE* raw = fopen(captureF16Env, "rb");
@@ -1418,6 +1435,9 @@ int main(int argc, char** argv) {
             if (captureEnv && *captureEnv)
                 Check(text.find("hip: candidate input captured ") != std::string::npos,
                       "candidate input capture was logged");
+            if (captureEnv && *captureEnv)
+                Check(text.find("hip: candidate input GPU tensor saved ") != std::string::npos,
+                      "candidate GPU input was logged");
 
             // Counted, not just searched: every pass should have run the
             // chain, and one fallback anywhere is a failure.

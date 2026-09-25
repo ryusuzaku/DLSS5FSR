@@ -30,6 +30,7 @@ if [ "${1:-}" = "clean" ]; then
 fi
 
 mkdir -p "$OUT"
+python tools/embed_candidate_input_256.py
 
 # ---------------------------------------------------------------- shaders --
 # fxc /Fh emits a C header containing the compiled blob.

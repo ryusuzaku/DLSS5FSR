@@ -174,6 +174,7 @@ void ConfigLoad(const std::wstring& dir) {
             else if (key == L"CandidatePreviewPath") c.candidatePreviewPath = val;
             else if (key == L"CandidateInputCapturePath") c.candidateInputCapturePath = val;
             else if (key == L"CandidateInputCaptureTrigger") c.candidateInputCaptureTrigger = (std::stoi(val) != 0);
+            else if (key == L"CandidateInputGpuPath") c.candidateInputGpuPath = val;
             else if (key == L"WhitePoint")       c.whitePoint = std::stof(val);
             else if (key == L"ProxyMode")        c.proxyMode = std::stoi(val);
             else if (key == L"MaxRatio")         c.maxRatio = std::stof(val);
@@ -216,6 +217,9 @@ void ConfigLoad(const std::wstring& dir) {
     if (!c.candidateInputCapturePath.empty())
         LOGI("config: one-shot candidate input capture armed at %ls (trigger=%d)",
              c.candidateInputCapturePath.c_str(), (int)c.candidateInputCaptureTrigger);
+    if (!c.candidateInputGpuPath.empty())
+        LOGI("config: same-frame candidate GPU input tensor at %ls (requires capture path)",
+             c.candidateInputGpuPath.c_str());
 }
 
 }  // namespace ngx
