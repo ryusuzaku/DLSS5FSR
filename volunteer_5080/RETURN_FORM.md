@@ -3,7 +3,7 @@
 - GPU model: RTX 5080 / other:
 - Windows version (optional):
 - Is `nvidia-smi` working? Yes / No
-- Did the kit produce 4/4 ViT maps? Yes / No (error text is in the ZIP)
+- Did the kit produce all requested ViT maps (8/8 for `all`, 4/4 for `bridge`)? Yes / No (error text is in the ZIP)
 - Did the DLL and optional full package come from the same download? Yes / No / Unsure
 - Do you have the full package ZIP or `native-game-tiled-assets` folder? Yes / No
 - Could you run one follow-up original C256/C32 kernel probe if we provide an exact kit? Yes / No

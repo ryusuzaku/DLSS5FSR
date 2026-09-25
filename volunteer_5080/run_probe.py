@@ -230,6 +230,8 @@ def main() -> int:
     parser.add_argument("--assets", type=Path, help="optional full package ZIP or extracted asset folder")
     parser.add_argument("--out", type=Path, default=Path("results"))
     parser.add_argument("--no-gpu", action="store_true", help="metadata/asset report only")
+    parser.add_argument("--shapes", choices=("all", "bridge"), default="all",
+                        help="bridge runs only the new 8x4 and 16x4 layouts")
     args = parser.parse_args()
     if not args.dll.is_file():
         parser.error(f"DLL not found: {args.dll}")
@@ -237,7 +239,7 @@ def main() -> int:
         parser.error(f"output folder is not empty; choose a new --out folder: {args.out}")
     args.out.mkdir(parents=True, exist_ok=True)
     report = {
-        "kit": "DLSS5FSR RTX 5080 volunteer kit v0.1",
+        "kit": "DLSS5FSR RTX 5080 volunteer kit v0.2",
         "python": platform.python_version(),
         "system": platform.system(),
         "machine": platform.machine(),
@@ -264,7 +266,9 @@ def main() -> int:
             report["repack_cubin"] = details
             driver = CUDADriver(cubin)
             try:
-                for width, height in ((4, 4), (8, 8)):
+                shapes = ((8, 4), (16, 4)) if args.shapes == "bridge" else (
+                    (4, 4), (8, 4), (16, 4), (8, 8))
+                for width, height in shapes:
                     for symbol in TARGETS:
                         report["repack_maps"].append(recover_map(
                             driver, symbol, width, height, args.out))
@@ -282,7 +286,8 @@ def main() -> int:
                 output.write(path, path.name)
     print(f"DLL SHA256: {report['dll_sha256']}")
     print(f"Matching model build: {report['known_model_match']}")
-    print(f"Recovered maps: {len(report['repack_maps'])}/4")
+    expected_maps = 4 if args.shapes == "bridge" else 8
+    print(f"Recovered maps: {len(report['repack_maps'])}/{0 if args.no_gpu else expected_maps}")
     print(f"Share this small results archive: {archive.resolve()}")
     for error in report["errors"]:
         print(f"ERROR: {error}", file=sys.stderr)

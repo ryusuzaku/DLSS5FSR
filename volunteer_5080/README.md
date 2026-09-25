@@ -46,15 +46,19 @@ add `--no-gpu`. If you rerun the kit, choose a fresh output folder with
 `--out results2` rather than overwriting the first result.
 
 The run may take a few minutes. It reads the DLL locally to find the SM120
-ViT repack cubin, launches its original forward and inverse kernels on two
-small synthetic layouts (4×4 and 8×8), checks two held-out patterns, and writes
-four output-byte-to-input-byte maps. It never launches the C256/C32 fused
-kernels; those need a separate, validated input/weight harness.
+ViT repack cubin, launches its original forward and inverse kernels on four
+small synthetic layouts (4×4, 8×4, 16×4, 8×8), checks two held-out patterns,
+and writes eight output-byte-to-input-byte maps. The 8×4 and 16×4 layouts
+directly cover the bridge shapes in our current pipeline. **If you already ran
+v0.1**, add `--shapes bridge` to run only these two new shapes (four maps), and
+use a fresh output folder such as `--out results2`. It never launches the
+C256/C32 fused kernels; those need a separate, validated input/weight harness.
 
 ## What to send back
 
-Send **only** `results\dlss5fsr-5080-results.zip` to the project maintainer.
-You can inspect its contents first: `report.json`, up to four small `.i32` map
+Send **only** `dlss5fsr-5080-results.zip` from your chosen output folder to
+the project maintainer.
+You can inspect its contents first: `report.json`, up to eight small `.i32` map
 files, and `gpu-error.txt` only if a GPU step failed. `report.json` includes
 the GPU model/driver, DLL and cubin hashes, map hashes, asset filenames/sizes/
 hashes when available, and any errors. It contains no DLL, cubin, weights,
@@ -71,6 +75,8 @@ setup, model provenance, asset availability, and ViT physical layout.
 The source is in this folder. The DLL parser and asset inventory are copied
 from the public project tools so the ZIP is self-contained. The parser, cubin
 selection, and metadata-only run were checked against the maintainer's
-matching signed DLL. The CUDA launch itself cannot be tested on our AMD host;
-the return report distinguishes a successful original launch from a failure.
+matching signed DLL. An RTX 5080 volunteer completed the v0.1 CUDA launches
+for 4×4 and 8×8, with byte-exact agreement against the PTX-derived physical
+map. The new 8×4 and 16×4 shapes still await runtime results. The return
+report distinguishes a successful original launch from a failure.
 Do not interpret a failed launch as evidence about our candidate C256/C32 map.

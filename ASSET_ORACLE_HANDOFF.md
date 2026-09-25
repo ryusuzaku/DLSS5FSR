@@ -82,9 +82,12 @@ An RTX 5080 is listed at compute capability 12.0 on NVIDIA's table below.
 The first inventory task above needs only [Python 3.12.10 for Windows
 (64-bit)](https://www.python.org/downloads/release/python-31210/) and **no
 pip add-ons**; `inspect_dlss5_logical_assets.py` uses the Python standard
-library. Do not have a volunteer install Python, CUDA or Visual Studio until
-the GPU/model-build match and chosen task are clear. Direct original-kernel
-probing uses CUDA/C++ and needs a separate, tested run recipe.
+library. The standalone [RTX 5080 volunteer kit](volunteer_5080/README.md)
+adds only `zstandard==0.25.0` and uses the CUDA Driver API through Python;
+it needs neither CUDA Toolkit nor Visual Studio. Its original ViT repack
+results are recorded in [ORIGINAL_VIT_REPACK_VALIDATION.md](ORIGINAL_VIT_REPACK_VALIDATION.md).
+The harder fused C256/C32 original-kernel probes still need a separate,
+validated run recipe.
 
 The signed DLL and extracted SM120 cubins are in the maintainer's private
 workspace; they are not in the public repository. The
