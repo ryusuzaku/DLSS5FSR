@@ -24,6 +24,11 @@ the same tool checks all 14 ordinary C256 blocks without fitting C256 maps.
 local checks and which are attributed to other projects.
 The [original RTX 5080 ViT repack result](ORIGINAL_VIT_REPACK_VALIDATION.md)
 validates the 4×4 and 8×8 physical byte maps against SM120 runtime output.
+`tools/audit_vit16_reduction_sensitivity.py` quantifies how plausible 16-key
+half-sum orders affect the saved candidate ViT stages without claiming an
+original attention match.
+`tools/audit_vit16_bridge_components.py` links a supplied original-map ZIP to
+the saved candidate frame while keeping the unmeasured C512 cell view explicit.
 
 An RTX 5080 volunteer can download the standalone
 [volunteer kit](volunteer_5080/README.md). It records model/asset provenance and

@@ -1,5 +1,35 @@
 # Same-image candidate decoder chain (2026-09-24)
 
+## Original repack evidence and 16-token reduction sensitivity (2026-09-25)
+
+An RTX 5080 volunteer ran the matching original SM120 ViT repack kernels on
+4×4 and 8×8 token grids. Both forward and inverse **physical byte maps**
+matched our PTX address formulas with zero mismatches; see
+`ORIGINAL_VIT_REPACK_VALIDATION.md`. The 4×4 physical repack is identity. This
+does not establish the C512 split-view-to-HWC mapping or the logical gather
+used below, and it does not validate ViT attention arithmetic.
+
+`tools/audit_vit16_reduction_sensitivity.py` checks the captured-game-frame
+ViT31–38 stage files against the current 16-valid-key HIP/scalar baseline,
+then recomputes three other plausible denominator orders at each block's
+**fixed saved QKV input**. The baseline matches exactly. Sequential half,
+balanced half, and a zero-padded 64-key tree change 515, 223, and 249 of
+131,072 FP8 attention values respectively. Their maximum absolute difference
+is 0.5; average absolute differences are 0.0003521, 0.0001561, and 0.0001747.
+These outputs were not propagated through the full network, and none of the
+three orders has an original 16-token oracle. The existing candidate reduction
+is therefore retained until independent evidence arrives.
+
+`python tools/audit_vit16_bridge_components.py <private-volunteer-results.zip>`
+links the original 4×4 map to the saved captured-game-frame candidate. It
+verifies the original physical forward/inverse maps are identity, the saved
+candidate 16,384-entry gather matches its report hash, and the gather exactly
+equals the upstream logical formula composed with the inferred repeated C512
+cell map. The cell-map SHA-256 is
+`a8e7412b3f8e24cf9e986063d192fdae1b8911de2e44698371ee7899fbc28f57`.
+This is a precise provenance split: original physical repack is validated;
+the C512 cell view and complete logical bridge remain candidates.
+
 ## Captured game-frame offline continuation
 
 A versioned staged-proxy capture from Cyberpunk (991×620 FP16, center-cropped
