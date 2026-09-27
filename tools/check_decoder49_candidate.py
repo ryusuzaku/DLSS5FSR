@@ -12,7 +12,7 @@ import json
 import subprocess
 import numpy as np
 
-from audit_c256_residual_ptx import run as audit_residual_ptx
+from audit_c256_residual_ptx import checked as audit_residual_ptx
 from check_c256_ffn_candidate import candidate_ffn_maps,decode_ffn,reference as ffn_reference
 from check_c256_attention_candidate import candidate_attention_maps,decode_attention,reference as attention_reference
 

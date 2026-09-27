@@ -18,7 +18,7 @@ sys.path.insert(0,str(ROOT/'ref/dlss5-port/Development'))
 from decode_tinlayout_global import e4m3fn
 from check_c256_ffn_candidate import bits,reference as ffn_reference
 from check_c256_attention_candidate import reference as attention_reference
-from audit_c256_residual_ptx import run as audit_ptx
+from audit_c256_residual_ptx import checked as audit_ptx
 
 WIDTH,HEIGHT,CHANNELS,SHIFT=256,64,64,0
 

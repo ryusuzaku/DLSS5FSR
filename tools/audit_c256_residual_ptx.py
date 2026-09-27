@@ -5,6 +5,8 @@ This compares physical paired-half weight loads and their accumulator slots.
 It does not establish a physical-to-logical channel map or run NVIDIA code.
 """
 from pathlib import Path
+import copy
+import hashlib
 import json
 import re
 
@@ -16,6 +18,35 @@ REG = r"%(?:r|rd)\d+"
 DEFINE = re.compile(rf"^(\w+(?:\.\w+)*)\s+({REG}),\s*([^;]+);")
 LOAD = re.compile(rf"^ld\.global\.b32\s+({REG}),\s*\[({REG})\+(\d+)\];")
 MUL = re.compile(rf"^\{{?mul\.f16x2\s+({REG}),({REG}),({REG});")
+_cached_signature = None
+_cached_report = None
+
+
+def source_signature():
+    paths = (PTX, ROOT / 'dlss5-analysis/cubins/cubin_01_sm_120_ptx.ptx',
+             ROOT / 'dlss5-analysis/cubins/cubin_02_sm_120_ptx.ptx')
+    signature = []
+    for path in paths:
+        with path.open('rb') as source:
+            signature.append((str(path.resolve()), hashlib.file_digest(source, 'sha256').hexdigest()))
+    return tuple(signature)
+
+
+def checked():
+    """Reuse this process's audit only while all three PTX contents match.
+
+    Blocks share static address evidence, but their scalar/GPU arithmetic
+    checks still run independently. The standalone run() always audits anew.
+    No persisted report is trusted as an audit cache.
+    """
+    global _cached_signature, _cached_report
+    signature = source_signature()
+    if signature != _cached_signature:
+        report = run()
+        if source_signature() != signature:
+            raise ValueError('PTX source changed during residual audit')
+        _cached_signature, _cached_report = signature, copy.deepcopy(report)
+    return copy.deepcopy(_cached_report)
 
 
 def entry_lines(ptx=PTX, entry=ENTRY):
@@ -135,7 +166,7 @@ def evaluate(register, definitions, warp, lane, before, cache):
 
 
 def run():
-    lines = entry_lines()
+    lines = entry_lines(PTX)
     definitions, loads, multiplies = collect(lines)
     for offset, entries in loads.items():
         if len(entries) != 32:

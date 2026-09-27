@@ -3,8 +3,9 @@
 This opt-in diagnostic lets the game capture a staged proxy frame, runs the
 current AMD candidate offline, then displays the result as a centered square
 in `DebugView=2`. The game keeps showing the last completed square while the
-next capture runs. A saved-frame pass with shared public reference inference
-took about three minutes. Earlier passes while Cyberpunk was running took
+next capture runs. The latest saved-frame pass took about 2.4 minutes with
+shared public reference inference and reused static audits. Earlier passes
+while Cyberpunk was running took
 6.7 and 8.1 minutes; the shared mode has not yet been timed in-game. This is
 **not** real-time inference or a production replacement for
 DLSS 5. Original C256/C32 maps, the C512 physical view, ViT reduction, and
@@ -110,6 +111,20 @@ took 247 seconds with independent branches and 187 seconds with the shared
 reference (about 24% less time). These are saved-frame measurements, not
 in-game timings. The shared public pass took 11 seconds; candidate execution
 and scalar checks still account for most of the remaining time.
+
+Candidate C64/C128/C256 blocks also share their static PTX residual-address
+audit within each stage process. The three PTX files are hashed on every
+request; changed contents force a new audit. Every block still runs all of
+its scalar/GPU comparisons. The standalone
+`tools/audit_c256_residual_ptx.py` command always performs a fresh audit;
+`tools/check_residual_audit_cache.py` verifies reuse and rejects a source edit
+even when its file size and timestamp are preserved.
+
+That change reduced full residual audits from 36 to four per saved-frame run.
+The latest pass took 142 seconds and again matched all 2,301 intermediate
+`.f32` files and the final preview exactly. Timings of unchanged stages also
+varied, so the entire difference from the earlier 187-second run should not
+be attributed to audit reuse. GPU test process startup remains a large cost.
 
 To process an already saved capture without a game, pass `--existing-capture
 --max-updates 1` with its path. To return to normal rendering, stop the
