@@ -1,3 +1,4 @@
+#pragma once
 // Logical C128 HWC <-> zero-padded 8x8 window-major storage.
 // The upstream native_upsample48_reference.upsample uses this spatial geometry for block56.
 #include <hip/hip_runtime.h>

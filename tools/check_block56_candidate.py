@@ -9,7 +9,7 @@ from pathlib import Path
 import argparse
 import hashlib
 import json
-import subprocess
+from gpu_test_runner import run as run_gpu_test
 import sys
 import numpy as np
 
@@ -131,7 +131,7 @@ def run(case='seeded',first_window=False,block=56,width=WIDTH,height=HEIGHT,
     else:
         root=ROOT/'build'/f'decoder{block}_candidate_derived'/case
     spatial=root/'spatial';save(spatial,dict(input=x,windows=windows))
-    subprocess.run([str(ROOT/'build/spatial128_test.exe'),str(spatial),str(width),str(height),str(shift)],cwd=ROOT,check=True)
+    run_gpu_test([str(ROOT/'build/spatial128_test.exe'),str(spatial),str(width),str(height),str(shift)],cwd=ROOT,check=True)
     if (spatial/'windows_device.f32').read_bytes()!=(spatial/'windows.f32').read_bytes():
         raise AssertionError('C128 spatial gather differs')
     device_windows=np.fromfile(spatial/'windows_device.f32','<f4').reshape(-1,CHANNELS)
@@ -142,7 +142,7 @@ def run(case='seeded',first_window=False,block=56,width=WIDTH,height=HEIGHT,
     ffn=ffn_reference(device_windows,w1,w2,w3,ffn_skip)
     ffn_folder=root/'ffn'
     save(ffn_folder,dict(input=device_windows,w1=w1,w2=w2,w3=w3,skip=ffn_skip,**ffn))
-    subprocess.run([str(ROOT/'build/c128_ffn_candidate_test.exe'),str(ffn_folder),str(len(device_windows))],cwd=ROOT,check=True)
+    run_gpu_test([str(ROOT/'build/c128_ffn_candidate_test.exe'),str(ffn_folder),str(len(device_windows))],cwd=ROOT,check=True)
     feature_path=ffn_folder/'feature_device.f32'
     if feature_path.read_bytes()!=(ffn_folder/'feature.f32').read_bytes():
         raise AssertionError('C128 FFN feature differs')
@@ -154,7 +154,7 @@ def run(case='seeded',first_window=False,block=56,width=WIDTH,height=HEIGHT,
     attn_folder=root/'attention'
     save(attn_folder,dict(feature=feature,qkv_weights=qkv,bias=bias,scales=scales,
                           projection_weights=projection,attention_skip=attention_skip,**stages))
-    subprocess.run([str(ROOT/'build/c128_attention_candidate_test.exe'),str(attn_folder),str(len(chunks)),
+    run_gpu_test([str(ROOT/'build/c128_attention_candidate_test.exe'),str(attn_folder),str(len(chunks)),
                     *(['raw'] if block==14 else [])],cwd=ROOT,check=True)
     residual_path=attn_folder/'projection_residual_device.f32'
     if residual_path.read_bytes()!=(attn_folder/'projection_residual.f32').read_bytes():
@@ -163,7 +163,7 @@ def run(case='seeded',first_window=False,block=56,width=WIDTH,height=HEIGHT,
         output_windows=np.fromfile(residual_path,'<f4').reshape(hh//8,ww//8,8,8,CHANNELS)
         image=output_windows.transpose(0,2,1,3,4).reshape(hh,ww,CHANNELS)[py:py+height,px:px+width]
         out=root/'output';save(out,dict(windows=output_windows,output=image))
-        subprocess.run([str(ROOT/'build/spatial128_output_test.exe'),str(out),str(width),str(height),str(shift)],cwd=ROOT,check=True)
+        run_gpu_test([str(ROOT/'build/spatial128_output_test.exe'),str(out),str(width),str(height),str(shift)],cwd=ROOT,check=True)
         output_device=out/'output_device.f32'
         if output_device.read_bytes()!=(out/'output.f32').read_bytes():
             raise AssertionError('C128 scatter differs')
@@ -173,7 +173,7 @@ def run(case='seeded',first_window=False,block=56,width=WIDTH,height=HEIGHT,
         raw_windows=np.fromfile(attn_folder/'projection_raw_device.f32','<f4').reshape(hh//8,ww//8,8,8,CHANNELS)
         raw_image=raw_windows.transpose(0,2,1,3,4).reshape(hh,ww,CHANNELS)[py:py+height,px:px+width]
         raw_folder=root/'raw_output';save(raw_folder,dict(windows=raw_windows,output=raw_image))
-        subprocess.run([str(ROOT/'build/spatial128_output_test.exe'),str(raw_folder),
+        run_gpu_test([str(ROOT/'build/spatial128_output_test.exe'),str(raw_folder),
                         str(width),str(height),str(shift)],cwd=ROOT,check=True)
         raw_device=raw_folder/'output_device.f32'
         if raw_device.read_bytes()!=(raw_folder/'output.f32').read_bytes():

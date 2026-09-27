@@ -10,7 +10,7 @@ from pathlib import Path
 import argparse
 import hashlib
 import json
-import subprocess
+from gpu_test_runner import run as run_gpu_test
 
 import numpy as np
 
@@ -138,7 +138,7 @@ def run(prepared_dir, output_root, last_block=8, through_block14=False,
         down.mkdir(exist_ok=True)
         for name, array in dict(raw=raw, pool=pool, matrix=matrix, output=output).items():
             np.asarray(array, '<f4').tofile(down / f'{name}.f32')
-        subprocess.run([str(ROOT / 'build/encoder64_downsample_test.exe'),
+        run_gpu_test([str(ROOT / 'build/encoder64_downsample_test.exe'),
                         str(down), '64', '64'], cwd=ROOT, check=True)
         if ((down / 'pool_device.f32').read_bytes() != (down / 'pool.f32').read_bytes() or
                 (down / 'output_device.f32').read_bytes() != (down / 'output.f32').read_bytes()):
@@ -215,7 +215,7 @@ def run(prepared_dir, output_root, last_block=8, through_block14=False,
         down.mkdir(exist_ok=True)
         for name, array in dict(raw=raw, pool=pool, matrix=matrix, output=output).items():
             np.asarray(array, '<f4').tofile(down / f'{name}.f32')
-        subprocess.run([str(ROOT / 'build/encoder128_downsample_test.exe'),
+        run_gpu_test([str(ROOT / 'build/encoder128_downsample_test.exe'),
                         str(down), '32', '32'], cwd=ROOT, check=True)
         if ((down / 'pool_device.f32').read_bytes() != (down / 'pool.f32').read_bytes() or
                 (down / 'output_device.f32').read_bytes() != (down / 'output.f32').read_bytes()):
@@ -279,7 +279,7 @@ def run(prepared_dir, output_root, last_block=8, through_block14=False,
         down.mkdir(exist_ok=True)
         for name, array in dict(raw=raw, pool=pool, matrix=matrix, output=output).items():
             np.asarray(array, '<f4').tofile(down / f'{name}.f32')
-        subprocess.run([str(ROOT / 'build/encoder256_downsample_test.exe'),
+        run_gpu_test([str(ROOT / 'build/encoder256_downsample_test.exe'),
                         str(down), '16', '16'], cwd=ROOT, check=True)
         if ((down / 'pool_device.f32').read_bytes() != (down / 'pool.f32').read_bytes() or
                 (down / 'output_device.f32').read_bytes() != (down / 'output.f32').read_bytes()):

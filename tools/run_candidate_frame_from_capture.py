@@ -11,6 +11,7 @@ from pathlib import Path
 import argparse
 import hashlib
 import json
+import os
 import subprocess
 import sys
 import time
@@ -26,7 +27,11 @@ def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-def run(prepared_dir, output_root, start_at='encoder22', reference_mode='shared'):
+def run(prepared_dir, output_root, start_at='encoder22', reference_mode='shared',
+        gpu_test_mode='auto'):
+    if gpu_test_mode not in ('auto', 'worker', 'process'):
+        raise ValueError(f'unknown GPU test mode: {gpu_test_mode}')
+    child_env = dict(os.environ, DLSS5_GPU_TEST_MODE=gpu_test_mode)
     prepared_dir = Path(prepared_dir).resolve()
     output_root = Path(output_root).resolve()
     prepared_file = prepared_dir / 'manifest.json'
@@ -90,7 +95,7 @@ def run(prepared_dir, output_root, start_at='encoder22', reference_mode='shared'
                    *commands[stage][1:]]
         print(f'{stage}: running', flush=True)
         start = time.monotonic()
-        result = subprocess.run(command, cwd=ROOT, text=True,
+        result = subprocess.run(command, cwd=ROOT, text=True, env=child_env,
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         elapsed = time.monotonic()-start
         (logs / f'{stage}.log').write_text(result.stdout)
@@ -120,6 +125,7 @@ def run(prepared_dir, output_root, start_at='encoder22', reference_mode='shared'
                   color_linear_sha256=digest(color),
                   stage_seconds=times,
                   reference_mode=reference_mode,
+                  gpu_test_mode=gpu_test_mode,
                   public_reference_manifest_sha256=reference_sha,
                   head_manifest_sha256=digest(output_root / 'head70/manifest.json'),
                   connected_manifest_sha256=digest(output_root / 'head70_connected_gpu/manifest.json'),
@@ -140,5 +146,8 @@ if __name__ == '__main__':
                         help='resume after verifying prior stage files still exist')
     parser.add_argument('--reference-mode', choices=('shared', 'independent'), default='shared',
                         help='one public inference or separate comparison branches')
+    parser.add_argument('--gpu-test-mode', choices=('auto', 'worker', 'process'), default='auto',
+                        help='reuse a built HIP test worker, require it, or use standalone processes')
     args = parser.parse_args()
-    run(args.prepared_dir, args.output_root, args.start_at, args.reference_mode)
+    run(args.prepared_dir, args.output_root, args.start_at, args.reference_mode,
+        args.gpu_test_mode)

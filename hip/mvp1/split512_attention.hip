@@ -1,3 +1,4 @@
+#pragma once
 // Scalar 16-head C512 attention baseline for one 8x8 window.
 // Uses the arithmetic in native_split_reference.attention.
 #include "split512_block.hip"

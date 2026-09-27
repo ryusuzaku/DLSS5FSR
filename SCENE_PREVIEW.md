@@ -124,7 +124,43 @@ That change reduced full residual audits from 36 to four per saved-frame run.
 The latest pass took 142 seconds and again matched all 2,301 intermediate
 `.f32` files and the final preview exactly. Timings of unchanged stages also
 varied, so the entire difference from the earlier 187-second run should not
-be attributed to audit reuse. GPU test process startup remains a large cost.
+be attributed to audit reuse.
+
+The C64/C128/C256 candidate tests can now reuse one HIP worker per Python
+stage. Build it with `bash tools/build_candidate_gpu_worker.sh` (also included
+in `tools/build_split512_block.sh`), then run the frame runner or sidecar as
+usual. Rebuild it after changing any included kernel or test source.
+
+`--gpu-test-mode auto`, the default, uses the built worker and otherwise uses
+the standalone test executables. `--gpu-test-mode worker` requires the worker;
+`--gpu-test-mode process` selects the old execution path. Standalone stage
+commands accept the same choice through `DLSS5_GPU_TEST_MODE`. The selected
+mode is recorded in the frame report and completed sidecar status; stage
+logs record worker startup and successful job counts.
+
+The dispatcher runs the existing gather, FFN, attention, scatter and
+downsample test bodies and exact comparisons. It keeps the HIP context alive
+between jobs, but still allocates/frees buffers and reads/writes intermediate
+files for each test. Other channel widths, ViT, head and prefix launchers
+still use their existing processes. This is an offline diagnostic optimization.
+
+Worker requests use length-prefixed arguments, including paths containing
+spaces. Responses have a 120-second timeout and matching request IDs. Any
+comparison, protocol, I/O or timeout failure retires the worker and fails the
+request; a failed worker job is never retried through a standalone process.
+`tools/check_gpu_test_runner.py` exercises repeat jobs, process equivalence,
+missing-worker fallback, comparison failure, fatal I/O, timeout, malformed
+requests and clean shutdown using synthetic data.
+
+A complete saved storefront replay with the worker matched all 2,301
+intermediate `.f32` files, both final head manifests and the exported preview
+byte for byte. Four workers handled 150 jobs (78 encoder, 32 C256 decoder,
+24 C128 decoder and 16 C64 decoder). Those four stages took 31 seconds versus
+74 seconds in the preceding standalone run. The full replay took 124 seconds
+versus 142 seconds; unaffected stage timings also varied. Six repeated small
+gather/scatter jobs separately took about 0.5 seconds in one worker versus
+3.3 seconds in standalone processes. These are saved-frame diagnostic timings,
+not live-game performance or evidence of original NVIDIA parity.
 
 To process an already saved capture without a game, pass `--existing-capture
 --max-updates 1` with its path. To return to normal rendering, stop the

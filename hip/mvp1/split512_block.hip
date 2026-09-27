@@ -1,3 +1,4 @@
+#pragma once
 // Standalone first C512 bottleneck projection. Input is already FP8-decoded.
 // Each 32-wide product rounds to half, as in native_split_reference.multiply.
 #include <hip/hip_runtime.h>

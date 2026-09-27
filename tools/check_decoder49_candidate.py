@@ -9,7 +9,7 @@ from pathlib import Path
 import argparse
 import hashlib
 import json
-import subprocess
+from gpu_test_runner import run as run_gpu_test
 import numpy as np
 
 from audit_c256_residual_ptx import checked as audit_residual_ptx
@@ -55,7 +55,7 @@ def run(block=49,previous=None,width=WIDTH,height=HEIGHT,output_root=None):
     tokens=len(windows)*64
     spatial=root/'spatial'
     save(spatial,dict(input=x,windows=windows))
-    subprocess.run([str(ROOT/'build/spatial256_window_test.exe'),str(spatial),
+    run_gpu_test([str(ROOT/'build/spatial256_window_test.exe'),str(spatial),
                     str(width),str(height),str(shift)],cwd=ROOT,check=True)
     if (spatial/'windows_device.f32').read_bytes()!=(spatial/'windows.f32').read_bytes():
         raise AssertionError('block49 spatial device input differs')
@@ -69,7 +69,7 @@ def run(block=49,previous=None,width=WIDTH,height=HEIGHT,output_root=None):
     ffn=ffn_reference(flat,w1,w2,w3,ffn_skip)
     ffn_folder=root/'ffn'
     save(ffn_folder,dict(input=flat,w1=w1,w2=w2,w3=w3,skip=ffn_skip,**ffn))
-    subprocess.run([str(ROOT/'build/c256_ffn_candidate_test.exe'),str(ffn_folder),str(tokens)],cwd=ROOT,check=True)
+    run_gpu_test([str(ROOT/'build/c256_ffn_candidate_test.exe'),str(ffn_folder),str(tokens)],cwd=ROOT,check=True)
     feature_path=ffn_folder/'feature_device.f32'
     if feature_path.read_bytes()!=(ffn_folder/'feature.f32').read_bytes():
         raise AssertionError('block49 device FFN output differs')
@@ -84,7 +84,7 @@ def run(block=49,previous=None,width=WIDTH,height=HEIGHT,output_root=None):
     attn_folder=root/'attention'
     save(attn_folder,dict(feature=feature,qkv_weights=qkv,bias=bias,scales=scales,
                           projection_weights=projection,attention_skip=attention_skip,**attention))
-    subprocess.run([str(ROOT/'build/c256_attention_candidate_test.exe'),str(attn_folder),str(len(windows)),
+    run_gpu_test([str(ROOT/'build/c256_attention_candidate_test.exe'),str(attn_folder),str(len(windows)),
                     *(['raw'] if block==22 else [])],
                    cwd=ROOT,check=True)
     residual_path=attn_folder/'projection_residual_device.f32'
@@ -95,7 +95,7 @@ def run(block=49,previous=None,width=WIDTH,height=HEIGHT,output_root=None):
     image=output_windows.transpose(0,2,1,3,4).reshape(hh,ww,CHANNELS)[py:py+height,px:px+width]
     out_folder=root/'output'
     save(out_folder,dict(windows=output_windows,output=image))
-    subprocess.run([str(ROOT/'build/spatial256_output_test.exe'),str(out_folder),
+    run_gpu_test([str(ROOT/'build/spatial256_output_test.exe'),str(out_folder),
                     str(width),str(height),str(shift)],cwd=ROOT,check=True)
     output_device=out_folder/'output_device.f32'
     if output_device.read_bytes()!=(out_folder/'output.f32').read_bytes():
@@ -106,7 +106,7 @@ def run(block=49,previous=None,width=WIDTH,height=HEIGHT,output_root=None):
         raw_image=raw_windows.transpose(0,2,1,3,4).reshape(hh,ww,CHANNELS)[py:py+height,px:px+width]
         raw_folder=root/'raw_output'
         save(raw_folder,dict(windows=raw_windows,output=raw_image))
-        subprocess.run([str(ROOT/'build/spatial256_output_test.exe'),str(raw_folder),
+        run_gpu_test([str(ROOT/'build/spatial256_output_test.exe'),str(raw_folder),
                         str(width),str(height),str(shift)],cwd=ROOT,check=True)
         raw_device=raw_folder/'output_device.f32'
         if raw_device.read_bytes()!=(raw_folder/'output.f32').read_bytes():
