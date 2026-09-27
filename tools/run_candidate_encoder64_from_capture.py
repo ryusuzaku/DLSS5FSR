@@ -13,7 +13,6 @@ import json
 import subprocess
 
 import numpy as np
-import onnxruntime as ort
 
 from audit_peer_native_c32_basis import peer_to_native_multihead
 from check_block62_candidate import ROOT, run as run_block
@@ -25,7 +24,7 @@ from decode_tinlayout_global import e4m3fn
 from extract_peer_encoder64_inputs import NODES as C64_NODES
 from extract_peer_encoder128_inputs import NODES as C128_NODES
 from extract_peer_encoder256_inputs import NODES as C256_NODES
-from cached_public_branch import extract_cached
+from shared_public_reference import run_reference
 from extract_peer_preblock0_skip import MODEL, MODEL_SHA256
 from native_split_reference import F
 from native_c64_reference import multiply
@@ -36,7 +35,7 @@ def digest(path):
 
 
 def run(prepared_dir, output_root, last_block=8, through_block14=False,
-        through_block22=False):
+        through_block22=False, public_reference=None):
     prepared_dir = Path(prepared_dir).resolve()
     output_root = Path(output_root).resolve()
     if last_block not in range(5, 9):
@@ -67,9 +66,8 @@ def run(prepared_dir, output_root, last_block=8, through_block14=False,
     branch_path = public_dir / ('encoder4_22.onnx' if through_block22 else
                                 'encoder4_14.onnx' if through_block14 else
                                 'encoder4_8.onnx')
-    extract_cached(MODEL, branch_path, ['rgb'], list(nodes.values()), MODEL_SHA256)
-    session = ort.InferenceSession(str(branch_path), providers=['CPUExecutionProvider'])
-    arrays = session.run(None, {'rgb': rgb.transpose(2, 0, 1)[None]})
+    arrays, branch_path, reference_info = run_reference(
+        prepared_path, rgb, nodes, branch_path, public_reference)
     public = {}
     for (name, _), array in zip(nodes.items(), arrays):
         shape = ((1, 8, 8, 512) if name == 'block22_down' else
@@ -311,6 +309,7 @@ def run(prepared_dir, output_root, last_block=8, through_block14=False,
                   downsample22=downsample22,
                   original_kernel_executed=False, full_candidate_inference=False,
                   production_wiring=False)
+    report.update(reference_info)
     (output_root / 'report.json').write_text(json.dumps(report, indent=2) + '\n')
     print(json.dumps(report, indent=2))
     return report
@@ -325,6 +324,9 @@ if __name__ == '__main__':
     parser.add_argument('--last-block', type=int, default=8)
     parser.add_argument('--through-block14', action='store_true')
     parser.add_argument('--through-block22', action='store_true')
+    parser.add_argument('--public-reference', type=Path,
+                        help='same-frame shared public reference directory')
     args = parser.parse_args()
     run(args.prepared_dir, args.output_root, args.last_block,
-        args.through_block14, args.through_block22)
+        args.through_block14, args.through_block22,
+        public_reference=args.public_reference)

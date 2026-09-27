@@ -8,7 +8,6 @@ import json
 import subprocess
 
 import numpy as np
-import onnxruntime as ort
 
 from audit_peer_native_c32_basis import peer_to_native_multihead
 from check_block62_candidate import ROOT, run as run_block
@@ -16,7 +15,7 @@ from check_upsample62_peer_image import metrics, project_sequential_f32
 from check_c256_ffn_candidate import bits
 from decode_tinlayout_global import e4m3fn
 from extract_peer_decoder62_inputs import NODES
-from cached_public_branch import extract_cached
+from shared_public_reference import run_reference
 from extract_peer_preblock0_skip import MODEL, MODEL_SHA256
 from native_c32_reference import H, F
 
@@ -25,7 +24,7 @@ def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-def run(prepared_dir, encoder22_dir, decoder61_dir, output_root):
+def run(prepared_dir, encoder22_dir, decoder61_dir, output_root, public_reference=None):
     prepared_dir = Path(prepared_dir).resolve()
     encoder22_dir = Path(encoder22_dir).resolve()
     decoder61_dir = Path(decoder61_dir).resolve()
@@ -63,9 +62,8 @@ def run(prepared_dir, encoder22_dir, decoder61_dir, output_root):
     public_dir = out / 'public_boundary'
     public_dir.mkdir(exist_ok=True)
     branch_file = public_dir / 'decoder61_65.onnx'
-    extract_cached(MODEL, branch_file, ['rgb'], list(NODES.values()), MODEL_SHA256)
-    session = ort.InferenceSession(str(branch_file), providers=['CPUExecutionProvider'])
-    arrays = session.run(None, {'rgb': rgb.transpose(2, 0, 1)[None]})
+    arrays, branch_file, reference_info = run_reference(
+        prepared_file, rgb, NODES, branch_file, public_reference)
     public = {}
     for (name, _), array in zip(NODES.items(), arrays):
         shape = (1, 32, 32, 128) if name == 'block61' else (1, 64, 64, 64)
@@ -146,6 +144,7 @@ def run(prepared_dir, encoder22_dir, decoder61_dir, output_root):
                   blocks=blocks, final_device_sha256=digest(previous),
                   hip_scalar_exact=True, original_kernel_executed=False,
                   full_candidate_inference=False, production_wiring=False)
+    report.update(reference_info)
     (out / 'report.json').write_text(json.dumps(report, indent=2) + '\n')
     print(json.dumps(report, indent=2))
     return report
@@ -159,5 +158,8 @@ if __name__ == '__main__':
     parser.add_argument('--output-root', type=Path,
                         default=Path.home() / 'DLSS5FSR-build-offload' /
                                 'candidate_capture_decoder64')
+    parser.add_argument('--public-reference', type=Path,
+                        help='same-frame shared public reference directory')
     args = parser.parse_args()
-    run(args.prepared_dir, args.encoder22_dir, args.decoder61_dir, args.output_root)
+    run(args.prepared_dir, args.encoder22_dir, args.decoder61_dir, args.output_root,
+        public_reference=args.public_reference)

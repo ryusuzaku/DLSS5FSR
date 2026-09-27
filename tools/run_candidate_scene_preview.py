@@ -73,7 +73,7 @@ def capture_next(capture_path, timeout, poll, gpu_input_path=None):
 
 def run(capture_path, output_root, preview_path, max_updates=0,
         existing_capture=False, capture_timeout=120, poll=0.5,
-        gpu_input_path=None, preview_gain='public_gain'):
+        gpu_input_path=None, preview_gain='public_gain', reference_mode='shared'):
     capture_path = Path(capture_path).resolve()
     output_root = Path(output_root).resolve()
     preview_path = Path(preview_path).resolve()
@@ -148,7 +148,7 @@ def run(capture_path, output_root, preview_path, max_updates=0,
                          input_tensor_source=input_source,
                          last_preview_sha256=last_preview_sha,
                          last_preview_completed_at_utc=last_preview_completed)
-            report = run_frame(prepared, work)
+            report = run_frame(prepared, work, reference_mode=reference_mode)
             if report['source_capture_sha256'] != capture_sha:
                 raise AssertionError('candidate output has a different source capture')
             preview = export_preview(work / 'head70', work / 'head70_connected_gpu',
@@ -162,6 +162,7 @@ def run(capture_path, output_root, preview_path, max_updates=0,
                          input_tensor_source=input_source,
                          gpu_tensor_sha256=pair['gpu_tensor_sha256'] if gpu_snapshot else None,
                          preview_gain=preview_gain,
+                         reference_mode=reference_mode,
                          original_kernel_executed=False,
                          real_time_inference=False)
             last_preview_sha = preview['preview_sha256']
@@ -215,6 +216,8 @@ if __name__ == '__main__':
                         help='public graph gain 1 or upstream-reported native launch gain .03125')
     parser.add_argument('--max-updates', type=int, default=0,
                         help='0 loops until stopped; 1 runs one capture and one preview')
+    parser.add_argument('--reference-mode', choices=('shared', 'independent'), default='shared',
+                        help='one public inference or separate comparison branches')
     parser.add_argument('--existing-capture', action='store_true',
                         help='process --capture-path once without arming the game trigger')
     parser.add_argument('--capture-timeout', type=float, default=120)
@@ -224,4 +227,4 @@ if __name__ == '__main__':
         parser.error('max-updates must be nonnegative; timeout and poll must be positive')
     run(args.capture_path, args.output_root, args.preview_path,
         args.max_updates, args.existing_capture, args.capture_timeout, args.poll,
-        args.gpu_input_path, args.preview_gain)
+        args.gpu_input_path, args.preview_gain, args.reference_mode)

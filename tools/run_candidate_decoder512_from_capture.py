@@ -7,12 +7,11 @@ import hashlib
 import json
 
 import numpy as np
-import onnxruntime as ort
 
 from audit_peer_native_c32_basis import peer_to_native_multihead
 from check_split512_peer_image import metrics
 from check_split512_spatial_block import run_case
-from cached_public_branch import extract_cached
+from shared_public_reference import run_reference
 from extract_peer_preblock0_skip import MODEL, MODEL_SHA256
 from extract_peer_split512_inputs import NODES
 
@@ -24,7 +23,7 @@ def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-def run(prepared_dir, vit39_dir, output_root):
+def run(prepared_dir, vit39_dir, output_root, public_reference=None):
     prepared_dir = Path(prepared_dir).resolve()
     vit39_dir = Path(vit39_dir).resolve()
     out = Path(output_root).resolve()
@@ -55,9 +54,8 @@ def run(prepared_dir, vit39_dir, output_root):
     public_dir = out / 'public_boundary'
     public_dir.mkdir(exist_ok=True)
     branch_file = public_dir / 'decoder39_47.onnx'
-    extract_cached(MODEL, branch_file, ['rgb'], list(NODES.values()), MODEL_SHA256)
-    session = ort.InferenceSession(str(branch_file), providers=['CPUExecutionProvider'])
-    arrays = session.run(None, {'rgb': rgb.transpose(2, 0, 1)[None]})
+    arrays, branch_file, reference_info = run_reference(
+        prepared_file, rgb, NODES, branch_file, public_reference)
     public = {}
     for (name, _), array in zip(NODES.items(), arrays):
         if array.shape != (1, 8, 8, 512) or not np.isfinite(array).all():
@@ -104,6 +102,7 @@ def run(prepared_dir, vit39_dir, output_root):
                   shifts=list(SHIFTS), hip_scalar_exact=True,
                   original_kernel_executed=False, full_candidate_inference=False,
                   production_wiring=False)
+    report.update(reference_info)
     (out / 'report.json').write_text(json.dumps(report, indent=2) + '\n')
     print(json.dumps(report, indent=2))
     return report
@@ -116,5 +115,8 @@ if __name__ == '__main__':
     parser.add_argument('--output-root', type=Path,
                         default=Path.home() / 'DLSS5FSR-build-offload' /
                                 'candidate_capture_decoder512')
+    parser.add_argument('--public-reference', type=Path,
+                        help='same-frame shared public reference directory')
     args = parser.parse_args()
-    run(args.prepared_dir, args.vit39_dir, args.output_root)
+    run(args.prepared_dir, args.vit39_dir, args.output_root,
+        public_reference=args.public_reference)

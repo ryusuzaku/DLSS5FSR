@@ -7,10 +7,9 @@ import hashlib
 import json
 
 import numpy as np
-import onnxruntime as ort
 
 from extract_peer_coherent_head_inputs import SKIP, LATENT, FUSED, BODY, ENHANCED
-from cached_public_branch import extract_cached
+from shared_public_reference import run_reference
 from extract_peer_preblock0_skip import MODEL, MODEL_SHA256
 
 
@@ -22,7 +21,7 @@ def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-def run(prepared_dir, decoder69_dir, output_root):
+def run(prepared_dir, decoder69_dir, output_root, public_reference=None):
     prepared_dir = Path(prepared_dir).resolve()
     decoder69_dir = Path(decoder69_dir).resolve()
     out = Path(output_root).resolve()
@@ -50,9 +49,8 @@ def run(prepared_dir, decoder69_dir, output_root):
         raise ValueError('prepared RGB contains nonfinite values')
     out.mkdir(parents=True, exist_ok=True)
     branch_file = out / 'head_controls.onnx'
-    extract_cached(MODEL, branch_file, ['rgb'], list(NODES.values()), MODEL_SHA256)
-    session = ort.InferenceSession(str(branch_file), providers=['CPUExecutionProvider'])
-    arrays = session.run(None, {'rgb': rgb.transpose(2, 0, 1)[None]})
+    arrays, branch_file, reference_info = run_reference(
+        prepared_file, rgb, NODES, branch_file, public_reference)
     outputs = {}
     for (name, _), array in zip(NODES.items(), arrays):
         shape = ((1, 128, 128, 32) if name == 'latent' else
@@ -88,6 +86,7 @@ def run(prepared_dir, decoder69_dir, output_root):
                   final_rgb_sha256=digest(out / 'final_rgb.f32'),
                   same_inference_call=True, same_frame_block69_public_exact=True,
                   original_kernel_executed=False)
+    report.update(reference_info)
     (out / 'manifest.json').write_text(json.dumps(report, indent=2) + '\n')
     print(json.dumps(report, indent=2))
     return report
@@ -100,5 +99,8 @@ if __name__ == '__main__':
     parser.add_argument('--output-root', type=Path,
                         default=Path.home() / 'DLSS5FSR-build-offload' /
                                 'candidate_capture_head_inputs')
+    parser.add_argument('--public-reference', type=Path,
+                        help='same-frame shared public reference directory')
     args = parser.parse_args()
-    run(args.prepared_dir, args.decoder69_dir, args.output_root)
+    run(args.prepared_dir, args.decoder69_dir, args.output_root,
+        public_reference=args.public_reference)

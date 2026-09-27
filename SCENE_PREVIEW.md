@@ -3,9 +3,10 @@
 This opt-in diagnostic lets the game capture a staged proxy frame, runs the
 current AMD candidate offline, then displays the result as a centered square
 in `DebugView=2`. The game keeps showing the last completed square while the
-next capture runs. Saved-frame passes took about four minutes; two passes
-while Cyberpunk was running took 6.7 and 8.1 minutes on the development
-machine. This is **not** real-time inference or a production replacement for
+next capture runs. A saved-frame pass with shared public reference inference
+took about three minutes. Earlier passes while Cyberpunk was running took
+6.7 and 8.1 minutes; the shared mode has not yet been timed in-game. This is
+**not** real-time inference or a production replacement for
 DLSS 5. Original C256/C32 maps, the C512 physical view, ViT reduction, and
 the game's exact native input/output contracts still need validation.
 
@@ -75,12 +76,40 @@ gain-1 candidate enhanced images differed by RGB MAE `0.0216`. The paired
 HIP-input mode therefore matters for a prospective GPU runtime. Both gain
 variants remain diagnostic choices, not proven original visual parity.
 
-Each stage reuses its extracted public ONNX branch after the first pass when
-the source-model hash, output nodes and branch-file hash still match. It
-recomputes the public outputs and candidate checks for every capture; the
-cache only saves graph extraction time. A corrupt or mismatched branch is
-rebuilt automatically. This trims several seconds per stage on repeated
-previews but does not make the pipeline real-time.
+The frame runner and sidecar use one shared public ONNX inference per capture
+by default. It supplies the same 85 named comparison boundaries used by the
+individual stages (74 unique tensors). Each consumer verifies the prepared
+input, source capture, source model, graph and tensor hashes. Public outputs
+and all candidate checks are recomputed for every frame. Only the extracted
+graph is cached between frames; damaged or stale reference data is rejected.
+
+Pass `--reference-mode independent` to the frame runner or sidecar to run the
+separate public branches for comparison. Standalone stage commands still use
+their own branches unless given `--public-reference <directory>`. Their graph
+extraction caches remain available. Neither mode provides real-time inference.
+
+`tools/audit_shared_public_reference.py` checks a shared reference against a
+saved run made with independent branches and exercises invalid-reference
+rejection. For example:
+
+```powershell
+& $py tools\audit_shared_public_reference.py 'C:\path\to\prepared' `
+  --reference-dir 'C:\path\to\shared-run\candidate\public_reference' `
+  --baseline-root 'C:\path\to\independent-run\candidate' `
+  --output-report 'C:\path\to\reference-audit.json'
+```
+
+Both runs must use the same prepared input. On two captured game scenes,
+all 170 named boundaries matched byte for byte. The complete storefront
+candidate also matched all 2,301 saved intermediate `.f32` files and the
+exported preview. This verifies equivalence to the previous candidate, not
+original-kernel or native game parity.
+
+On the development machine, separate runs of that saved storefront frame
+took 247 seconds with independent branches and 187 seconds with the shared
+reference (about 24% less time). These are saved-frame measurements, not
+in-game timings. The shared public pass took 11 seconds; candidate execution
+and scalar checks still account for most of the remaining time.
 
 To process an already saved capture without a game, pass `--existing-capture
 --max-updates 1` with its path. To return to normal rendering, stop the

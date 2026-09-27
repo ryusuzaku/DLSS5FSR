@@ -2,9 +2,9 @@
 """Run the offline candidate through the head from one prepared 256x256 input.
 
 Each stage checks the previous candidate device hash and runs its public FP16
-comparison boundaries on the same input. Graph extraction is cached by source
-model and nodes; comparison outputs are recomputed for every frame. This is
-not a live game path.
+comparison boundaries on the same input. By default one public inference
+supplies all stages; --reference-mode independent runs each branch separately.
+Comparison outputs are recomputed for every frame. This is not a live game path.
 """
 
 from pathlib import Path
@@ -26,7 +26,7 @@ def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-def run(prepared_dir, output_root, start_at='encoder22'):
+def run(prepared_dir, output_root, start_at='encoder22', reference_mode='shared'):
     prepared_dir = Path(prepared_dir).resolve()
     output_root = Path(output_root).resolve()
     prepared_file = prepared_dir / 'manifest.json'
@@ -72,8 +72,20 @@ def run(prepared_dir, output_root, start_at='encoder22'):
     }
     if start_at not in STAGES:
         raise ValueError(f'unknown start stage: {start_at}')
+    if reference_mode not in ('shared', 'independent'):
+        raise ValueError(f'unknown public reference mode: {reference_mode}')
+    stages = list(STAGES[STAGES.index(start_at):])
+    reference_dir = output_root / 'public_reference'
+    generate_reference = reference_mode == 'shared' and start_at in STAGES[:9]
+    if generate_reference:
+        commands['public_reference'] = ['shared_public_reference.py', p,
+                                        '--output-root', str(reference_dir)]
+        for stage in STAGES[:9]:
+            commands[stage].extend(['--public-reference', str(reference_dir)])
+        stages.insert(0, 'public_reference')
     times = {}
-    for stage in STAGES[STAGES.index(start_at):]:
+    reference_sha = None
+    for stage in stages:
         command = [sys.executable, str(ROOT / 'tools' / commands[stage][0]),
                    *commands[stage][1:]]
         print(f'{stage}: running', flush=True)
@@ -85,6 +97,14 @@ def run(prepared_dir, output_root, start_at='encoder22'):
         if result.returncode or 'FAIL' in result.stdout:
             raise RuntimeError(f'{stage} failed after {elapsed:.1f}s; '
                                f'see {logs / (stage + ".log")}\n{result.stdout[-3000:]}')
+        if stage == 'public_reference':
+            reference_sha = digest(reference_dir / 'manifest.json')
+        elif generate_reference and stage in STAGES[:9]:
+            report_name = 'manifest.json' if stage == 'head_inputs' else 'report.json'
+            stage_report = json.loads((output_root / stage / report_name).read_text())
+            if (stage_report.get('shared_public_reference_manifest_sha256') != reference_sha or
+                    digest(reference_dir / 'manifest.json') != reference_sha):
+                raise AssertionError(f'{stage} shared public reference changed during the frame')
         times[stage] = elapsed
         print(f'{stage}: complete in {elapsed:.1f}s', flush=True)
     head = json.loads((output_root / 'head70/manifest.json').read_text())
@@ -99,6 +119,8 @@ def run(prepared_dir, output_root, start_at='encoder22'):
                   prepared_manifest_sha256=digest(prepared_file),
                   color_linear_sha256=digest(color),
                   stage_seconds=times,
+                  reference_mode=reference_mode,
+                  public_reference_manifest_sha256=reference_sha,
                   head_manifest_sha256=digest(output_root / 'head70/manifest.json'),
                   connected_manifest_sha256=digest(output_root / 'head70_connected_gpu/manifest.json'),
                   public_gain_blended_vs_public_final=head['rgb']['public_gain']['blended_vs_public_final'],
@@ -116,5 +138,7 @@ if __name__ == '__main__':
     parser.add_argument('--output-root', type=Path, required=True)
     parser.add_argument('--start-at', choices=STAGES, default='encoder22',
                         help='resume after verifying prior stage files still exist')
+    parser.add_argument('--reference-mode', choices=('shared', 'independent'), default='shared',
+                        help='one public inference or separate comparison branches')
     args = parser.parse_args()
-    run(args.prepared_dir, args.output_root, args.start_at)
+    run(args.prepared_dir, args.output_root, args.start_at, args.reference_mode)
