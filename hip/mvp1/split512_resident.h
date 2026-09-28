@@ -13,6 +13,12 @@ struct Traffic {
 };
 inline Traffic traffic;
 
+// Borrowed default-stream device view; it never owns or frees its pointer.
+struct DeviceTensor {
+    const float* data = nullptr;
+    size_t count = 0;
+};
+
 struct Buffer {
     float* data = nullptr;
     size_t count;
@@ -55,6 +61,7 @@ class Chain {
     std::unique_ptr<Buffer> head_weights, pooled, head_output;
     std::string head_dir;
     float* result = nullptr;
+    Buffer raw_output;
 
     bool check(const std::string& dir, const char* name, float* device, size_t count, bool verify) {
         if (!verify) return true;
@@ -65,7 +72,6 @@ class Chain {
     }
 
 public:
-    Buffer raw_output;
     size_t comparisons = 0;
     Chain(int w, int h, const std::vector<std::pair<std::string, int>>& blocks,
           const std::string& head = "") :
@@ -87,9 +93,19 @@ public:
     }
 
     bool run(bool verify) {
-        // Reset from the resident seed for repeatability, without another H2D upload.
-        HIP_CHECK(hipMemcpyAsync(ping.data, seed.data, n*sizeof(float), hipMemcpyDeviceToDevice));
-        traffic.d2d_bytes += n*sizeof(float);
+        return run_from_device({seed.data, n}, verify);
+    }
+
+    // Input must remain valid through the ordered copy on this HIP device's
+    // default stream. Outputs are borrowed until the next run or destruction.
+    // The copy isolates caller-owned input from ping-pong writes.
+    bool run_from_device(DeviceTensor source, bool verify = false) {
+        result = nullptr;
+        if (!source.data || source.count != n) return false;
+        if (source.data != ping.data) {
+            HIP_CHECK(hipMemcpyAsync(ping.data, source.data, n*sizeof(float), hipMemcpyDeviceToDevice));
+            traffic.d2d_bytes += n*sizeof(float);
+        }
         float* input = ping.data;
         float* output = pong.data;
         for (const auto& entry : weights) {
@@ -130,7 +146,6 @@ public:
                 !check(w.dir, "final", output, n, verify)) return false;
             std::swap(input, output);
         }
-        result = input;
         if (head_weights) {
             if (!check(head_dir, "raw", raw_output.data, n, verify)) return false;
             C512_LAUNCH(k_split512_pool, pooled->count, raw_output.data, pooled->data, width, height);
@@ -139,10 +154,18 @@ public:
             if (!check(head_dir, "pool", pooled->data, pooled->count, verify) ||
                 !check(head_dir, "head", head_output->data, head_output->count, verify)) return false;
         }
+        result = input;
         return true;
     }
 
+    DeviceTensor final_view() const { return result ? DeviceTensor{result, n} : DeviceTensor{}; }
+    DeviceTensor raw_view() const { return result ? DeviceTensor{raw_output.data, n} : DeviceTensor{}; }
+    DeviceTensor head_view() const {
+        return result && head_output ? DeviceTensor{head_output->data, head_output->count} : DeviceTensor{};
+    }
+
     bool save(const std::string& directory) {
+        if (!result) return false;
         auto write = [&](const char* name, float* data, size_t count) {
             std::vector<float> values(count);
             HIP_CHECK(hipMemcpy(values.data(), data, count*sizeof(float), hipMemcpyDeviceToHost));

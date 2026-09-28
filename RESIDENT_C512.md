@@ -84,7 +84,66 @@ transfers during the measured repetitions; both failure controls passed in
 each case. Setup uploaded about 61–63 MB, mostly weights.
 
 This establishes a connected C512 component under the current candidate
-assumptions. The next integration step is accepting each new frame's GPU
-activation while retaining weights/workspace, then connecting this component
-to its neighboring stages. The current scene preview still uses its existing
-file-based diagnostics.
+assumptions. The changing-input interface and adjacent gather check below
+extend it; the current scene preview still uses its existing file-based
+diagnostics.
+
+## Changing inputs and GPU output views
+
+`Chain::run_from_device(DeviceTensor)` accepts a borrowed device pointer with
+the fixed chain's element count. It copies the activation into its reusable
+workspace and leaves caller-owned input unchanged. `final_view()`,
+`raw_view()` and `head_view()` expose borrowed output pointers and element
+counts so another GPU operation can consume them directly. No weights are
+reloaded and no buffers are reallocated for a new frame.
+
+The interface uses one HIP device and its default stream. The caller must
+keep the input allocation alive until the ordered copy completes. Output
+views are valid until the next submission or chain destruction; operations
+consuming them must be ordered before the next submission. The chain is
+not a concurrent, multi-stream interface. A null input or wrong element
+count fails before dispatch, clears the output views and prevents saving
+stale output. A subsequent valid submission can recover. Diagnostic
+`verify=true` still checks the original construction fixtures and is intended
+for the fixed-input test; changing inputs have their own reference checks.
+
+The new test reuses one chain for captured input A, spatially shifted input B,
+zero input, B again, then A again. It prepares independent scalar/standalone
+references before starting the resident process. A reusable incoming GPU
+buffer represents the preceding stage. Output views feed reusable GPU
+consumer buffers; on the encoder path, the head view also directly feeds
+the existing ViT gather kernel. The gather arithmetic was moved unchanged
+into a shared header. Its logical map remains the current candidate map,
+without new original-kernel validation.
+
+```powershell
+& $py tools\check_split512_frames.py 'C:\path\to\candidate\encoder30' `
+  --output-root 'C:\path\to\changing-encoder'
+& $py tools\check_split512_frames.py 'C:\path\to\candidate\decoder47' `
+  --first-block 40 --output-root 'C:\path\to\changing-decoder'
+```
+
+Use `--width 32 --head-fixture build\split512_bridge_32x8` with the synthetic
+`build\split512_spatial` fixture for the larger encoder case. The build script
+above produces both fixed-input and changing-input executables.
+
+Across captured encoder/decoder and synthetic 32×8 encoder cases, all 15
+submissions matched their references: 50 byte-exact output arrays, including
+the two encoder cases' ViT gather outputs. All three distinct inputs also
+produced distinct final outputs. Six invalid-view checks rejected null or
+wrong-size inputs, invalidated stale output and recovered on the zero frame.
+All caller input buffers remained byte-identical after processing.
+
+The measured regions had zero host transfers and zero explicit device-buffer
+allocations. The harness uploaded one new activation before each region and
+downloaded results afterward; those transfers are accounted separately in
+`frames_metrics.json`. Weights were uploaded only during setup. The 8×8
+encoder intervals ranged from 4.67–6.73 ms, decoder 4.57–4.76 ms, and larger
+32×8 encoder 12.89–13.04 ms. These are C512 feature-grid extents and component
+timings, not full image dimensions or whole-model frame times. Intervals
+include the input device copy, C512 work, output-consumer device copies and,
+for the encoder, ViT gather.
+
+The next step is connecting resident ViT execution after that gather, then
+integrating the remaining stages. Game/preview execution has not been
+switched to this component yet.

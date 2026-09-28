@@ -1,11 +1,5 @@
 #include "head70_test_common.h"
-#include <cstdint>
-
-__global__ void k_vit_bridge_gather(const float* hwc,const int32_t* indices,
-                                    float* vit,int count) {
-    int i=blockIdx.x*blockDim.x+threadIdx.x;
-    if(i<count)vit[i]=hwc[indices[i]];
-}
+#include "vit_bridge_gather.hip"
 
 int main(int argc,char** argv) {
     if(argc!=4){fprintf(stderr,"usage: vit_bridge_ptx_test dir map-dir count\n");return 2;}
