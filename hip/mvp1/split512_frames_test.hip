@@ -48,8 +48,8 @@ static bool input_unchanged(DeviceTensor view, const Buffer& snapshot) {
     return !memcmp(after.data(), before.data(), view.count*sizeof(float));
 }
 int main(int argc, char** argv) {
-    if (argc != 6 && argc != 8 && argc != 9 && argc != 11 && argc != 13 && argc != 15 && argc != 17 && argc != 19 && argc != 20) {
-        fputs("usage: split512_frames_test blocks width height frames output [head-fixture bridge-map [vit-blocks [decoder39-fixture decoder-blocks [prefix48-fixture c256-blocks [prefix56-fixture c128-blocks [prefix62-fixture c64-blocks [prefix66-fixture c32-blocks [head70-fixture]]]]]]]]\n", stderr);
+    if (argc != 6 && argc != 8 && argc != 9 && argc != 11 && argc != 13 && argc != 15 && argc != 17 && argc != 19 && argc != 20 && argc != 22) {
+        fputs("usage: split512_frames_test blocks width height frames output [head-fixture bridge-map [vit-blocks [decoder39-fixture decoder-blocks [prefix48-fixture c256-blocks [prefix56-fixture c128-blocks [prefix62-fixture c64-blocks [prefix66-fixture c32-blocks [head70-fixture [encoder15-blocks downsample22-fixture]]]]]]]]]\n", stderr);
         return 2;
     }
     int width = atoi(argv[2]), height = atoi(argv[3]);
@@ -71,7 +71,8 @@ int main(int argc, char** argv) {
     }
     if (blocks.size() != 8 || frames.size() < 3) return 2;
     bool encoder = argc >= 8, with_vit = argc >= 9, with_decoder = argc >= 11,
-         with_c256 = argc >= 13, with_c128 = argc >= 15, with_c64 = argc >= 17, with_c32 = argc >= 19, with_head70 = argc == 20;
+         with_c256 = argc >= 13, with_c128 = argc >= 15, with_c64 = argc >= 17, with_c32 = argc >= 19, with_head70 = argc >= 20,
+         with_front = argc == 22;
     if (with_vit && width == 16) return 2; // No 32-token attention contract.
     size_t n = size_t(width)*height*512, hn = size_t(width)*height/4*1024;
     Chain chain(width, height, blocks, encoder ? argv[6] : "");
@@ -220,6 +221,28 @@ int main(int argc, char** argv) {
         if(head70->final_view().data||head70->public_view().data||head70->merged_view().data||
            head70->peer_view().data||head70->body_view().data||head70->native_view().data)return 1;
     }
+    // Optional encoder15-22 front: frames then upload only the C256 boundary14 input.
+    std::unique_ptr<c256_resident::Chain> encoder22;
+    std::unique_ptr<c256_resident::Downsample> down22;
+    std::unique_ptr<Buffer> c256_incoming,skip22_consumer,raw22_consumer,pool22_consumer,input_consumer;
+    if (with_front) {
+        std::ifstream file(argv[20]);
+        if (!file) return 2;
+        std::vector<std::pair<std::string,int>> front_blocks;
+        while (std::getline(file,line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (line.size()<3 || line[1]!='\t' || line[0]<'0' || line[0]>'3' || front_blocks.size()>=8) return 2;
+            front_blocks.emplace_back(line.substr(2),line[0]-'0');
+        }
+        if (front_blocks.size()!=8) return 2;
+        encoder22.reset(new c256_resident::Chain(width*2,height*2,front_blocks,true));
+        down22.reset(new c256_resident::Downsample(width*2,height*2,argv[21]));
+        c256_incoming.reset(new Buffer(2*n));
+        skip22_consumer.reset(new Buffer(2*n));raw22_consumer.reset(new Buffer(2*n));
+        pool22_consumer.reset(new Buffer(n/2));input_consumer.reset(new Buffer(n));
+        if (encoder22->final_view().data || encoder22->raw_view().data ||
+            down22->final_view().data || down22->pool_view().data) return 1;
+    }
     if (chain.final_view().data || chain.raw_view().data || chain.head_view().data) return 1;
     HIP_CHECK(hipDeviceSynchronize());
     Traffic setup = traffic;
@@ -231,6 +254,16 @@ int main(int argc, char** argv) {
     for (size_t index = 0; index < frames.size(); ++index) {
         if (index == 2) {
             Traffic before = traffic;
+            if (encoder22) {
+                if (encoder22->run_from_device({nullptr,2*n}) || encoder22->final_view().data || encoder22->raw_view().data ||
+                    encoder22->run_from_device({c256_incoming->data,2*n-1}) || encoder22->final_view().data ||
+                    encoder22->raw_view().data) return 1;
+                rejected += 2;
+                if (down22->run_from_device({nullptr,2*n}) || down22->final_view().data || down22->pool_view().data ||
+                    down22->run_from_device({raw22_consumer->data,2*n-1}) || down22->final_view().data ||
+                    down22->pool_view().data) return 1;
+                rejected += 2;
+            }
             if (chain.run_from_device({nullptr, n}) || chain.final_view().data ||
                 chain.raw_view().data || chain.head_view().data || chain.save(argv[5])) return 1;
             ++rejected;
@@ -321,13 +354,22 @@ int main(int argc, char** argv) {
             if (traffic.allocations != before.allocations || traffic.h2d_bytes != before.h2d_bytes ||
                 traffic.d2h_bytes != before.d2h_bytes || traffic.d2d_bytes != before.d2d_bytes) return 1;
         }
-        auto input = read(frames[index], "input", n);
-        for (float value : input) if (!std::isfinite(value)) return 2;
-        HIP_CHECK(hipMemcpy(incoming.data, input.data(), n*sizeof(float), hipMemcpyHostToDevice));
-        traffic.h2d_bytes += n*sizeof(float);
-        frame_upload_bytes += n*sizeof(float);
+        std::vector<float> input, c256_input;
+        if (encoder22) {
+            c256_input = read(frames[index], "c256_input", 2*n);
+            for (float value : c256_input) if (!std::isfinite(value)) return 2;
+            HIP_CHECK(hipMemcpy(c256_incoming->data, c256_input.data(), 2*n*sizeof(float), hipMemcpyHostToDevice));
+            traffic.h2d_bytes += 2*n*sizeof(float);
+            frame_upload_bytes += 2*n*sizeof(float);
+        } else {
+            input = read(frames[index], "input", n);
+            for (float value : input) if (!std::isfinite(value)) return 2;
+            HIP_CHECK(hipMemcpy(incoming.data, input.data(), n*sizeof(float), hipMemcpyHostToDevice));
+            traffic.h2d_bytes += n*sizeof(float);
+            frame_upload_bytes += n*sizeof(float);
+        }
         std::vector<float> skip_input;
-        if (skip22) {
+        if (skip22 && !encoder22) {
             skip_input = read(frames[index],"skip22",2*n);
             for (float value:skip_input) if (!std::isfinite(value)) return 2;
             HIP_CHECK(hipMemcpy(skip22->data,skip_input.data(),2*n*sizeof(float),hipMemcpyHostToDevice));
@@ -370,7 +412,11 @@ int main(int argc, char** argv) {
         // Check every ViT stage on the actual GPU-produced first-frame bridge.
         // Diagnostic readbacks are outside all measured execution regions.
         if (vit && index == 0) {
-            if (!chain.run_from_device({incoming.data, n})) return 1;
+            if (encoder22 && (!encoder22->run_from_device({c256_incoming->data,2*n},true) ||
+                              encoder22->comparisons != 122 ||
+                              !down22->run_from_device(encoder22->raw_view(),true) || down22->comparisons != 3))
+                return 1;
+            if (!chain.run_from_device(encoder22 ? down22->final_view() : DeviceTensor{incoming.data, n})) return 1;
             hipLaunchKernelGGL(k_vit_bridge_gather, dim3((hn+255)/256), dim3(256), 0, 0,
                                chain.head_view().data, map->data, bridge_output->data, int(hn));
             HIP_CHECK(hipGetLastError());
@@ -380,7 +426,8 @@ int main(int argc, char** argv) {
                           entry->comparisons != 5 ||
                           !decoder->run_from_device(entry->final_view(), true) || decoder->comparisons != 112))
                 return 1;
-            if (prefix48 && (!prefix48->run_from_device(decoder->final_view(),{skip22->data,2*n},true) ||
+            if (prefix48 && (!prefix48->run_from_device(decoder->final_view(),
+                                 encoder22 ? encoder22->final_view() : DeviceTensor{skip22->data,2*n},true) ||
                              prefix48->comparisons != 4 || !c256->run_from_device(prefix48->final_view(),true) ||
                              c256->comparisons != 120)) return 1;
             if (prefix56 && (!prefix56->run_from_device(c256->final_view(),{skip14->data,4*n},true) ||
@@ -397,7 +444,16 @@ int main(int argc, char** argv) {
         }
         Traffic before = traffic;
         HIP_CHECK(hipEventRecord(start));
-        if (!chain.run_from_device({incoming.data, n})) return 1;
+        if (encoder22) {
+            // Encoder22 skip stays borrowed until block48 consumes it in this frame.
+            if (!encoder22->run_from_device({c256_incoming->data,2*n}) ||
+                !down22->run_from_device(encoder22->raw_view())) return 1;
+            consume(encoder22->final_view(),*skip22_consumer);
+            consume(encoder22->raw_view(),*raw22_consumer);
+            consume(down22->pool_view(),*pool22_consumer);
+            consume(down22->final_view(),*input_consumer);
+        }
+        if (!chain.run_from_device(encoder22 ? down22->final_view() : DeviceTensor{incoming.data, n})) return 1;
         consume(chain.final_view(), final_consumer);
         consume(chain.raw_view(), raw_consumer);
         if (encoder) {
@@ -423,7 +479,8 @@ int main(int argc, char** argv) {
             consume(decoder->raw_view(), *decoder_raw_consumer);
         }
         if (prefix48) {
-            if (!prefix48->run_from_device(decoder->final_view(),{skip22->data,2*n}) ||
+            if (!prefix48->run_from_device(decoder->final_view(),
+                                           encoder22 ? encoder22->final_view() : DeviceTensor{skip22->data,2*n}) ||
                 !c256->run_from_device(prefix48->final_view())) return 1;
             consume(prefix48->low_view(),*low48_consumer);
             consume(prefix48->final_view(),*merge48_consumer);
@@ -467,14 +524,20 @@ int main(int argc, char** argv) {
             (prefix48 && (prefix48->comparisons != 4 || c256->comparisons != 120)) ||
             (prefix56 && (prefix56->comparisons != 4 || c128->comparisons != 90)) ||
             (prefix62 && (prefix62->comparisons != 4 || c64->comparisons != 60)) ||
-            (prefix66 && (prefix66->comparisons != 4 || c32->comparisons != 60)) || (head70 && head70->comparisons!=20)) return 1;
+            (prefix66 && (prefix66->comparisons != 4 || c32->comparisons != 60)) || (head70 && head70->comparisons!=20) ||
+            (encoder22 && (encoder22->comparisons != 122 || down22->comparisons != 3))) return 1;
         size_t expected_d2d = (3*n + (encoder ? hn : 0) + (vit ? 2*hn : 0) +
                                (entry ? 4*n + hn + hn/2 : 0) + (prefix48 ? 6*n+n/2 : 0) +
                                (prefix56 ? 13*n : 0) + (prefix62 ? 26*n : 0) +
-                               (prefix66 ? 52*n : 0) + (head70 ? 268*n : 0))*sizeof(float);
+                               (prefix66 ? 52*n : 0) + (head70 ? 268*n : 0) +
+                               (encoder22 ? 7*n + n/2 : 0))*sizeof(float);
         if (traffic.d2d_bytes-before.d2d_bytes != expected_d2d) return 1;
         compute_d2d += expected_d2d;
         std::string output = std::string(argv[5]) + "/frame_" + std::to_string(index);
+        if (encoder22 && (!check_save(frames[index], output, "skip22", *skip22_consumer) ||
+                          !check_save(frames[index], output, "raw22", *raw22_consumer) ||
+                          !check_save(frames[index], output, "pool22", *pool22_consumer) ||
+                          !check_save(frames[index], output, "input", *input_consumer))) return 1;
         if (!check_save(frames[index], output, "final", final_consumer) ||
             !check_save(frames[index], output, "final_raw", raw_consumer) ||
             (encoder && (!check_save(frames[index], output, "head", *head_consumer) ||
@@ -492,10 +555,14 @@ int main(int argc, char** argv) {
                 !check_save(frames[index],output,"merge48",*merge48_consumer) ||
                 !check_save(frames[index],output,"decoder55",*c256_consumer) ||
                 !input_unchanged(decoder->final_view(),*decoder_consumer)) return 1;
-            std::vector<float> after(2*n);
-            HIP_CHECK(hipMemcpy(after.data(),skip22->data,2*n*sizeof(float),hipMemcpyDeviceToHost));
-            traffic.d2h_bytes += 2*n*sizeof(float);
-            if (memcmp(after.data(),skip_input.data(),2*n*sizeof(float))) return 1;
+            if (encoder22) {
+                if (!input_unchanged(encoder22->final_view(),*skip22_consumer)) return 1;
+            } else {
+                std::vector<float> after(2*n);
+                HIP_CHECK(hipMemcpy(after.data(),skip22->data,2*n*sizeof(float),hipMemcpyDeviceToHost));
+                traffic.d2h_bytes += 2*n*sizeof(float);
+                if (memcmp(after.data(),skip_input.data(),2*n*sizeof(float))) return 1;
+            }
         }
         if (prefix56) {
             if (!check_save(frames[index],output,"low56",*low56_consumer) ||
@@ -542,10 +609,18 @@ int main(int argc, char** argv) {
             if(memcmp(after.data(),skip0_input.data(),64*n*sizeof(float))||memcmp(rgb.data(),color_input.data(),6*n*sizeof(float)))return 1;
         }
         // A borrowed input must not be overwritten by chain or consumer work.
-        std::vector<float> unchanged(n);
-        HIP_CHECK(hipMemcpy(unchanged.data(), incoming.data, n*sizeof(float), hipMemcpyDeviceToHost));
-        traffic.d2h_bytes += n*sizeof(float);
-        if (memcmp(unchanged.data(), input.data(), n*sizeof(float))) return 1;
+        if (encoder22) {
+            std::vector<float> unchanged(2*n);
+            HIP_CHECK(hipMemcpy(unchanged.data(), c256_incoming->data, 2*n*sizeof(float), hipMemcpyDeviceToHost));
+            traffic.d2h_bytes += 2*n*sizeof(float);
+            if (memcmp(unchanged.data(), c256_input.data(), 2*n*sizeof(float)) ||
+                !input_unchanged(down22->final_view(), *input_consumer)) return 1;
+        } else {
+            std::vector<float> unchanged(n);
+            HIP_CHECK(hipMemcpy(unchanged.data(), incoming.data, n*sizeof(float), hipMemcpyDeviceToHost));
+            traffic.d2h_bytes += n*sizeof(float);
+            if (memcmp(unchanged.data(), input.data(), n*sizeof(float))) return 1;
+        }
     }
     HIP_CHECK(hipEventDestroy(start)); HIP_CHECK(hipEventDestroy(stop));
     if (traffic.allocations != setup.allocations || traffic.h2d_bytes-setup.h2d_bytes != frame_upload_bytes)
@@ -563,7 +638,8 @@ int main(int argc, char** argv) {
         "\"resident_c128\":%s,\"prefix56_stage_comparisons\":%zu,\"c128_stage_comparisons\":%zu,"
         "\"resident_c64\":%s,\"prefix62_stage_comparisons\":%zu,\"c64_stage_comparisons\":%zu,"
         "\"resident_c32\":%s,\"prefix66_stage_comparisons\":%zu,\"c32_stage_comparisons\":%zu,"
-        "\"resident_head70\":%s,\"head70_stage_comparisons\":%zu,\"frame_ms\":[",
+        "\"resident_head70\":%s,\"head70_stage_comparisons\":%zu,"
+        "\"resident_encoder22\":%s,\"encoder22_stage_comparisons\":%zu,\"downsample22_stage_comparisons\":%zu,\"frame_ms\":[",
         frames.size(), rejected, frame_upload_bytes, compute_d2d, encoder ? "true" : "false",
         vit ? "true" : "false", vit ? vit->comparisons : size_t(0), entry ? "true" : "false",
         entry ? entry->comparisons : size_t(0), decoder ? decoder->comparisons : size_t(0),
@@ -571,7 +647,9 @@ int main(int argc, char** argv) {
         c128 ? "true" : "false", prefix56 ? prefix56->comparisons : size_t(0), c128 ? c128->comparisons : size_t(0),
         c64 ? "true" : "false", prefix62 ? prefix62->comparisons : size_t(0), c64 ? c64->comparisons : size_t(0),
         c32 ? "true" : "false", prefix66 ? prefix66->comparisons : size_t(0), c32 ? c32->comparisons : size_t(0),
-        head70 ? "true" : "false", head70 ? head70->comparisons : size_t(0)) > 0;
+        head70 ? "true" : "false", head70 ? head70->comparisons : size_t(0),
+        encoder22 ? "true" : "false", encoder22 ? encoder22->comparisons : size_t(0),
+        down22 ? down22->comparisons : size_t(0)) > 0;
     for (size_t i = 0; i < frame_ms.size(); ++i)
         ok = (fprintf(f, "%s%.6f", i ? "," : "", frame_ms[i]) > 0) && ok;
     ok = (fprintf(f, "]}\n") > 0) && ok;

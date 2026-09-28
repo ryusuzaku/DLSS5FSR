@@ -23,7 +23,8 @@ def verify_files(folder, manifest):
             raise ValueError(f'changed fixture: {folder}/{name}')
 
 
-def run(source, output, captured_candidate=None, synthetic_skip=False, head_fixture=None):
+def run(source, output, captured_candidate=None, synthetic_skip=False, head_fixture=None,
+        skips=None, skips_provenance=None):
     source, output = Path(source).resolve(), Path(output).resolve()
     if source == output or source in output.parents or output in source.parents:
         raise ValueError('use separate source and output directories')
@@ -89,7 +90,16 @@ def run(source, output, captured_candidate=None, synthetic_skip=False, head_fixt
     else:
         skip_a=F(np.random.default_rng(4801).normal(0,.03125,(16,2*width,256)).astype(np.float32))
         skip_provenance=dict(kind='synthetic FP8 Gaussian skip; seed4801, sigma0.03125')
-    skips=dict(a=skip_a,b=np.roll(skip_a,2,axis=1).copy(),zero=np.zeros_like(skip_a))
+    if skips is None:
+        skips=dict(a=skip_a,b=np.roll(skip_a,2,axis=1).copy(),zero=np.zeros_like(skip_a))
+        paired='B shifts skip22 by two columns; zero has zero skip. B/zero are synthetic pairs, not full upstream encoder executions.'
+    else:
+        # Same-frame encoder22 outputs; a captured A must still equal the capture.
+        if set(skips)!={'a','b','zero'} or not skips_provenance:raise ValueError('declared skips need a/b/zero and provenance')
+        skips={k:np.asarray(v,np.float32).reshape(16,2*width,256) for k,v in skips.items()}
+        if captured_candidate and skips['a'].tobytes()!=skip_a.tobytes():raise ValueError('declared skip A differs from capture')
+        skip_provenance=dict(skip_provenance,declared=skips_provenance)
+        paired='A/B/zero skips are same-frame encoder22 outputs of their declared C256 inputs'
     records={r['name']:r for r in json.loads((ROOT/'dlss5-analysis/model.resolved.json').read_text())['tensors']}
     raw_path=ROOT/'dlss5-analysis/tensors'/f"tensor_{records['block48.layer0.layer']['index']:03d}.bin"
     raw=np.fromfile(raw_path,np.uint8)
@@ -176,7 +186,7 @@ def run(source, output, captured_candidate=None, synthetic_skip=False, head_fixt
         controls.append('altered block49 input rejected before publishing outputs')
     report=dict(extent=[width,8,512],output_extent=[width*2,16,256],sequence=sequence,metrics=metrics,exact_outputs=exact,
         source_report_sha256=digest(source/'report.json'),skip_provenance=skip_provenance,
-        paired_controls='B shifts skip22 by two columns; zero has zero skip. B/zero are synthetic pairs, not full upstream encoder executions.',
+        paired_controls=paired,
         prefix_tensor_sha256=digest(raw_path),c256_references=references,negative_controls=controls,
         original_kernel_executed=False,production_wiring=False,original_c256_maps_validated=False)
     (output/'report.json').write_text(json.dumps(report,indent=2)+'\n')

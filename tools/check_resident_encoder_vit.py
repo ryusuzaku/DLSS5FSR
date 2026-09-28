@@ -150,6 +150,8 @@ def run(source, output, head_fixture=None):
                   metrics=metrics, exact_outputs=exact, source_report_sha256=digest(source / 'report.json'),
                   c512_sources=baseline['sources'], vit_sources=manifests,
                   bridge_map_sha256=digest(output / 'bridge_map.i32'),
+                  declared_inputs=prior.get('declared_inputs'),
+                  input_provenance=prior.get('input_provenance'),
                   negative_controls=['altered block32 input rejected', '32-token attention extent rejected'],
                   original_kernel_executed=False, original_bridge_validated=False, production_wiring=False,
                   scope='resident C51223-30, pool/head, candidate gather, ViT31-38; default stream')

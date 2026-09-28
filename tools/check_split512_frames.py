@@ -15,7 +15,8 @@ from audit_native_vit_logical_map import logical_map
 from gpu_test_runner import close_worker
 
 
-def run(fixtures, output, first=23, width=8, height=8, head_fixture=None):
+def run(fixtures, output, first=23, width=8, height=8, head_fixture=None, inputs=None,
+        input_provenance=None):
     fixtures, output = Path(fixtures).resolve(), Path(output).resolve()
     executable = ROOT / 'build/split512_frames_test.exe'
     if not executable.is_file():
@@ -25,8 +26,17 @@ def run(fixtures, output, first=23, width=8, height=8, head_fixture=None):
     baseline = check_fixed(fixtures, output / 'fixed_control', first, width, height,
                            repeats=2, head_fixture=head_fixture)
     source = fixtures / f'block{first}-{width}x{height}-s0/input.f32'
-    a = np.fromfile(source, '<f4').reshape(height, width, 512)
-    inputs = dict(a=a, b=np.roll(a, 1, axis=1).copy(), zero=np.zeros_like(a))
+    fixture_a = np.fromfile(source, '<f4').reshape(height, width, 512)
+    declared = inputs is not None
+    if declared:
+        # Upstream-produced frames: every case, including A, gets its own reference.
+        if first != 23 or not input_provenance or set(inputs) != {'a', 'b', 'zero'}:
+            raise ValueError('declared inputs need encoder23, provenance and a/b/zero')
+        inputs = {k: np.asarray(v, np.float32).reshape(height, width, 512) for k, v in inputs.items()}
+        if not all(np.isfinite(v).all() for v in inputs.values()):
+            raise ValueError('nonfinite declared input')
+    else:
+        inputs = dict(a=fixture_a, b=np.roll(fixture_a, 1, axis=1).copy(), zero=np.zeros_like(fixture_a))
     if len({v.tobytes() for v in inputs.values()}) != 3:
         raise ValueError('source does not produce three distinct control inputs')
     frames = {}
@@ -36,7 +46,7 @@ def run(fixtures, output, first=23, width=8, height=8, head_fixture=None):
             frame = output / 'references' / name
             frame.mkdir(parents=True, exist_ok=True)
             image.astype('<f4').tofile(frame / 'input.f32')
-            if name == 'a':
+            if name == 'a' and image.tobytes() == fixture_a.tobytes():
                 last = fixtures / f'block{first+7}-{width}x{height}-s2'
                 head = (Path(head_fixture).resolve() if head_fixture is not None else
                         fixtures / f'block30_head_{width//2}x{height//2}') if first == 23 else None
@@ -106,6 +116,9 @@ def run(fixtures, output, first=23, width=8, height=8, head_fixture=None):
                   metrics=metrics, exact_outputs=outputs,
                   bridge_map_sha256=digest(output / 'bridge_map.i32') if first == 23 else None,
                   base_sources=baseline['sources'], original_kernel_executed=False,
+                  declared_inputs=({k: digest(frames[k] / 'input.f32') for k in frames}
+                                   if declared else None),
+                  input_provenance=input_provenance if declared else None,
                   original_bridge_validated=False, production_wiring=False,
                   scope='changing-frame C512 component with resident weights and device output consumers')
     (output / 'report.json').write_text(json.dumps(report, indent=2)+'\n')

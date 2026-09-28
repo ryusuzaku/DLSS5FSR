@@ -1,3 +1,4 @@
+#pragma once
 // Candidate C256 block22 raw body -> 2x2 pool -> C512 projection.
 #include "split512_block.hip"
 

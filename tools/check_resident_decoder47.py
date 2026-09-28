@@ -51,14 +51,18 @@ def run(source, output, head_fixture=None):
         for tensor in PRIOR_NAMES:
             if digest(source / f'references/{name}/{tensor}.f32') != record['outputs'][tensor]:
                 raise ValueError(f'source output changed: {name}/{tensor}')
+    declared = prior.get('declared_inputs')
     a = np.fromfile(source / 'references/a/input.f32', '<f4').reshape(height, width, 512)
     expected_inputs = dict(a=a, b=np.roll(a, 1, axis=1).copy(), zero=np.zeros_like(a))
-    if (source / 'references/a/input.f32').read_bytes() != (fixtures / f'block23-{width}x8-s0/input.f32').read_bytes():
+    if not declared and (source / 'references/a/input.f32').read_bytes() != (fixtures / f'block23-{width}x8-s0/input.f32').read_bytes():
         raise ValueError('source input A changed')
     # Check every saved ViT fixture and handoff, not just its final projection.
     for name in ('a', 'b', 'zero'):
         frame = source / 'references' / name
-        if (frame / 'input.f32').read_bytes() != expected_inputs[name].astype('<f4').tobytes():
+        if declared:
+            if digest(frame / 'input.f32') != declared[name]:
+                raise ValueError('declared changing input differs')
+        elif (frame / 'input.f32').read_bytes() != expected_inputs[name].astype('<f4').tobytes():
             raise ValueError('source changing input differs')
         previous = frame / 'bridge.f32'
         records = prior['vit_sources'][name]
@@ -214,6 +218,7 @@ def run(source, output, head_fixture=None):
                   decoder39_inputs_preserved=True,
                   source_report_sha256=digest(source / 'report.json'), c512_sources=baseline['sources'],
                   decoder_sources=decoder_sources, decoder39_tensor_sha256=digest(tensor_path),
+                  declared_inputs=declared, input_provenance=prior.get('input_provenance'),
                   inverse_map_sha256=digest(output / 'references/a/entry39/inverse.i32'), negative_controls=controls,
                   original_kernel_executed=False, original_bridge_validated=False, production_wiring=False,
                   scope='resident encoder23-30 -> ViT31-38 -> inverse/decoder39 with same-frame skip -> decoder40-47')

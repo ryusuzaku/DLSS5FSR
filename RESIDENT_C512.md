@@ -509,3 +509,59 @@ earlier logical-map assumptions and native input/output contracts remain
 unverified. Enhanced RGB here precedes the preview's final blend; neither
 the preview nor game DLL uses this resident runner yet. Upstream encoder
 and skip residency, full-path performance work and live integration remain.
+
+## Resident encoder15–22 and block22 downsample
+
+`c256_resident::Chain` now has an encoder mode, and `c256_resident::Downsample`
+adds the block22 pool and C512 projection. With two extra arguments, the
+harness uploads one C256 boundary14 tensor per frame in place of the initial
+C512 input and skip22. Encoder15–22 run with shifts `0, 3, 1, 2, 0, 3, 1, 2`.
+Block22 writes both its FP8 skip and its unquantized projection. The pool
+consumes the raw output, never the quantized skip. It rounds horizontal sums,
+combines and rounds, multiplies by 0.25, then applies FP8. The projection
+keeps its 32-product half boundaries. The downsampled C512 feeds encoder23
+directly. The encoder22 skip stays borrowed on the device until block48
+consumes it in the same frame.
+
+```powershell
+& $py tools\check_resident_encoder22.py `
+  --captured-candidate 'C:\path\to\captured-frame\candidate' `
+  --output-root 'C:\path\to\resident-encoder22'
+& $py tools\check_resident_encoder22.py --synthetic --output-root 'C:\path\to\resident-encoder22-32x8'
+```
+
+Each frame's C512 input and skip22 now come from its own encoder execution,
+so every downstream reference is regenerated. The checker first builds
+independent encoder15–22 and downsample22 references for A, B and zero. It
+then reruns the existing checkers from `check_split512_frames.py` through
+`check_resident_head70.py`, declaring those C512 inputs and skip22 arrays.
+Captured A starts from the saved candidate encoder14 downsample. Its block22
+skip, raw output, downsample matrix and downsampled output match the
+canonical candidate byte for byte. Captured A and zero then reproduce the
+earlier head70 endpoints byte for byte. B rolls the C256 input two columns,
+so it is now an actual encoder execution rather than a rolled C512 input.
+The larger case uses a synthetic FP8 Gaussian C256 input (seed 2215,
+standard deviation 5.6957, the captured boundary14 value). Skip14/8/4/0 and
+RGB remain external synthetic pairs, as before.
+
+The harness adds 125 stage checks on the first frame: 122 for the encoder
+chain, including block22's raw projection and raw scatter, and 3 for the
+downsample. It adds four exact endpoints per submission: skip22, raw22,
+pool22 and the downsampled C512 input. Null and wrong-size controls cover
+both new stages. Separate diagnostics corrupt the block16 handoff, the
+block22 raw output and the pool expectations. Uploads fall from 101·n to
+100·n floats per frame (n = width·8·512): the C256 input, skips14/8/4/0 and RGB.
+
+| C256 input / enhanced RGB grid | Encoder-through-head stage checks | Exact output arrays | Combined device interval |
+|---|---:|---:|---:|
+| 16×16×256 / 256×256×3 | 688 | 160 | 38.10–41.12 ms |
+| 64×16×256 / 1024×256×3 | 688 | 160 | 147.66–155.77 ms |
+
+Both cases pass 44 invalid-view controls and all three altered-expectation
+diagnostics. The measured interval covers encoder15–30, ViT31–38,
+decoder39–69 and head70, plus the harness's device copies. It has zero
+explicit GPU buffer allocations and zero host transfers. The nine older
+harness modes retain 595 exact endpoints. These are still prepared component
+checks, not full-model or in-game frame times. Original C256 logical maps
+remain unverified. Encoder5–14 and their skips, the public block4/preblock0
+producers, the preview and the game DLL are not connected yet.
