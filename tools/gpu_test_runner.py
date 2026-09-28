@@ -18,6 +18,14 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 WORKER = ROOT / 'build/candidate_gpu_worker.exe'
 SUPPORTED = frozenset((
+    'vit_bridge_ptx_test',
+    'vit_expand_chain_test',
+    'decoder39_entry_test',
+    'spatial32_peer_test',
+    'c32_peer_body_test',
+    'spatial32_peer_output_test',
+    'upsample66_prefix_test',
+    'head70_test',
     'spatial64_test',
     'c64_ffn_candidate_test',
     'c64_attention_candidate_test',
@@ -87,7 +95,7 @@ class Worker:
                                f'(exit code {self.process.poll()})')
         return line
 
-    def request(self, args):
+    def request(self, args, *, capture_output=False):
         if self.closed:
             raise RuntimeError('GPU worker is closed')
         self.sequence += 1
@@ -116,7 +124,8 @@ class Worker:
                         self.jobs += 1
                     return result, '\n'.join(output) + '\n'
                 output.append(line)
-                print(line, flush=True)
+                if not capture_output:
+                    print(line, flush=True)
         except BaseException:
             self.close(force=True)
             raise
@@ -149,29 +158,32 @@ def close_worker():
             _worker = None
 
 
-def run(args, *, cwd, check=True):
-    """subprocess.run-compatible subset for the candidate's exact GPU tests."""
+def run(args, *, cwd, check=True, capture_output=False):
+    """Run an exact test; capture_output returns merged stdout/stderr as text."""
     global _worker, _notified_fallback
     args = [str(arg) for arg in args]
     mode = os.environ.get('DLSS5_GPU_TEST_MODE', 'auto')
+    output_options = (dict(text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                      if capture_output else {})
     if mode not in ('auto', 'worker', 'process'):
         raise ValueError(f'unknown GPU test mode: {mode}')
     executable = Path(args[0]).resolve()
     supported = (executable.parent == ROOT / 'build' and
                  executable.stem in SUPPORTED and Path(cwd).resolve() == ROOT)
     if mode == 'process' or not supported:
-        return subprocess.run(args, cwd=cwd, check=check)
+        return subprocess.run(args, cwd=cwd, check=check, **output_options)
     if not WORKER.is_file():
         if mode == 'worker':
             raise FileNotFoundError('build the GPU worker with tools/build_candidate_gpu_worker.sh')
         if not _notified_fallback:
             print('GPU worker not built; using standalone GPU test processes', flush=True)
             _notified_fallback = True
-        return subprocess.run(args, cwd=cwd, check=check)
+        return subprocess.run(args, cwd=cwd, check=check, **output_options)
     with _lock:
         if _worker is None or _worker.closed:
             _worker = Worker()
-        result, output = _worker.request([executable.stem, *args[1:]])
+        result, output = _worker.request([executable.stem, *args[1:]],
+                                         capture_output=capture_output)
     if check and result:
         raise subprocess.CalledProcessError(result, args, output=output)
     return subprocess.CompletedProcess(args, result, stdout=output)

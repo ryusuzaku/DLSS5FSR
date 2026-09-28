@@ -5,7 +5,7 @@ from pathlib import Path
 import argparse
 import hashlib
 import json
-import subprocess
+from gpu_test_runner import run as run_gpu_test
 import sys
 
 import numpy as np
@@ -89,7 +89,7 @@ def run(prepared_dir, encoder30_dir, output_root, public_reference=None):
         raise ValueError('wrong/nonfinite candidate encoder head')
     (bridge_dir / 'input.f32').write_bytes(head_file.read_bytes())
     head[gather].astype('<f4').tofile(bridge_dir / 'expected.f32')
-    subprocess.run([str(ROOT / 'build/vit_bridge_ptx_test.exe'), str(bridge_dir),
+    run_gpu_test([str(ROOT / 'build/vit_bridge_ptx_test.exe'), str(bridge_dir),
                     str(map_dir), str(len(gather))], cwd=ROOT, check=True)
     if (bridge_dir / 'device.f32').read_bytes() != (bridge_dir / 'expected.f32').read_bytes():
         raise AssertionError('candidate HIP ViT bridge differs')
@@ -117,7 +117,7 @@ def run(prepared_dir, encoder30_dir, output_root, public_reference=None):
     vit = np.fromfile(previous, '<f4')
     (inverse_bridge / 'input.f32').write_bytes(previous.read_bytes())
     vit[inverse].astype('<f4').tofile(inverse_bridge / 'expected.f32')
-    subprocess.run([str(ROOT / 'build/vit_bridge_ptx_test.exe'), str(inverse_bridge),
+    run_gpu_test([str(ROOT / 'build/vit_bridge_ptx_test.exe'), str(inverse_bridge),
                     str(inverse_dir), str(len(inverse))], cwd=ROOT, check=True)
     if (inverse_bridge / 'device.f32').read_bytes() != (inverse_bridge / 'expected.f32').read_bytes():
         raise AssertionError('candidate HIP ViT inverse differs')
@@ -152,9 +152,8 @@ def run(prepared_dir, encoder30_dir, output_root, public_reference=None):
             raise ValueError(f'nonfinite candidate decoder39 {name}')
         np.asarray(array, '<f4').tofile(dec / f'{name}.f32')
     np.arange(main.size, dtype='<i4').tofile(dec / 'inverse.i32')
-    check = subprocess.run([str(ROOT / 'build/decoder39_entry_test.exe'), str(dec), '4', '4'],
-                           cwd=ROOT, text=True, stdout=subprocess.PIPE,
-                           stderr=subprocess.STDOUT)
+    check = run_gpu_test([str(ROOT / 'build/decoder39_entry_test.exe'), str(dec), '4', '4'],
+                           cwd=ROOT, capture_output=True, check=False)
     (dec / 'hip_check.log').write_text(check.stdout)
     if (check.returncode or check.stdout.count('PASS') != 3 or 'FAIL' in check.stdout or
             (dec / 'output_device.f32').read_bytes() != (dec / 'output.f32').read_bytes()):

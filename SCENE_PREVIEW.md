@@ -126,8 +126,8 @@ The latest pass took 142 seconds and again matched all 2,301 intermediate
 varied, so the entire difference from the earlier 187-second run should not
 be attributed to audit reuse.
 
-The C64/C128/C256 candidate tests can now reuse one HIP worker per Python
-stage. Build it with `bash tools/build_candidate_gpu_worker.sh` (also included
+The C32/C64/C128/C256, ViT and head candidate tests can now reuse one HIP
+worker per Python stage. Build it with `bash tools/build_candidate_gpu_worker.sh` (also included
 in `tools/build_split512_block.sh`), then run the frame runner or sidecar as
 usual. Rebuild it after changing any included kernel or test source.
 
@@ -138,11 +138,14 @@ commands accept the same choice through `DLSS5_GPU_TEST_MODE`. The selected
 mode is recorded in the frame report and completed sidecar status; stage
 logs record worker startup and successful job counts.
 
-The dispatcher runs the existing gather, FFN, attention, scatter and
-downsample test bodies and exact comparisons. It keeps the HIP context alive
+The dispatcher runs 23 existing test entry points, including gather, FFN,
+attention, scatter, downsample, ViT bridges, decoder39, block66 prefix and
+head outer passes, with their exact comparisons. It keeps the HIP context alive
 between jobs, but still allocates/frees buffers and reads/writes intermediate
-files for each test. Other channel widths, ViT, head and prefix launchers
-still use their existing processes. This is an offline diagnostic optimization.
+files for each test. C512 and other launchers not included in the dispatcher
+still use their existing processes. Captured diagnostic output preserves the
+standalone PASS counts used by ViT, C32 prefix and head checks. This is an
+offline diagnostic optimization.
 
 Worker requests use length-prefixed arguments, including paths containing
 spaces. Responses have a 120-second timeout and matching request IDs. Any
@@ -152,7 +155,7 @@ request; a failed worker job is never retried through a standalone process.
 missing-worker fallback, comparison failure, fatal I/O, timeout, malformed
 requests and clean shutdown using synthetic data.
 
-A complete saved storefront replay with the worker matched all 2,301
+A complete saved storefront replay with the initial C64/C128/C256 worker matched all 2,301
 intermediate `.f32` files, both final head manifests and the exported preview
 byte for byte. Four workers handled 150 jobs (78 encoder, 32 C256 decoder,
 24 C128 decoder and 16 C64 decoder). Those four stages took 31 seconds versus
@@ -161,6 +164,21 @@ versus 142 seconds; unaffected stage timings also varied. Six repeated small
 gather/scatter jobs separately took about 0.5 seconds in one worker versus
 3.3 seconds in standalone processes. These are saved-frame diagnostic timings,
 not live-game performance or evidence of original NVIDIA parity.
+
+Extending the worker to ViT, C32 and the head also preserved all 2,301 tensors,
+both final manifests and the preview exactly. Seven workers now handle 192
+jobs per frame, including 11 ViT/decoder39 jobs, 13 C32 decoder jobs and 18
+head jobs. The full saved-frame replay took 95 seconds versus the previous
+124 seconds. C32 decoder time fell from 17.6 to 8.8 seconds and head time from
+17.4 to 7.2 seconds; ViT took 22.5 seconds versus 21.3 previously. Other stages
+also varied, so the overall difference is not a controlled benchmark of the
+worker change alone. Scalar references and fixture processing remain substantial.
+
+Replaying just those 42 newly supported GPU jobs against the same already
+prepared fixtures took 16.1 seconds in standalone processes and 2.2 seconds
+in workers. All 335 PASS lines matched, and the full tensor comparison still
+passed afterward. This isolates test-launch overhead from the Python scalar
+and fixture-generation work included in full-frame timings.
 
 To process an already saved capture without a game, pass `--existing-capture
 --max-updates 1` with its path. To return to normal rendering, stop the

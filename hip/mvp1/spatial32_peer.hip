@@ -1,3 +1,4 @@
+#pragma once
 // Native C32 HWC <-> peer C32 channel basis in 8x8 shifted windows.
 // peer_to_native() is checked against all 2048 block66 projection entries.
 #include <hip/hip_runtime.h>

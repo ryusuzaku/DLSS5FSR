@@ -8,7 +8,7 @@ from pathlib import Path
 import argparse
 import hashlib
 import json
-import subprocess
+from gpu_test_runner import run as run_gpu_test
 
 import numpy as np
 
@@ -105,9 +105,8 @@ def run(prepared_dir, decoder65_dir, output_root, public_reference=None):
         if not np.isfinite(array).all():
             raise ValueError(f'nonfinite candidate block66 {name}')
         np.asarray(array, '<f4').tofile(prefix / f'{name}.f32')
-    check = subprocess.run([str(ROOT / 'build/upsample66_prefix_test.exe'), str(prefix), '64', '64'],
-                           cwd=ROOT, text=True, stdout=subprocess.PIPE,
-                           stderr=subprocess.STDOUT)
+    check = run_gpu_test([str(ROOT / 'build/upsample66_prefix_test.exe'), str(prefix), '64', '64'],
+                           cwd=ROOT, capture_output=True, check=False)
     (prefix / 'hip_check.log').write_text(check.stdout)
     if (check.returncode or check.stdout.count('PASS') != 2 or 'FAIL' in check.stdout or
             (prefix / 'merged_device.f32').read_bytes() != (prefix / 'merged.f32').read_bytes()):

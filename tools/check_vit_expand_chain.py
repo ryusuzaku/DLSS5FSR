@@ -4,7 +4,7 @@ from pathlib import Path
 import argparse
 import hashlib
 import json
-import subprocess
+from gpu_test_runner import run as run_gpu_test
 import sys
 import numpy as np
 from recover_vit_bridge_ptx import ROOT,recover
@@ -146,7 +146,7 @@ def run_block(block,width=8,height=4,derived=False,image_source=None,output_root
     if tokens in (16,64):
         report['projection_tensor']=projection_record['index']
         report['projection_sha256']=hashlib.sha256(projection_raw).hexdigest()
-    subprocess.run([str(exe),str(folder),str(tokens)],cwd=ROOT,check=True)
+    run_gpu_test([str(exe),str(folder),str(tokens)],cwd=ROOT,check=True)
     report['files']={p.name:hashlib.sha256(p.read_bytes()).hexdigest()
                      for p in folder.glob('*.f32')}
     (folder/'manifest.json').write_text(json.dumps(report,indent=2)+'\n')

@@ -1,3 +1,4 @@
+#pragma once
 // Block 70 outer passes. Logical float32 HWC buffers, origin (0,0).
 // Equations: tools/head70_reference.py; derived from Kien's MIT reference
 // ref/dlss5-port/Development/native_post70_reference.py (post and aligned).

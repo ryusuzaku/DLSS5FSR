@@ -10,7 +10,7 @@ from pathlib import Path
 import argparse
 import hashlib
 import json
-import subprocess
+from gpu_test_runner import run as run_gpu_test
 import numpy as np
 from PIL import Image
 
@@ -43,8 +43,7 @@ def png(path,linear):
 
 
 def checked_command(command, log):
-    result=subprocess.run(command,cwd=ROOT,text=True,stdout=subprocess.PIPE,
-                          stderr=subprocess.STDOUT)
+    result=run_gpu_test(command,cwd=ROOT,capture_output=True, check=False)
     log.write_text(result.stdout)
     if result.returncode:
         raise RuntimeError(f'device check failed ({result.returncode}): {log}\n{result.stdout[-3000:]}')

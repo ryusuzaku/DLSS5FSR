@@ -43,6 +43,15 @@ def run():
         checks += ['six repeated jobs in one context', 'path containing spaces',
                    'standalone/worker byte equality', 'clean EOF shutdown']
 
+        captured = {}
+        for mode in ('process', 'worker'):
+            with mock.patch.dict(os.environ, DLSS5_GPU_TEST_MODE=mode):
+                captured[mode] = runner.run(args, cwd=runner.ROOT, capture_output=True).stdout
+        assert captured['process'] == captured['worker']
+        assert captured['worker'].count('PASS') == 2 and 'D5GPU' not in captured['worker']
+        checks.append('captured text and PASS counts match standalone output')
+        runner.close_worker()
+
         missing_worker = folder / 'missing-worker.exe'
         with mock.patch.object(runner, 'WORKER', missing_worker):
             with mock.patch.dict(os.environ, DLSS5_GPU_TEST_MODE='auto'):
@@ -67,6 +76,13 @@ def run():
                 checks.append('comparison failure retires context without retry')
             else:
                 raise AssertionError('corrupt expected tensor accepted')
+        runner.close_worker()
+
+        with mock.patch.dict(os.environ, DLSS5_GPU_TEST_MODE='worker'):
+            result = runner.run(args, cwd=runner.ROOT, check=False, capture_output=True)
+            assert result.returncode == 1 and 'FAIL' in result.stdout
+            assert runner._worker.closed
+            checks.append('captured nonzero result preserves caller failure checks')
         runner.close_worker()
 
         worker = runner.Worker()

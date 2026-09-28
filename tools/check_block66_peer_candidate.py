@@ -8,7 +8,7 @@ from pathlib import Path
 import argparse
 import hashlib
 import json
-import subprocess
+from gpu_test_runner import run as run_gpu_test
 import sys
 import numpy as np
 
@@ -95,7 +95,7 @@ def run(block=66,case='seeded',first_window=False,width=WIDTH,height=HEIGHT,
           ROOT/'build'/('block66_peer_first_window' if first_window else 'block66_peer_candidate')/case
           if block==66 else ROOT/'build'/f'decoder{block}_peer_candidate'/case)
     spatial=root/'spatial';save(spatial,dict(input=native,windows=windows))
-    subprocess.run([str(ROOT/'build/spatial32_peer_test.exe'),str(spatial),
+    run_gpu_test([str(ROOT/'build/spatial32_peer_test.exe'),str(spatial),
                     str(width),str(height),str(shift)],cwd=ROOT,check=True)
     if (spatial/'windows_device.f32').read_bytes()!=(spatial/'windows.f32').read_bytes():
         raise AssertionError('C32 basis/spatial gather differs')
@@ -107,7 +107,7 @@ def run(block=66,case='seeded',first_window=False,width=WIDTH,height=HEIGHT,
     stages=trace(device_windows,weights)
     output=F(stages['body'])
     body=root/'body';save(body,dict(input=device_windows,weights=packed(weights),**stages,output=output))
-    subprocess.run([str(ROOT/'build/c32_peer_body_test.exe'),str(body),str(len(device_windows))],cwd=ROOT,check=True)
+    run_gpu_test([str(ROOT/'build/c32_peer_body_test.exe'),str(body),str(len(device_windows))],cwd=ROOT,check=True)
     output_peer=body/'output_device.f32'
     if output_peer.read_bytes()!=(body/'output.f32').read_bytes():
         raise AssertionError('C32 peer body device output differs')
@@ -117,7 +117,7 @@ def run(block=66,case='seeded',first_window=False,width=WIDTH,height=HEIGHT,
         native_image=np.empty_like(peer_image)
         native_image[...,map32]=peer_image
         out=root/'output';save(out,dict(windows=output_windows,output=native_image))
-        subprocess.run([str(ROOT/'build/spatial32_peer_output_test.exe'),str(out),
+        run_gpu_test([str(ROOT/'build/spatial32_peer_output_test.exe'),str(out),
                         str(width),str(height),str(shift)],cwd=ROOT,check=True)
         output_device=out/'output_device.f32'
         if output_device.read_bytes()!=(out/'output.f32').read_bytes():

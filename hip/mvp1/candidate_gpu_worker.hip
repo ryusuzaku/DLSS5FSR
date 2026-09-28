@@ -1,4 +1,4 @@
-// Persistent dispatcher for the existing exact C64/C128/C256 diagnostic tests.
+// Persistent dispatcher for the existing exact candidate diagnostic tests.
 // Test bodies, kernels, allocations and comparisons are reused verbatim.
 #include "head70_test_common.h"
 #include <cstdint>
@@ -55,8 +55,41 @@
 #include "encoder256_downsample_test.hip"
 #undef main
 
+#define main job_vit_bridge_ptx_test
+#include "vit_bridge_ptx_test.hip"
+#undef main
+#define main job_vit_expand_chain_test
+#include "vit_expand_chain_test.hip"
+#undef main
+#define main job_decoder39_entry_test
+#include "decoder39_entry_test.hip"
+#undef main
+#define main job_spatial32_peer_test
+#include "spatial32_peer_test.hip"
+#undef main
+#define main job_c32_peer_body_test
+#include "c32_peer_body_test.hip"
+#undef main
+#define main job_spatial32_peer_output_test
+#include "spatial32_peer_output_test.hip"
+#undef main
+#define main job_upsample66_prefix_test
+#include "upsample66_prefix_test.hip"
+#undef main
+#define main job_head70_test
+#include "head70_test.hip"
+#undef main
+
 struct Job { const char* name; int (*run)(int, char**); };
 static const Job jobs[] = {
+    {"vit_bridge_ptx_test", job_vit_bridge_ptx_test},
+    {"vit_expand_chain_test", job_vit_expand_chain_test},
+    {"decoder39_entry_test", job_decoder39_entry_test},
+    {"spatial32_peer_test", job_spatial32_peer_test},
+    {"c32_peer_body_test", job_c32_peer_body_test},
+    {"spatial32_peer_output_test", job_spatial32_peer_output_test},
+    {"upsample66_prefix_test", job_upsample66_prefix_test},
+    {"head70_test", job_head70_test},
     {"spatial64_test", job_spatial64_test},
     {"c64_ffn_candidate_test", job_c64_ffn_candidate_test},
     {"c64_attention_candidate_test", job_c64_attention_candidate_test},
