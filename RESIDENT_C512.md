@@ -144,6 +144,58 @@ timings, not full image dimensions or whole-model frame times. Intervals
 include the input device copy, C512 work, output-consumer device copies and,
 for the encoder, ViT gather.
 
-The next step is connecting resident ViT execution after that gather, then
-integrating the remaining stages. Game/preview execution has not been
-switched to this component yet.
+## Resident ViT31–38 after the gather
+
+The changing-input runner can now pass the GPU gather output directly into
+eight resident ViT blocks. `vit_resident::Chain` preloads their weights and
+reuses its scratch and activation buffers across all submissions. It uses
+the existing ViT kernels unchanged, including the explicitly candidate
+16-token attention reduction. Both 16-token and 64-token extents are covered;
+32-token attention is rejected because it has no supported contract here.
+
+The borrowed input/output lifetime and default-stream rules above also apply
+to ViT. Its output view is cleared on a rejected input, and the next valid
+submission recovers. Diagnostic verification compares each block's input
+and nine arithmetic stages against saved scalar/standalone references. Later
+block inputs are never uploaded from those reference files.
+
+After producing a changing-encoder fixture with `check_split512_frames.py`, run:
+
+```powershell
+& $py tools\check_resident_encoder_vit.py 'C:\path\to\changing-encoder' `
+  --output-root 'C:\path\to\resident-encoder-vit'
+```
+
+For the larger synthetic case, use the changing-encoder32x8 output and add
+`--head-fixture build\split512_bridge_32x8`. Keep input and output directories
+separate. The checker revalidates C512 source manifests and saved frame
+hashes, reconstructs the gather map, and generates independent ViT references
+for A, shifted B and zero. It then replays A/B/zero/B/A with one resident chain.
+Allow about 1.3 GB per case for decoded diagnostic fixtures; none are bundled
+with the public source. The existing resident build script builds this mode.
+
+| Input feature grid | ViT tokens | ViT stage checks | Exact output arrays | Combined device interval |
+|---|---:|---:|---:|---:|
+| Captured encoder, 8×8×512 | 16 | 80 | 25 | 5.57–5.71 ms |
+| Synthetic encoder, 32×8×512 | 64 | 80 | 25 | 20.20–20.85 ms |
+
+These intervals include C51223–30, block30 pool/head, gather, ViT31–38,
+input device copies and output-consumer device copies. They exclude setup,
+host input upload, diagnostic checks and final readback. Both cases report
+zero explicit device-buffer allocations and zero host transfers inside
+their measured regions. These remain component timings, not whole-model
+or in-game frame times.
+
+All five endpoints (C512 final/raw, head, gather and ViT38) match byte for
+byte on every submission. The three distinct inputs produce three distinct
+ViT outputs. Eight invalid-view controls across the two cases clear stale
+outputs and recover. An altered block32 reference input fails diagnostic
+verification in each case, and unsupported attention extents are rejected.
+The captured case's 152 ViT fixture arrays also match the earlier complete
+captured-frame replay. Legacy C512 encoder and decoder modes retain their
+30 exact changing-frame outputs.
+
+The logical bridge and 16-token reduction remain candidate assumptions;
+this adds no original NVIDIA-kernel parity evidence. Next is connecting the
+inverse bridge and decoder39 to the resident decoder40–47 chain. Game and
+scene-preview execution have not been switched to these components.

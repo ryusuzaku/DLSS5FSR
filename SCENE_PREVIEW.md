@@ -216,8 +216,12 @@ A separate [resident C512 component check](RESIDENT_C512.md) now validates
 direct GPU handoffs across encoder23–30 (including pool/head) and decoder40–47.
 It retains weights and scratch buffers across repeated execution, accepts
 changing device inputs, and exposes device outputs. Its encoder head can
-feed the ViT gather directly on the GPU. Changing-frame controls match the
-saved scalar/standalone references. This is a standalone building block;
+feed the ViT gather and all eight ViT31–38 blocks directly on the GPU, with
+their weights and workspace retained too. The 16-token captured case and
+64-token synthetic case pass all 160 ViT stage checks and 50 byte-exact
+changing-frame output comparisons. Their combined component intervals are
+5.57–5.71 ms and 20.20–20.85 ms, excluding setup and host transfers; these
+are not whole-model frame times. This is a standalone building block;
 the scene-preview path above still uses its existing diagnostic files.
 
 To process an already saved capture without a game, pass `--existing-capture

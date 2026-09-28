@@ -27,8 +27,8 @@ def run_block(block,width=8,height=4,derived=False,image_source=None,output_root
     tokens=width*height
     if block==31:
         if image_source is not None:
-            if (width,height)!=(4,4) or not derived:
-                raise ValueError('image source requires the 4x4 derived-map candidate')
+            if tokens not in (16,64) or not derived:
+                raise ValueError('explicit source requires a 16/64-token derived-map candidate')
             source_path=Path(image_source)
             if not source_path.is_file():raise FileNotFoundError(source_path)
             head_path=None
@@ -46,7 +46,7 @@ def run_block(block,width=8,height=4,derived=False,image_source=None,output_root
             if mapped.tobytes()!=np.asarray(head[gather],dtype='<f4').tobytes():
                 raise ValueError('HIP bridge output differs bytewise from PTX map gather')
     else:
-        if tokens==16 and image_source is not None and derived:
+        if tokens in (16,64) and image_source is not None and derived:
             source_path=Path(image_source)
         elif tokens==64:
             suffix='_derived' if derived else ''
@@ -133,7 +133,7 @@ def run_block(block,width=8,height=4,derived=False,image_source=None,output_root
                 qkv_tensor=qkv_record['index'],qkv_sha256=hashlib.sha256(qkv_raw).hexdigest(),
                 bridge=('prior candidate ViT device projection; original physical bridge unverified'
                         if image_source is not None and block>31 else
-                        'candidate 4x4 logical C512/ViT map; original physical bridge unverified'
+                        'candidate logical C512/ViT map; original physical bridge unverified'
                         if image_source is not None else
                         'upstream capture-derived logical map composed with original PTX physical source; no original-kernel execution'
                         if derived else 'PTX source-linear map on logical-HWC control; C512 split-view composition missing; no original-kernel execution'),

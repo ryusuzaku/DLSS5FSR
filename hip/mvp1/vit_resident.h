@@ -1,0 +1,99 @@
+#pragma once
+// Persistent ViT31-38 workspace; arithmetic stays in the standalone kernels.
+#include "split512_resident.h"
+#include "vit_expand_chain.hip"
+#include <stdexcept>
+
+namespace vit_resident {
+using c512_resident::Buffer;
+using c512_resident::DeviceTensor;
+using c512_resident::traffic;
+
+struct Weights {
+    std::string dir;
+    Buffer expand, contract, skip, qkv, scales, projection, projection_skip;
+    explicit Weights(const std::string& folder) : dir(folder),
+        expand(dir, "weights", 4096*1024), contract(dir, "contract_weights", 1024*4096),
+        skip(dir, "contract_skip", 1024), qkv(dir, "qkv_weights", 3*1024*1024),
+        scales(dir, "qkv_scales", 32), projection(dir, "projection_weights", 1024*1024),
+        projection_skip(dir, "projection_skip", 1024) {}
+};
+
+#define VIT_LAUNCH(kernel, count, ...) do { \
+    hipLaunchKernelGGL(kernel, dim3(((count)+255)/256), dim3(256), 0, 0, __VA_ARGS__); \
+    HIP_CHECK(hipGetLastError()); } while (0)
+
+class Chain {
+    static int checked_tokens(int tokens, size_t blocks) {
+        if ((tokens != 16 && tokens != 64) || blocks != 8)
+            throw std::invalid_argument("resident ViT requires 16/64 tokens and eight blocks");
+        return tokens;
+    }
+    int tokens;
+    size_t n, sn;
+    Buffer ping, pong, expanded, hidden, contract, projected, qkv, scores, exponents, attention;
+    std::vector<std::unique_ptr<Weights>> weights;
+    float* result = nullptr;
+
+    bool check(const std::string& dir, const char* name, float* device, size_t count, bool verify) {
+        if (!verify) return true;
+        ++comparisons;
+        traffic.d2h_bytes += count*sizeof(float);
+        return compare((dir + ": " + name).c_str(), device, read(dir, name, count));
+    }
+
+public:
+    size_t comparisons = 0;
+    Chain(int count, const std::vector<std::string>& blocks) :
+        tokens(checked_tokens(count, blocks.size())), n(size_t(tokens)*1024),
+        sn(size_t(32)*tokens*tokens), ping(n), pong(n), expanded(4*n), hidden(4*n),
+        contract(n), projected(3*n), qkv(3*n), scores(sn), exponents(sn), attention(n) {
+        for (const auto& dir : blocks) weights.emplace_back(new Weights(dir));
+    }
+
+    // Borrowed same-device/default-stream input. Output lasts until next submission.
+    // verify=true compares only against the construction fixtures, outside timing.
+    bool run_from_device(DeviceTensor source, bool verify = false) {
+        result = nullptr;
+        if (!source.data || source.count != n) return false;
+        if (source.data != ping.data) {
+            HIP_CHECK(hipMemcpyAsync(ping.data, source.data, n*sizeof(float), hipMemcpyDeviceToDevice));
+            traffic.d2d_bytes += n*sizeof(float);
+        }
+        float *input = ping.data, *output = pong.data;
+        for (const auto& owned : weights) {
+            const auto& w = *owned;
+            if (!check(w.dir, "input", input, n, verify)) return false;
+            VIT_LAUNCH(k_vit_expand, 4*n, input, w.expand.data, expanded.data, hidden.data, tokens);
+            VIT_LAUNCH(k_vit_residual_projection, n, hidden.data, input, w.contract.data,
+                       w.skip.data, contract.data, tokens, 4096);
+            VIT_LAUNCH(k_vit_qkv_projection, 3*n, contract.data, w.qkv.data, projected.data, tokens);
+            VIT_LAUNCH(k_vit_qkv_normalize, 3*n, projected.data, w.scales.data, qkv.data, tokens);
+            VIT_LAUNCH(k_vit_scores, sn, qkv.data, scores.data, tokens);
+            VIT_LAUNCH(k_vit_exponents, sn, scores.data, exponents.data, int(sn));
+            if (tokens == 64) {
+                VIT_LAUNCH(k_vit_attention, n, qkv.data, exponents.data, attention.data, tokens);
+            } else {
+                VIT_LAUNCH(k_vit_attention16_candidate, n, qkv.data, exponents.data, attention.data);
+            }
+            VIT_LAUNCH(k_vit_residual_projection, n, attention.data, contract.data,
+                       w.projection.data, w.projection_skip.data, output, tokens, 1024);
+            if (!check(w.dir, "expanded", expanded.data, 4*n, verify) ||
+                !check(w.dir, "hidden", hidden.data, 4*n, verify) ||
+                !check(w.dir, "contract", contract.data, n, verify) ||
+                !check(w.dir, "qkv_projected", projected.data, 3*n, verify) ||
+                !check(w.dir, "qkv", qkv.data, 3*n, verify) ||
+                !check(w.dir, "scores", scores.data, sn, verify) ||
+                !check(w.dir, "exponents", exponents.data, sn, verify) ||
+                !check(w.dir, "attention", attention.data, n, verify) ||
+                !check(w.dir, "projection", output, n, verify)) return false;
+            std::swap(input, output);
+        }
+        result = input;
+        return true;
+    }
+
+    DeviceTensor final_view() const { return result ? DeviceTensor{result, n} : DeviceTensor{}; }
+};
+#undef VIT_LAUNCH
+} // namespace vit_resident
