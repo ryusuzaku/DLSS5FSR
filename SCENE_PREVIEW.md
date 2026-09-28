@@ -212,6 +212,12 @@ several unchanged stages also slower. The direct job comparison demonstrates
 reduced startup overhead; this whole-frame sample does not demonstrate an
 overall speedup.
 
+A separate [resident C512 component check](RESIDENT_C512.md) now validates
+direct GPU handoffs across encoder23–30 (including pool/head) and decoder40–47.
+It retains weights and scratch buffers across repeated execution. This is a
+standalone building block; the scene-preview path above still uses its
+existing diagnostic files.
+
 To process an already saved capture without a game, pass `--existing-capture
 --max-updates 1` with its path. To return to normal rendering, stop the
 sidecar, set `DebugView=0`, clear `CandidatePreviewPath` and

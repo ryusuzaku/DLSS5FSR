@@ -62,3 +62,4 @@ MSYS_NO_PATHCONV=1 "$ROCM/bin/hipcc.exe" -std=c++17 -O2 -ffp-contract=off -D_CRT
   --offload-arch=gfx1201 hip/mvp1/spatial32_peer_output_test.hip -o build/spatial32_peer_output_test.exe
 
 bash tools/build_candidate_gpu_worker.sh
+bash tools/build_split512_resident.sh
