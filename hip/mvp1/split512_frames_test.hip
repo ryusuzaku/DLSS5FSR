@@ -4,6 +4,7 @@
 #include "vit_resident.h"
 #include "decoder39_resident.h"
 #include "c256_resident.h"
+#include "c128_resident.h"
 #include <fstream>
 #include <cstring>
 
@@ -45,8 +46,8 @@ static bool input_unchanged(DeviceTensor view, const Buffer& snapshot) {
     return !memcmp(after.data(), before.data(), view.count*sizeof(float));
 }
 int main(int argc, char** argv) {
-    if (argc != 6 && argc != 8 && argc != 9 && argc != 11 && argc != 13) {
-        fputs("usage: split512_frames_test blocks width height frames output [head-fixture bridge-map [vit-blocks [decoder39-fixture decoder-blocks [prefix48-fixture c256-blocks]]]]\n", stderr);
+    if (argc != 6 && argc != 8 && argc != 9 && argc != 11 && argc != 13 && argc != 15) {
+        fputs("usage: split512_frames_test blocks width height frames output [head-fixture bridge-map [vit-blocks [decoder39-fixture decoder-blocks [prefix48-fixture c256-blocks [prefix56-fixture c128-blocks]]]]]\n", stderr);
         return 2;
     }
     int width = atoi(argv[2]), height = atoi(argv[3]);
@@ -67,7 +68,8 @@ int main(int argc, char** argv) {
         frames.push_back(line);
     }
     if (blocks.size() != 8 || frames.size() < 3) return 2;
-    bool encoder = argc >= 8, with_vit = argc >= 9, with_decoder = argc >= 11, with_c256 = argc == 13;
+    bool encoder = argc >= 8, with_vit = argc >= 9, with_decoder = argc >= 11,
+         with_c256 = argc >= 13, with_c128 = argc == 15;
     if (with_vit && width == 16) return 2; // No 32-token attention contract.
     size_t n = size_t(width)*height*512, hn = size_t(width)*height/4*1024;
     Chain chain(width, height, blocks, encoder ? argv[6] : "");
@@ -141,6 +143,27 @@ int main(int argc, char** argv) {
         c256_consumer.reset(new Buffer(2*n));
         if (prefix48->final_view().data || prefix48->low_view().data || c256->final_view().data) return 1;
     }
+    std::unique_ptr<c128_resident::Prefix> prefix56;
+    std::unique_ptr<c128_resident::Chain> c128;
+    std::unique_ptr<Buffer> skip14, low56_consumer, merge56_consumer, c128_consumer;
+    if (with_c128) {
+        std::ifstream file(argv[14]);
+        if (!file) return 2;
+        std::vector<std::pair<std::string,int>> blocks128;
+        while (std::getline(file,line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (line.size()<3 || line[1]!='\t' || line[0]<'0' || line[0]>'3' || blocks128.size()>=6) return 2;
+            blocks128.emplace_back(line.substr(2),line[0]-'0');
+        }
+        if (blocks128.size()!=6) return 2;
+        prefix56.reset(new c128_resident::Prefix(width*2,height*2,argv[13]));
+        c128.reset(new c128_resident::Chain(width*4,height*4,blocks128));
+        skip14.reset(new Buffer(4*n));
+        low56_consumer.reset(new Buffer(n));
+        merge56_consumer.reset(new Buffer(4*n));
+        c128_consumer.reset(new Buffer(4*n));
+        if (prefix56->final_view().data || prefix56->low_view().data || c128->final_view().data) return 1;
+    }
     if (chain.final_view().data || chain.raw_view().data || chain.head_view().data) return 1;
     HIP_CHECK(hipDeviceSynchronize());
     Traffic setup = traffic;
@@ -192,6 +215,18 @@ int main(int argc, char** argv) {
                     c256->run_from_device({merge48_consumer->data,2*n-1}) || c256->final_view().data) return 1;
                 rejected += 2;
             }
+            if (prefix56) {
+                DeviceTensor main{c256_consumer->data,2*n}, skip{skip14->data,4*n};
+                auto reject = [&](DeviceTensor a, DeviceTensor b) {
+                    return !prefix56->run_from_device(a,b) && !prefix56->final_view().data && !prefix56->low_view().data;
+                };
+                if (!reject({nullptr,2*n},skip) || !reject({main.data,2*n-1},skip) ||
+                    !reject(main,{nullptr,4*n}) || !reject(main,{skip.data,4*n-1})) return 1;
+                rejected += 4;
+                if (c128->run_from_device({nullptr,4*n}) || c128->final_view().data ||
+                    c128->run_from_device({merge56_consumer->data,4*n-1}) || c128->final_view().data) return 1;
+                rejected += 2;
+            }
             if (traffic.allocations != before.allocations || traffic.h2d_bytes != before.h2d_bytes ||
                 traffic.d2h_bytes != before.d2h_bytes || traffic.d2d_bytes != before.d2d_bytes) return 1;
         }
@@ -207,6 +242,14 @@ int main(int argc, char** argv) {
             HIP_CHECK(hipMemcpy(skip22->data,skip_input.data(),2*n*sizeof(float),hipMemcpyHostToDevice));
             traffic.h2d_bytes += 2*n*sizeof(float);
             frame_upload_bytes += 2*n*sizeof(float);
+        }
+        std::vector<float> skip14_input;
+        if (skip14) {
+            skip14_input = read(frames[index],"skip14",4*n);
+            for (float value:skip14_input) if (!std::isfinite(value)) return 2;
+            HIP_CHECK(hipMemcpy(skip14->data,skip14_input.data(),4*n*sizeof(float),hipMemcpyHostToDevice));
+            traffic.h2d_bytes += 4*n*sizeof(float);
+            frame_upload_bytes += 4*n*sizeof(float);
         }
         // Check every ViT stage on the actual GPU-produced first-frame bridge.
         // Diagnostic readbacks are outside all measured execution regions.
@@ -224,6 +267,9 @@ int main(int argc, char** argv) {
             if (prefix48 && (!prefix48->run_from_device(decoder->final_view(),{skip22->data,2*n},true) ||
                              prefix48->comparisons != 4 || !c256->run_from_device(prefix48->final_view(),true) ||
                              c256->comparisons != 120)) return 1;
+            if (prefix56 && (!prefix56->run_from_device(c256->final_view(),{skip14->data,4*n},true) ||
+                             prefix56->comparisons != 4 || !c128->run_from_device(prefix56->final_view(),true) ||
+                             c128->comparisons != 90)) return 1;
         }
         Traffic before = traffic;
         HIP_CHECK(hipEventRecord(start));
@@ -259,6 +305,13 @@ int main(int argc, char** argv) {
             consume(prefix48->final_view(),*merge48_consumer);
             consume(c256->final_view(),*c256_consumer);
         }
+        if (prefix56) {
+            if (!prefix56->run_from_device(c256->final_view(),{skip14->data,4*n}) ||
+                !c128->run_from_device(prefix56->final_view())) return 1;
+            consume(prefix56->low_view(),*low56_consumer);
+            consume(prefix56->final_view(),*merge56_consumer);
+            consume(c128->final_view(),*c128_consumer);
+        }
         HIP_CHECK(hipEventRecord(stop)); HIP_CHECK(hipEventSynchronize(stop));
         float elapsed = 0;
         HIP_CHECK(hipEventElapsedTime(&elapsed, start, stop));
@@ -267,9 +320,11 @@ int main(int argc, char** argv) {
             traffic.d2h_bytes != before.d2h_bytes || chain.comparisons ||
             (vit && vit->comparisons != 80) ||
             (entry && (entry->comparisons != 5 || decoder->comparisons != 112)) ||
-            (prefix48 && (prefix48->comparisons != 4 || c256->comparisons != 120))) return 1;
+            (prefix48 && (prefix48->comparisons != 4 || c256->comparisons != 120)) ||
+            (prefix56 && (prefix56->comparisons != 4 || c128->comparisons != 90))) return 1;
         size_t expected_d2d = (3*n + (encoder ? hn : 0) + (vit ? 2*hn : 0) +
-                               (entry ? 4*n + hn + hn/2 : 0) + (prefix48 ? 6*n+n/2 : 0))*sizeof(float);
+                               (entry ? 4*n + hn + hn/2 : 0) + (prefix48 ? 6*n+n/2 : 0) +
+                               (prefix56 ? 13*n : 0))*sizeof(float);
         if (traffic.d2d_bytes-before.d2d_bytes != expected_d2d) return 1;
         compute_d2d += expected_d2d;
         std::string output = std::string(argv[5]) + "/frame_" + std::to_string(index);
@@ -295,6 +350,16 @@ int main(int argc, char** argv) {
             traffic.d2h_bytes += 2*n*sizeof(float);
             if (memcmp(after.data(),skip_input.data(),2*n*sizeof(float))) return 1;
         }
+        if (prefix56) {
+            if (!check_save(frames[index],output,"low56",*low56_consumer) ||
+                !check_save(frames[index],output,"merge56",*merge56_consumer) ||
+                !check_save(frames[index],output,"decoder61",*c128_consumer) ||
+                !input_unchanged(c256->final_view(),*c256_consumer)) return 1;
+            std::vector<float> after(4*n);
+            HIP_CHECK(hipMemcpy(after.data(),skip14->data,4*n*sizeof(float),hipMemcpyDeviceToHost));
+            traffic.d2h_bytes += 4*n*sizeof(float);
+            if (memcmp(after.data(),skip14_input.data(),4*n*sizeof(float))) return 1;
+        }
         // A borrowed input must not be overwritten by chain or consumer work.
         std::vector<float> unchanged(n);
         HIP_CHECK(hipMemcpy(unchanged.data(), incoming.data, n*sizeof(float), hipMemcpyDeviceToHost));
@@ -313,11 +378,13 @@ int main(int argc, char** argv) {
         "\"input_preserved\":true,\"adjacent_vit_bridge\":%s,\"resident_vit\":%s,"
         "\"vit_stage_comparisons\":%zu,\"resident_decoder\":%s,"
         "\"decoder39_stage_comparisons\":%zu,\"decoder_stage_comparisons\":%zu,"
-        "\"resident_c256\":%s,\"prefix48_stage_comparisons\":%zu,\"c256_stage_comparisons\":%zu,\"frame_ms\":[",
+        "\"resident_c256\":%s,\"prefix48_stage_comparisons\":%zu,\"c256_stage_comparisons\":%zu,"
+        "\"resident_c128\":%s,\"prefix56_stage_comparisons\":%zu,\"c128_stage_comparisons\":%zu,\"frame_ms\":[",
         frames.size(), rejected, frame_upload_bytes, compute_d2d, encoder ? "true" : "false",
         vit ? "true" : "false", vit ? vit->comparisons : size_t(0), entry ? "true" : "false",
         entry ? entry->comparisons : size_t(0), decoder ? decoder->comparisons : size_t(0),
-        c256 ? "true" : "false", prefix48 ? prefix48->comparisons : size_t(0), c256 ? c256->comparisons : size_t(0)) > 0;
+        c256 ? "true" : "false", prefix48 ? prefix48->comparisons : size_t(0), c256 ? c256->comparisons : size_t(0),
+        c128 ? "true" : "false", prefix56 ? prefix56->comparisons : size_t(0), c128 ? c128->comparisons : size_t(0)) > 0;
     for (size_t i = 0; i < frame_ms.size(); ++i)
         ok = (fprintf(f, "%s%.6f", i ? "," : "", frame_ms[i]) > 0) && ok;
     ok = (fprintf(f, "]}\n") > 0) && ok;

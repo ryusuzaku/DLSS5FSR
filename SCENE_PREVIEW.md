@@ -230,7 +230,11 @@ transition and eight C256 blocks. It accepts a separately supplied encoder22
 skip and passes 642 ViT/decoder stage checks and 130 endpoint comparisons
 across captured-size and larger synthetic controls. The captured A input
 uses its same-frame skip; shifted/zero runs use explicitly synthetic skip
-pairs. This is a standalone building block;
+pairs. The next resident section reaches decoder61 using a separately
+supplied encoder14 skip: both sizes pass 830 ViT/decoder stage checks and
+160 exact endpoint comparisons. Its captured-size combined interval is
+19.16–19.42 ms, excluding setup, all three input uploads and readbacks.
+These remain component measurements. This is a standalone building block;
 the scene-preview path above still uses its existing diagnostic files.
 
 To process an already saved capture without a game, pass `--existing-capture

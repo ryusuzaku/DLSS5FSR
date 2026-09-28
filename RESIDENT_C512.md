@@ -317,6 +317,66 @@ buffer allocations or host transfers inside the measured regions. This
 still is not whole-model or game performance, and neither the game DLL nor
 scene-preview path has been switched to this runner.
 
-Next is decoder56's transition and the C128 decoder56–61 section, using the
-matching encoder14 skip. The upstream skip producers also need resident
+The following extension adds decoder56's transition and the C128
+decoder56–61 section. The upstream skip producers also need resident
 execution before the full path can operate without external skip inputs.
+
+## Resident decoder56–61 with an explicit encoder14 skip
+
+`c128_resident::Prefix` takes decoder55's device output and a separate
+encoder14 skip. Its projection, skip scale and workspace stay resident.
+The merged output feeds six C128 blocks using the existing kernels and
+shift schedule `0, 2, 0, 3, 1, 2`. `c128_resident::Chain` retains the weights
+and reuses activation and padded-window buffers across submissions.
+
+The harness uploads the initial C512 input, encoder22 skip and encoder14
+skip before each measured region. Captured A uses the verified AMD
+encoder14 output from the same captured-frame replay. B rolls that skip
+four columns, consistent with the control's spatial scale; zero supplies
+a zero skip. These are synthetic pairs, not recomputed upstream encoder
+results. The larger case uses a reproducible FP8 Gaussian skip with seed
+5601 and standard deviation 0.03125.
+
+```powershell
+& $py tools\check_resident_decoder61.py 'C:\path\to\resident-through-decoder55' `
+  --decoder47-source 'C:\path\to\resident-through-decoder47' `
+  --captured-candidate 'C:\path\to\captured-frame\candidate' `
+  --output-root 'C:\path\to\resident-through-decoder61'
+```
+
+The decoder47 source must match the report recorded by the decoder55 run;
+it supplies the earlier ViT and decoder39 fixtures. For the larger case,
+use its matching decoder55/decoder47 directories, `--synthetic-skip` instead
+of `--captured-candidate ...`, and
+`--head-fixture build\split512_bridge_32x8`. The existing resident build
+script includes this mode. `native_command.json` records the prepared
+invocation for later replay without regenerating scalar references.
+
+| C512 input / C128 output grid | ViT-through-decoder stage checks | Exact output arrays | Combined device interval |
+|---|---:|---:|---:|
+| 8×8×512 / 32×32×128 | 415 | 80 | 19.16–19.42 ms |
+| 32×8×512 / 128×32×128 | 415 | 80 | 62.55–62.85 ms |
+
+Block56's transition adds four checks and the six C128 bodies add 90
+stage/handoff checks. All 16 endpoints per submission match independent
+scalar/standalone references through A/B/zero/B/A. The captured case's
+seven prefix arrays and 198 C128 arrays also match the earlier full-frame
+replay. The five older modes retain all 170 exact endpoint comparisons.
+
+Both cases verify that the supplied encoder14 skip and decoder55 input
+remain unchanged. The 44 invalid-view controls across both runs clear stale
+outputs and recover, and separate diagnostics reject an altered encoder14
+skip expectation and an altered block57 input before publishing frames.
+The C128 attention residual order remains a candidate; no original NVIDIA
+kernel was executed for these checks.
+
+The measured region now reaches decoder61 and includes device copies used
+by the harness. Setup, three host input uploads and validation readbacks
+are excluded. It has zero explicit buffer allocations and zero host
+transfers, with weights loaded once. These remain component timings on
+prepared inputs, not whole-model or in-game frame times. Game and preview
+execution have not been switched to this component.
+
+Next is block62's transition and the C64 decoder62–65 section with the
+matching encoder8 skip, followed by C32 and the final head. Upstream
+encoder/skip residency and production integration also remain unfinished.
