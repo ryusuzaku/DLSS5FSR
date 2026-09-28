@@ -221,7 +221,11 @@ their weights and workspace retained too. The 16-token captured case and
 64-token synthetic case pass all 160 ViT stage checks and 50 byte-exact
 changing-frame output comparisons. Their combined component intervals are
 5.57–5.71 ms and 20.20–20.85 ms, excluding setup and host transfers; these
-are not whole-model frame times. This is a standalone building block;
+are not whole-model frame times. A further resident extension connects the
+inverse bridge and decoder39, using the same-frame encoder30 skip, through
+decoder40–47. Both tested sizes pass 394 ViT/decoder stage checks and 100
+byte-exact output comparisons with no host transfers during measured
+execution. This is a standalone building block;
 the scene-preview path above still uses its existing diagnostic files.
 
 To process an already saved capture without a game, pass `--existing-capture

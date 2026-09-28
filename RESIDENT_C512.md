@@ -196,6 +196,63 @@ captured-frame replay. Legacy C512 encoder and decoder modes retain their
 30 exact changing-frame outputs.
 
 The logical bridge and 16-token reduction remain candidate assumptions;
-this adds no original NVIDIA-kernel parity evidence. Next is connecting the
-inverse bridge and decoder39 to the resident decoder40–47 chain. Game and
-scene-preview execution have not been switched to these components.
+this adds no original NVIDIA-kernel parity evidence. The following extension
+connects the inverse bridge and decoder39 to the resident decoder40–47 chain.
+Game and scene-preview execution have not been switched to these components.
+
+## Resident inverse bridge and decoder39–47
+
+The combined runner now continues from ViT38 to decoder47 without a host
+activation transfer. `decoder39_resident::Entry` retains its inverse map,
+projection weights, skip scale and scratch buffers. It reads ViT38 and the
+same submission's encoder30 final output directly from their device views,
+then performs the inverse gather, projection and upsample/skip merge using
+the existing kernels. The merge output feeds the existing resident C512
+decoder40–47 chain. The encoder skip stays alive until the merge consumes it.
+
+```powershell
+& $py tools\check_resident_decoder47.py 'C:\path\to\resident-encoder-vit' `
+  --output-root 'C:\path\to\resident-through-decoder47'
+```
+
+Use the larger resident-encoder32x8/ViT result with
+`--head-fixture build\split512_bridge_32x8` for the 64-token case. Rebuild with
+`tools/build_split512_resident.sh` first. The checker verifies its source
+hashes and ViT handoffs, generates independent decoder39 and decoder40–47
+scalar/standalone references, then exercises A/B/zero/B/A in one resident
+process. The inverse map is the inverse of the existing candidate logical
+gather; it is not newly recovered from NVIDIA runtime output.
+
+| Input feature grid | ViT/decoder stage checks | Exact output arrays | Combined device interval |
+|---|---:|---:|---:|
+| Captured encoder, 8×8×512 | 197 | 50 | 8.97–9.21 ms |
+| Synthetic encoder, 32×8×512 | 197 | 50 | 27.16–30.89 ms |
+
+Each case checks 80 ViT stages/handoffs, decoder39's two input handoffs and
+three arithmetic stages, and 112 decoder40–47 stages/handoffs. Ten endpoints
+per submission match byte for byte, including the inverse-mapped activation,
+projection, merged decoder39 output and decoder47 final/raw outputs. All
+three distinct inputs produce distinct decoder47 outputs. The captured
+case's seven decoder39 arrays and 208 decoder40–47 arrays also match the
+earlier full-frame replay. The older C512 encoder, C512 decoder and
+encoder/ViT modes retain their 55 exact changing-frame output arrays.
+
+Twenty invalid-view checks across both cases clear stale output and recover
+on valid input, covering null/wrong-size ViT and skip inputs as well as the
+encoder, ViT and decoder chains. The harness also verifies that decoder39
+leaves both borrowed inputs unchanged. Each case rejects an altered skip
+expectation, a non-bijective inverse map, and an altered block41 input
+expectation; failed diagnostics publish no frame outputs.
+
+The measured interval now covers encoder23–30, pool/head, forward gather,
+ViT31–38, inverse/decoder39 and decoder40–47, including device input and
+output-consumer copies. It still excludes setup, host uploads and validation
+readbacks. Weights are loaded once and the measured regions have zero
+explicit device-buffer allocations and zero host transfers. These are
+component timings on prepared inputs, not a complete model or game frame.
+
+The next connection is decoder48's transition and C256 blocks48–55, with
+the matching encoder22 skip. Remaining decoder stages, upstream encoder
+residency and production game integration are still ahead. Original logical
+maps, the 16-token reduction and native input/output contracts remain
+unvalidated.
