@@ -180,6 +180,25 @@ in workers. All 335 PASS lines matched, and the full tensor comparison still
 passed afterward. This isolates test-launch overhead from the Python scalar
 and fixture-generation work included in full-frame timings.
 
+ViT weight decoding now uses binary reshape/transpose operations for the
+existing address-bit permutation and a 256-entry FP8 lookup table generated
+from the unchanged reference decoder. It reads and decodes each source record
+on every run; there is no persisted weight cache. Scalar arithmetic, source
+hashes, record validation and GPU comparisons remain in place.
+
+`tools/check_vit_weight_decode.py` compares every address in the three matrix
+shapes (9,437,184 addresses total), all FP8 codes including signed zero, and
+all 32 ViT source records against the unchanged vendored decoder. It also
+rejects invalid sizes, types, shapes and nonfinite QKV scales. In one direct
+comparison, decoding the 32 records took 0.35 seconds versus 14.0 seconds in
+the original decoder. This verifies implementation equivalence, not independent
+evidence for the assumed model layout.
+
+The complete saved-frame replay with this decoder took 72 seconds versus
+95 seconds previously, with ViT falling from 22.5 to 3.6 seconds. All 2,301
+intermediate tensors, both final head manifests and the preview remained
+byte-identical. Other stage timings varied; these remain offline measurements.
+
 To process an already saved capture without a game, pass `--existing-capture
 --max-updates 1` with its path. To return to normal rendering, stop the
 sidecar, set `DebugView=0`, clear `CandidatePreviewPath` and

@@ -9,6 +9,7 @@ import sys
 import numpy as np
 from recover_vit_bridge_ptx import ROOT,recover
 from audit_native_vit_logical_map import logical_map
+import vit_weight_decode as weights_decode
 
 sys.path.insert(0,str(ROOT/'ref/dlss5-port/Development'))
 import native_vit_linear_reference as V
@@ -62,20 +63,19 @@ def run_block(block,width=8,height=4,derived=False,image_source=None,output_root
     raw=(ROOT/'dlss5-analysis/tensors'/f"tensor_{record['index']:03d}.bin").read_bytes()
     if len(raw)!=4194320 or any(raw[4194304:]):
         raise ValueError(f'wrong block{block} expansion size or nonzero trailer')
-    weight=V.matrix(np.frombuffer(raw[:4194304],np.uint8),1024,4096)
+    weight=weights_decode.matrix(np.frombuffer(raw[:4194304],np.uint8),1024,4096)
     expanded=multiply(x,weight)
     hidden=V.expand(x,weight)
     contract_record=records[f'block{block}.layer1.layer']
     contract_raw=(ROOT/'dlss5-analysis/tensors'/f"tensor_{contract_record['index']:03d}.bin").read_bytes()
     if len(contract_raw)!=4196352:
         raise ValueError(f'wrong block{block} contraction size')
-    contract_path=ROOT/'dlss5-analysis/tensors'/f"tensor_{contract_record['index']:03d}.bin"
-    contract_weights,contract_skip=V.unpack_residual(contract_path,4096)
+    contract_weights,contract_skip=weights_decode.unpack_residual(contract_raw,4096)
     contract=V.residual_projection(hidden,x,contract_weights,contract_skip)
     qkv_record=records[f'block{block}.layer2.layer']
     qkv_path=ROOT/'dlss5-analysis/tensors'/f"tensor_{qkv_record['index']:03d}.bin"
     qkv_raw=qkv_path.read_bytes()
-    qkv_weights,qkv_scales=Q.unpack(qkv_path)
+    qkv_weights,qkv_scales=weights_decode.unpack_qkv(qkv_raw)
     qkv_projected=np.stack([H(multiply(contract[:,:512],m[:,:512])+
                                multiply(contract[:,512:],m[:,512:]))
                             for m in qkv_weights],axis=1).reshape(tokens,3,1024)
@@ -100,7 +100,7 @@ def run_block(block,width=8,height=4,derived=False,image_source=None,output_root
         projection_path=ROOT/'dlss5-analysis/tensors'/f"tensor_{projection_record['index']:03d}.bin"
         projection_raw=projection_path.read_bytes()
         if len(projection_raw)!=1050624:raise ValueError(f'wrong block{block} projection size')
-        projection_weights,projection_skip=V.unpack_residual(projection_path,1024)
+        projection_weights,projection_skip=weights_decode.unpack_residual(projection_raw,1024)
         projection=V.residual_projection(attention,contract,projection_weights,projection_skip)
         attention_data=dict(scores=scores,exponents=exponents,attention=attention,
                             projection_weights=projection_weights,projection_skip=projection_skip,
