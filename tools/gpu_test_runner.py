@@ -18,6 +18,8 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 WORKER = ROOT / 'build/candidate_gpu_worker.exe'
 SUPPORTED = frozenset((
+    'split512_block_test',
+    'split512_bridge_test',
     'vit_bridge_ptx_test',
     'vit_expand_chain_test',
     'decoder39_entry_test',

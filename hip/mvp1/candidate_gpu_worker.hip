@@ -80,8 +80,17 @@
 #include "head70_test.hip"
 #undef main
 
+#define main job_split512_block_test
+#include "split512_block_test.hip"
+#undef main
+#define main job_split512_bridge_test
+#include "split512_bridge_test.hip"
+#undef main
+
 struct Job { const char* name; int (*run)(int, char**); };
 static const Job jobs[] = {
+    {"split512_block_test", job_split512_block_test},
+    {"split512_bridge_test", job_split512_bridge_test},
     {"vit_bridge_ptx_test", job_vit_bridge_ptx_test},
     {"vit_expand_chain_test", job_vit_expand_chain_test},
     {"decoder39_entry_test", job_decoder39_entry_test},

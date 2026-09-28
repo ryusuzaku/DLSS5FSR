@@ -3,10 +3,9 @@
 This opt-in diagnostic lets the game capture a staged proxy frame, runs the
 current AMD candidate offline, then displays the result as a centered square
 in `DebugView=2`. The game keeps showing the last completed square while the
-next capture runs. The latest saved-frame pass took about 2.4 minutes with
-shared public reference inference and reused static audits. Earlier passes
-while Cyberpunk was running took
-6.7 and 8.1 minutes; the shared mode has not yet been timed in-game. This is
+next capture runs. Saved-frame timings for the optimizations are recorded
+below. Earlier passes while Cyberpunk was running took 6.7 and 8.1 minutes;
+the optimized pipeline has not yet been timed in-game. This is
 **not** real-time inference or a production replacement for
 DLSS 5. Original C256/C32 maps, the C512 physical view, ViT reduction, and
 the game's exact native input/output contracts still need validation.
@@ -22,6 +21,9 @@ Build the shim and candidate HIP test executables following the main README.
 Use the project's Python venv with NumPy, Pillow and ONNX Runtime and leave
 the hash-verified public model in its documented local location. Output
 files are private and can take several GB; they are excluded from Git.
+The reported count of 2,301 tensors means intermediate `.f32` files saved
+and compared by this particular diagnostic run. It is neither a GPU hardware
+count nor the number of tensors held in VRAM at once.
 
 With the game closed, `tools/activate_candidate_scene_preview.ps1` can back up
 the currently installed three DLL names and INI, install the new built DLL,
@@ -126,7 +128,7 @@ The latest pass took 142 seconds and again matched all 2,301 intermediate
 varied, so the entire difference from the earlier 187-second run should not
 be attributed to audit reuse.
 
-The C32/C64/C128/C256, ViT and head candidate tests can now reuse one HIP
+The C32/C64/C128/C256/C512, ViT and head candidate tests can now reuse one HIP
 worker per Python stage. Build it with `bash tools/build_candidate_gpu_worker.sh` (also included
 in `tools/build_split512_block.sh`), then run the frame runner or sidecar as
 usual. Rebuild it after changing any included kernel or test source.
@@ -138,11 +140,12 @@ commands accept the same choice through `DLSS5_GPU_TEST_MODE`. The selected
 mode is recorded in the frame report and completed sidecar status; stage
 logs record worker startup and successful job counts.
 
-The dispatcher runs 23 existing test entry points, including gather, FFN,
+The dispatcher runs 25 existing test entry points, including gather, FFN,
 attention, scatter, downsample, ViT bridges, decoder39, block66 prefix and
-head outer passes, with their exact comparisons. It keeps the HIP context alive
+head outer passes and C512 spatial blocks/pool/head, with their exact comparisons.
+It keeps the HIP context alive
 between jobs, but still allocates/frees buffers and reads/writes intermediate
-files for each test. C512 and other launchers not included in the dispatcher
+files for each test. Launchers not included in the dispatcher
 still use their existing processes. Captured diagnostic output preserves the
 standalone PASS counts used by ViT, C32 prefix and head checks. This is an
 offline diagnostic optimization.
@@ -198,6 +201,16 @@ The complete saved-frame replay with this decoder took 72 seconds versus
 95 seconds previously, with ViT falling from 22.5 to 3.6 seconds. All 2,301
 intermediate tensors, both final head manifests and the preview remained
 byte-identical. Other stage timings varied; these remain offline measurements.
+
+The C512 extension adds nine encoder jobs and eight decoder jobs to worker
+reuse. Nine workers now handle 209 jobs per frame. Replaying those same 17
+prepared C512 jobs took 8.54 seconds in standalone processes versus 1.32
+seconds in two workers, with all 210 PASS lines identical. All 2,301 tensors,
+both final head manifests and the preview again matched byte for byte.
+That complete replay took 88 seconds versus the previous 72 seconds, with
+several unchanged stages also slower. The direct job comparison demonstrates
+reduced startup overhead; this whole-frame sample does not demonstrate an
+overall speedup.
 
 To process an already saved capture without a game, pass `--existing-capture
 --max-updates 1` with its path. To return to normal rendering, stop the

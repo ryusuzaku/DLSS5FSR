@@ -3,7 +3,7 @@
 from pathlib import Path
 import hashlib
 import json
-import subprocess
+from gpu_test_runner import run as run_gpu_test
 import numpy as np
 from check_split512_block import ROOT,R,attention_trace
 from check_split512_window import expected_windows
@@ -71,7 +71,7 @@ def run_case(block,width,height,shift,x=None,output_root=None):
                 oracle='native_split_reference.attention_window and attention; exact',
                 files={p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in folder.glob('*.f32')})
     (folder/'manifest.json').write_text(json.dumps(report,indent=2)+'\n')
-    subprocess.run([str(exe),str(folder),str(len(x)),str(width),str(height),str(shift)],cwd=ROOT,check=True)
+    run_gpu_test([str(exe),str(folder),str(len(x)),str(width),str(height),str(shift)],cwd=ROOT,check=True)
     np.testing.assert_array_equal(np.fromfile(folder/'final_device.f32','<f4'),final.ravel())
     np.testing.assert_array_equal(np.fromfile(folder/'final_raw_device.f32','<f4'),final_raw.ravel())
     return folder

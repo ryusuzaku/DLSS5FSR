@@ -4,7 +4,7 @@ from pathlib import Path
 import argparse
 import hashlib
 import json
-import subprocess
+from gpu_test_runner import run as run_gpu_test
 import numpy as np
 from check_split512_block import ROOT,R
 from decode_tinlayout_global import e4m3fn
@@ -46,7 +46,7 @@ def run_case(width=16,height=8,source_path=None,output_root=None):
                 comparison='exact',files={p.name:hashlib.sha256(p.read_bytes()).hexdigest()
                                           for p in folder.glob('*.f32')})
     (folder/'manifest.json').write_text(json.dumps(report,indent=2)+'\n')
-    subprocess.run([str(exe),str(folder),str(width),str(height)],cwd=ROOT,check=True)
+    run_gpu_test([str(exe),str(folder),str(width),str(height)],cwd=ROOT,check=True)
     np.testing.assert_array_equal(np.fromfile(folder/'head_device.f32','<f4'),head.ravel())
     return folder
 
