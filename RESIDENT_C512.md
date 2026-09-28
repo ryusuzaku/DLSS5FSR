@@ -380,3 +380,61 @@ execution have not been switched to this component.
 Next is block62's transition and the C64 decoder62–65 section with the
 matching encoder8 skip, followed by C32 and the final head. Upstream
 encoder/skip residency and production integration also remain unfinished.
+
+## Resident decoder62–65 with an explicit encoder8 skip
+
+`c64_resident::Prefix` now consumes decoder61's device output and a separate
+encoder8 skip. Four C64 blocks follow with shifts `0, 3, 1, 2`; their weights,
+ping-pong activations and padded-window workspace stay resident. The existing
+kernels are unchanged, including block62's sequential float32 projection
+accumulation with half rounding after each 32 products. The independent
+reference uses `project_sequential_f32` to preserve that rounding order.
+
+```powershell
+& $py tools\check_resident_decoder65.py 'C:\path\to\resident-through-decoder61' `
+  --captured-candidate 'C:\path\to\captured-frame\candidate' `
+  --output-root 'C:\path\to\resident-through-decoder65'
+```
+
+Rebuild with `tools/build_split512_resident.sh` first. The checker requires
+the earlier decoder61 report, references and `native_command.json`, plus
+the ancestor fixture paths recorded there. It verifies saved endpoint/input
+hashes, redecodes the C128 weights and block56 prefix, and uses only the
+repository's known executable to replay the prepared chain. It generates
+independent scalar/standalone references for the new prefix and C64 blocks.
+For the larger decoder61 source, use `--synthetic-skip` instead of
+`--captured-candidate ...`.
+
+Captured A uses the hash-verified encoder8 output from the same AMD captured
+frame. B rolls that skip eight columns; zero supplies a zero skip. These are
+synthetic control pairs, not new upstream encoder executions. The larger
+case uses an FP8 Gaussian skip with seed 6201 and standard deviation 0.03125.
+The initial C512 input and all three external skips upload before timing.
+
+| C512 input / C64 output grid | ViT-through-decoder stage checks | Exact output arrays | Combined device interval |
+|---|---:|---:|---:|
+| 8×8×512 / 64×64×64 | 479 | 95 | 22.09–23.12 ms |
+| 32×8×512 / 256×64×64 | 479 | 95 | 77.51–80.12 ms |
+
+The transition adds four checks and the C64 bodies add 60. All 19 endpoints
+per submission match through A/B/zero/B/A, with three distinct decoder65
+outputs. The seven captured prefix arrays and 132 body arrays also match
+the earlier full-frame replay byte for byte. All six older modes retain
+their 250 exact endpoint comparisons.
+
+Across both sizes, 56 null/wrong-size input controls clear stale outputs and
+recover on valid submissions. Separate diagnostics reject altered skip8
+and block63 input expectations before publishing frames. The supplied skip
+and decoder61 input remain unchanged. No original NVIDIA kernel was run;
+the existing logical-map and attention residual-order assumptions remain.
+
+The measured interval covers encoder23–30, ViT31–38 and decoder39–65,
+including bridges, transitions and harness device copies. Weights load once;
+there are zero explicit buffer allocations or host transfers inside that
+interval. Setup, four input uploads and validation readbacks are excluded.
+These are component timings, not full-model or in-game frame times, and the
+preview still runs its existing diagnostic path.
+
+Next are block66's transition, C32 decoder66–69 and head70. Upstream encoder
+and skip residency, candidate-contract validation and game integration
+remain necessary for a complete live path.

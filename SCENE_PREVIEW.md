@@ -234,6 +234,11 @@ pairs. The next resident section reaches decoder61 using a separately
 supplied encoder14 skip: both sizes pass 830 ViT/decoder stage checks and
 160 exact endpoint comparisons. Its captured-size combined interval is
 19.16–19.42 ms, excluding setup, all three input uploads and readbacks.
+The extension through decoder65 adds block62's transition and four C64
+blocks, with an external encoder8 skip. Both sizes pass 958 stage checks
+and 190 exact endpoint comparisons; the captured-size connected interval is
+22.09–23.12 ms, excluding setup, four input uploads and readbacks. The new
+139 captured prefix/body arrays also match the earlier full replay exactly.
 These remain component measurements. This is a standalone building block;
 the scene-preview path above still uses its existing diagnostic files.
 
