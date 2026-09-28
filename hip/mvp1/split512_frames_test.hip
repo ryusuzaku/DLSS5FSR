@@ -6,6 +6,7 @@
 #include "c256_resident.h"
 #include "c128_resident.h"
 #include "c64_resident.h"
+#include "c32_resident.h"
 #include <fstream>
 #include <cstring>
 
@@ -47,8 +48,8 @@ static bool input_unchanged(DeviceTensor view, const Buffer& snapshot) {
     return !memcmp(after.data(), before.data(), view.count*sizeof(float));
 }
 int main(int argc, char** argv) {
-    if (argc != 6 && argc != 8 && argc != 9 && argc != 11 && argc != 13 && argc != 15 && argc != 17) {
-        fputs("usage: split512_frames_test blocks width height frames output [head-fixture bridge-map [vit-blocks [decoder39-fixture decoder-blocks [prefix48-fixture c256-blocks [prefix56-fixture c128-blocks [prefix62-fixture c64-blocks]]]]]]\n", stderr);
+    if (argc != 6 && argc != 8 && argc != 9 && argc != 11 && argc != 13 && argc != 15 && argc != 17 && argc != 19 && argc != 20) {
+        fputs("usage: split512_frames_test blocks width height frames output [head-fixture bridge-map [vit-blocks [decoder39-fixture decoder-blocks [prefix48-fixture c256-blocks [prefix56-fixture c128-blocks [prefix62-fixture c64-blocks [prefix66-fixture c32-blocks [head70-fixture]]]]]]]]\n", stderr);
         return 2;
     }
     int width = atoi(argv[2]), height = atoi(argv[3]);
@@ -70,7 +71,7 @@ int main(int argc, char** argv) {
     }
     if (blocks.size() != 8 || frames.size() < 3) return 2;
     bool encoder = argc >= 8, with_vit = argc >= 9, with_decoder = argc >= 11,
-         with_c256 = argc >= 13, with_c128 = argc >= 15, with_c64 = argc == 17;
+         with_c256 = argc >= 13, with_c128 = argc >= 15, with_c64 = argc >= 17, with_c32 = argc >= 19, with_head70 = argc == 20;
     if (with_vit && width == 16) return 2; // No 32-token attention contract.
     size_t n = size_t(width)*height*512, hn = size_t(width)*height/4*1024;
     Chain chain(width, height, blocks, encoder ? argv[6] : "");
@@ -186,6 +187,39 @@ int main(int argc, char** argv) {
         c64_consumer.reset(new Buffer(8*n));
         if (prefix62->final_view().data || prefix62->low_view().data || c64->final_view().data) return 1;
     }
+    std::unique_ptr<c32_resident::Prefix> prefix66;
+    std::unique_ptr<c32_resident::Chain> c32;
+    std::unique_ptr<Buffer> skip4, low66_consumer, merge66_consumer, c32_consumer;
+    if (with_c32) {
+        std::ifstream file(argv[18]);
+        if (!file) return 2;
+        std::vector<std::pair<std::string,int>> blocks32;
+        while (std::getline(file,line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (line.size()<3 || line[1]!='\t' || line[0]<'0' || line[0]>'3' || blocks32.size()>=4) return 2;
+            blocks32.emplace_back(line.substr(2),line[0]-'0');
+        }
+        if (blocks32.size()!=4) return 2;
+        prefix66.reset(new c32_resident::Prefix(width*8,height*8,argv[17]));
+        c32.reset(new c32_resident::Chain(width*16,height*16,blocks32));
+        skip4.reset(new Buffer(16*n));
+        low66_consumer.reset(new Buffer(4*n));
+        merge66_consumer.reset(new Buffer(16*n));
+        c32_consumer.reset(new Buffer(16*n));
+        if (prefix66->final_view().data || prefix66->low_view().data || c32->final_view().data) return 1;
+    }
+    std::unique_ptr<c32_resident::Head> head70;
+    std::unique_ptr<Buffer> skip0,color,merged70_consumer,peer70_consumer,body70_consumer,
+                            native70_consumer,rgb_native_consumer,rgb_public_consumer;
+    if(with_head70){
+        head70.reset(new c32_resident::Head(width*32,height*32,argv[19]));
+        skip0.reset(new Buffer(64*n));color.reset(new Buffer(6*n));
+        merged70_consumer.reset(new Buffer(64*n));peer70_consumer.reset(new Buffer(64*n));
+        body70_consumer.reset(new Buffer(64*n));native70_consumer.reset(new Buffer(64*n));
+        rgb_native_consumer.reset(new Buffer(6*n));rgb_public_consumer.reset(new Buffer(6*n));
+        if(head70->final_view().data||head70->public_view().data||head70->merged_view().data||
+           head70->peer_view().data||head70->body_view().data||head70->native_view().data)return 1;
+    }
     if (chain.final_view().data || chain.raw_view().data || chain.head_view().data) return 1;
     HIP_CHECK(hipDeviceSynchronize());
     Traffic setup = traffic;
@@ -261,6 +295,29 @@ int main(int argc, char** argv) {
                     c64->run_from_device({merge62_consumer->data,8*n-1}) || c64->final_view().data) return 1;
                 rejected += 2;
             }
+            if (prefix66) {
+                DeviceTensor main{c64_consumer->data,8*n}, skip{skip4->data,16*n};
+                auto reject = [&](DeviceTensor a, DeviceTensor b) {
+                    return !prefix66->run_from_device(a,b) && !prefix66->final_view().data && !prefix66->low_view().data;
+                };
+                if (!reject({nullptr,8*n},skip) || !reject({main.data,8*n-1},skip) ||
+                    !reject(main,{nullptr,16*n}) || !reject(main,{skip.data,16*n-1})) return 1;
+                rejected += 4;
+                if (c32->run_from_device({nullptr,16*n}) || c32->final_view().data ||
+                    c32->run_from_device({merge66_consumer->data,16*n-1}) || c32->final_view().data) return 1;
+                rejected += 2;
+            }
+            if(head70){
+                DeviceTensor main{c32_consumer->data,16*n},skip{skip0->data,64*n},rgb{color->data,6*n};
+                auto reject=[&](DeviceTensor a,DeviceTensor b,DeviceTensor c){
+                    return !head70->run_from_device(a,b,c)&&!head70->final_view().data&&!head70->public_view().data&&
+                      !head70->merged_view().data&&!head70->peer_view().data&&!head70->body_view().data&&!head70->native_view().data;
+                };
+                if(!reject({nullptr,16*n},skip,rgb)||!reject({main.data,16*n-1},skip,rgb)||
+                   !reject(main,{nullptr,64*n},rgb)||!reject(main,{skip.data,64*n-1},rgb)||
+                   !reject(main,skip,{nullptr,6*n})||!reject(main,skip,{rgb.data,6*n-1}))return 1;
+                rejected+=6;
+            }
             if (traffic.allocations != before.allocations || traffic.h2d_bytes != before.h2d_bytes ||
                 traffic.d2h_bytes != before.d2h_bytes || traffic.d2d_bytes != before.d2d_bytes) return 1;
         }
@@ -293,6 +350,23 @@ int main(int argc, char** argv) {
             traffic.h2d_bytes += 8*n*sizeof(float);
             frame_upload_bytes += 8*n*sizeof(float);
         }
+        std::vector<float> skip4_input;
+        if (skip4) {
+            skip4_input = read(frames[index],"skip4",16*n);
+            for (float value:skip4_input) if (!std::isfinite(value)) return 2;
+            HIP_CHECK(hipMemcpy(skip4->data,skip4_input.data(),16*n*sizeof(float),hipMemcpyHostToDevice));
+            traffic.h2d_bytes += 16*n*sizeof(float);
+            frame_upload_bytes += 16*n*sizeof(float);
+        }
+        std::vector<float> skip0_input,color_input;
+        if(head70){
+            skip0_input=read(frames[index],"skip0",64*n);color_input=read(frames[index],"color",6*n);
+            for(float v:skip0_input)if(!std::isfinite(v))return 2;
+            for(float v:color_input)if(!std::isfinite(v))return 2;
+            HIP_CHECK(hipMemcpy(skip0->data,skip0_input.data(),64*n*sizeof(float),hipMemcpyHostToDevice));
+            HIP_CHECK(hipMemcpy(color->data,color_input.data(),6*n*sizeof(float),hipMemcpyHostToDevice));
+            traffic.h2d_bytes+=70*n*sizeof(float);frame_upload_bytes+=70*n*sizeof(float);
+        }
         // Check every ViT stage on the actual GPU-produced first-frame bridge.
         // Diagnostic readbacks are outside all measured execution regions.
         if (vit && index == 0) {
@@ -315,6 +389,11 @@ int main(int argc, char** argv) {
             if (prefix62 && (!prefix62->run_from_device(c128->final_view(),{skip8->data,8*n},true) ||
                              prefix62->comparisons != 4 || !c64->run_from_device(prefix62->final_view(),true) ||
                              c64->comparisons != 60)) return 1;
+            if (prefix66 && (!prefix66->run_from_device(c64->final_view(),{skip4->data,16*n},true) ||
+                             prefix66->comparisons != 4 || !c32->run_from_device(prefix66->final_view(),true) ||
+                             c32->comparisons != 60)) return 1;
+            if(head70&&(!head70->run_from_device(c32->final_view(),{skip0->data,64*n},{color->data,6*n},true)||
+                         head70->comparisons!=20))return 1;
         }
         Traffic before = traffic;
         HIP_CHECK(hipEventRecord(start));
@@ -364,6 +443,19 @@ int main(int argc, char** argv) {
             consume(prefix62->final_view(),*merge62_consumer);
             consume(c64->final_view(),*c64_consumer);
         }
+        if (prefix66) {
+            if (!prefix66->run_from_device(c64->final_view(),{skip4->data,16*n}) ||
+                !c32->run_from_device(prefix66->final_view())) return 1;
+            consume(prefix66->low_view(),*low66_consumer);
+            consume(prefix66->final_view(),*merge66_consumer);
+            consume(c32->final_view(),*c32_consumer);
+        }
+        if(head70){
+            if(!head70->run_from_device(c32->final_view(),{skip0->data,64*n},{color->data,6*n}))return 1;
+            consume(head70->merged_view(),*merged70_consumer);consume(head70->peer_view(),*peer70_consumer);
+            consume(head70->body_view(),*body70_consumer);consume(head70->native_view(),*native70_consumer);
+            consume(head70->final_view(),*rgb_native_consumer);consume(head70->public_view(),*rgb_public_consumer);
+        }
         HIP_CHECK(hipEventRecord(stop)); HIP_CHECK(hipEventSynchronize(stop));
         float elapsed = 0;
         HIP_CHECK(hipEventElapsedTime(&elapsed, start, stop));
@@ -374,10 +466,12 @@ int main(int argc, char** argv) {
             (entry && (entry->comparisons != 5 || decoder->comparisons != 112)) ||
             (prefix48 && (prefix48->comparisons != 4 || c256->comparisons != 120)) ||
             (prefix56 && (prefix56->comparisons != 4 || c128->comparisons != 90)) ||
-            (prefix62 && (prefix62->comparisons != 4 || c64->comparisons != 60))) return 1;
+            (prefix62 && (prefix62->comparisons != 4 || c64->comparisons != 60)) ||
+            (prefix66 && (prefix66->comparisons != 4 || c32->comparisons != 60)) || (head70 && head70->comparisons!=20)) return 1;
         size_t expected_d2d = (3*n + (encoder ? hn : 0) + (vit ? 2*hn : 0) +
                                (entry ? 4*n + hn + hn/2 : 0) + (prefix48 ? 6*n+n/2 : 0) +
-                               (prefix56 ? 13*n : 0) + (prefix62 ? 26*n : 0))*sizeof(float);
+                               (prefix56 ? 13*n : 0) + (prefix62 ? 26*n : 0) +
+                               (prefix66 ? 52*n : 0) + (head70 ? 268*n : 0))*sizeof(float);
         if (traffic.d2d_bytes-before.d2d_bytes != expected_d2d) return 1;
         compute_d2d += expected_d2d;
         std::string output = std::string(argv[5]) + "/frame_" + std::to_string(index);
@@ -423,6 +517,30 @@ int main(int argc, char** argv) {
             traffic.d2h_bytes += 8*n*sizeof(float);
             if (memcmp(after.data(),skip8_input.data(),8*n*sizeof(float))) return 1;
         }
+        if (prefix66) {
+            if (!check_save(frames[index],output,"low66",*low66_consumer) ||
+                !check_save(frames[index],output,"merge66",*merge66_consumer) ||
+                !check_save(frames[index],output,"decoder69",*c32_consumer) ||
+                !input_unchanged(c64->final_view(),*c64_consumer)) return 1;
+            std::vector<float> after(16*n);
+            HIP_CHECK(hipMemcpy(after.data(),skip4->data,16*n*sizeof(float),hipMemcpyDeviceToHost));
+            traffic.d2h_bytes += 16*n*sizeof(float);
+            if (memcmp(after.data(),skip4_input.data(),16*n*sizeof(float))) return 1;
+        }
+        if(head70){
+            if(!check_save(frames[index],output,"merged70",*merged70_consumer)||
+               !check_save(frames[index],output,"peer70",*peer70_consumer)||
+               !check_save(frames[index],output,"body70",*body70_consumer)||
+               !check_save(frames[index],output,"native70",*native70_consumer)||
+               !check_save(frames[index],output,"rgb_native",*rgb_native_consumer)||
+               !check_save(frames[index],output,"rgb_public",*rgb_public_consumer)||
+               !input_unchanged(c32->final_view(),*c32_consumer))return 1;
+            std::vector<float> after(64*n),rgb(6*n);
+            HIP_CHECK(hipMemcpy(after.data(),skip0->data,64*n*sizeof(float),hipMemcpyDeviceToHost));
+            HIP_CHECK(hipMemcpy(rgb.data(),color->data,6*n*sizeof(float),hipMemcpyDeviceToHost));
+            traffic.d2h_bytes+=70*n*sizeof(float);
+            if(memcmp(after.data(),skip0_input.data(),64*n*sizeof(float))||memcmp(rgb.data(),color_input.data(),6*n*sizeof(float)))return 1;
+        }
         // A borrowed input must not be overwritten by chain or consumer work.
         std::vector<float> unchanged(n);
         HIP_CHECK(hipMemcpy(unchanged.data(), incoming.data, n*sizeof(float), hipMemcpyDeviceToHost));
@@ -443,13 +561,17 @@ int main(int argc, char** argv) {
         "\"decoder39_stage_comparisons\":%zu,\"decoder_stage_comparisons\":%zu,"
         "\"resident_c256\":%s,\"prefix48_stage_comparisons\":%zu,\"c256_stage_comparisons\":%zu,"
         "\"resident_c128\":%s,\"prefix56_stage_comparisons\":%zu,\"c128_stage_comparisons\":%zu,"
-        "\"resident_c64\":%s,\"prefix62_stage_comparisons\":%zu,\"c64_stage_comparisons\":%zu,\"frame_ms\":[",
+        "\"resident_c64\":%s,\"prefix62_stage_comparisons\":%zu,\"c64_stage_comparisons\":%zu,"
+        "\"resident_c32\":%s,\"prefix66_stage_comparisons\":%zu,\"c32_stage_comparisons\":%zu,"
+        "\"resident_head70\":%s,\"head70_stage_comparisons\":%zu,\"frame_ms\":[",
         frames.size(), rejected, frame_upload_bytes, compute_d2d, encoder ? "true" : "false",
         vit ? "true" : "false", vit ? vit->comparisons : size_t(0), entry ? "true" : "false",
         entry ? entry->comparisons : size_t(0), decoder ? decoder->comparisons : size_t(0),
         c256 ? "true" : "false", prefix48 ? prefix48->comparisons : size_t(0), c256 ? c256->comparisons : size_t(0),
         c128 ? "true" : "false", prefix56 ? prefix56->comparisons : size_t(0), c128 ? c128->comparisons : size_t(0),
-        c64 ? "true" : "false", prefix62 ? prefix62->comparisons : size_t(0), c64 ? c64->comparisons : size_t(0)) > 0;
+        c64 ? "true" : "false", prefix62 ? prefix62->comparisons : size_t(0), c64 ? c64->comparisons : size_t(0),
+        c32 ? "true" : "false", prefix66 ? prefix66->comparisons : size_t(0), c32 ? c32->comparisons : size_t(0),
+        head70 ? "true" : "false", head70 ? head70->comparisons : size_t(0)) > 0;
     for (size_t i = 0; i < frame_ms.size(); ++i)
         ok = (fprintf(f, "%s%.6f", i ? "," : "", frame_ms[i]) > 0) && ok;
     ok = (fprintf(f, "]}\n") > 0) && ok;

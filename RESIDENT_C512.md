@@ -438,3 +438,74 @@ preview still runs its existing diagnostic path.
 Next are block66's transition, C32 decoder66–69 and head70. Upstream encoder
 and skip residency, candidate-contract validation and game integration
 remain necessary for a complete live path.
+
+## Resident C32 decoder66–69 and head70
+
+`c32_resident::Prefix`, `Chain` and `Head` extend the prepared GPU path from
+decoder65 through enhanced RGB. Block66 consumes a separate block4 skip,
+then four C32 bodies run with shifts `0, 3, 1, 2`. Their gather/scatter passes
+use the existing audited transition basis and public QMMA candidate weights.
+The head consumes decoder69's device output, a preblock0 skip and input RGB.
+It merges directly into window order, runs the C32 body, converts its raw
+half-rounded output back to the native channel basis, and computes both
+native-gain (0.03125) and public-gain (1.0) enhanced RGB. The finish pass uses
+the raw body output, before FP8 quantization.
+
+All weights and GPU workspace remain allocated between submissions. The
+new head body shares the same arithmetic kernels as the standalone checks;
+the C32 transition and outer head passes also keep their existing kernels.
+The checker uses sequential float32 projection sums with 32-product half
+boundaries and independent scalar head traces. Bounded standalone body
+chunks are assembled in window order for the resident stage checks.
+
+```powershell
+& $py tools\check_resident_head70.py 'C:\path\to\resident-through-decoder65' `
+  --captured-candidate 'C:\path\to\captured-frame\candidate' `
+  --output-root 'C:\path\to\resident-through-head70'
+```
+
+Rebuild using `tools/build_split512_resident.sh`. Keep the decoder65 report,
+references, `native_command.json` and its ancestor fixtures available. The
+checker verifies saved endpoints and inputs, redecodes C64/prefix62 weights,
+and checks the capture provenance of the new skips and RGB. For the larger
+decoder65 source, replace `--captured-candidate ...` with `--synthetic-skip`.
+The prepared invocation is saved again for subsequent replay.
+
+Captured A uses the same-frame public ONNX block4 skip rounded to FP8, the
+public preblock0 skip, and prepared linear RGB. These two skip producers
+remain outside the resident chain. B rolls block4 by 16 columns and
+preblock0/RGB by 32 columns; zero supplies zeros. They are synthetic pairs,
+not recomputed upstream results. The larger case uses seed 6670, Gaussian
+skips with standard deviation 0.03125 (FP8 block4, FP16 preblock0), and
+uniform RGB. The harness uploads seven input arrays before each measurement:
+the initial C512 tensor, five skips and RGB.
+
+The connected candidate now has 563 ViT-through-head stage checks and 28
+byte-exact endpoints per submission. Null/wrong-size checks include all
+three head inputs and clear every exposed head view before valid-input
+recovery. Separate diagnostics corrupt the block4 skip, block67 handoff,
+preblock0 skip and RGB expectations. Borrowed decoder outputs and all
+supplied inputs must remain unchanged.
+
+| C512 input / enhanced RGB grid | ViT-through-head stage checks | Exact output arrays | Combined device interval |
+|---|---:|---:|---:|
+| 8×8×512 / 256×256×3 | 563 | 140 | 34.02–46.61 ms |
+| 32×8×512 / 1024×256×3 | 563 | 140 | 112.83–135.20 ms |
+
+Both cases run A/B/zero/B/A with three distinct decoder69 and native-gain
+RGB outputs. The captured case matches all 369 saved C32/head arrays from
+the earlier full replay, including the head's body chunks and both gains.
+All 80 invalid-view controls and eight altered-expectation diagnostics pass
+across both sizes. Regression runs retain 345 exact endpoints across the
+seven older modes; the new decoder69-only mode adds 110 exact endpoints.
+The interval covers encoder23–30, ViT31–38, decoder39–69 and head70, plus
+the harness's device copies and both RGB gain calculations. It has zero
+explicit GPU buffer allocations and zero host transfers. Setup, seven
+input uploads and validation readbacks remain outside the interval; these
+measurements are not full-model or in-game frame times.
+
+These are still prepared component checks. Original C32 body maps, the
+earlier logical-map assumptions and native input/output contracts remain
+unverified. Enhanced RGB here precedes the preview's final blend; neither
+the preview nor game DLL uses this resident runner yet. Upstream encoder
+and skip residency, full-path performance work and live integration remain.

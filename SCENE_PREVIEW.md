@@ -239,6 +239,13 @@ blocks, with an external encoder8 skip. Both sizes pass 958 stage checks
 and 190 exact endpoint comparisons; the captured-size connected interval is
 22.09–23.12 ms, excluding setup, four input uploads and readbacks. The new
 139 captured prefix/body arrays also match the earlier full replay exactly.
+The resident extension now continues through C32 decoder66–69 and head70's
+enhanced RGB, accepting external public block4/preblock0 skips and RGB.
+Both sizes pass 1,126 stage checks and 280 exact endpoint comparisons.
+The captured output matches all 369 saved C32/head arrays, including both
+gain settings. Its connected 256×256 component interval is 34.02–46.61 ms,
+excluding setup, seven input uploads and readbacks. This ends before the
+preview's final blend and still needs upstream encoder/skip residency.
 These remain component measurements. This is a standalone building block;
 the scene-preview path above still uses its existing diagnostic files.
 
