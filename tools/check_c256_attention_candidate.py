@@ -16,10 +16,10 @@ import numpy as np
 ROOT=Path(__file__).resolve().parents[1]
 UPSTREAM=ROOT/'ref/dlss5-port/Development'
 sys.path.insert(0,str(UPSTREAM))
-from native_c64_reference import multiply,normalize,denominator
+from native_c64_reference import normalize,denominator
 from native_c32_reference import F,H
 from decode_tinlayout_global import e4m3fn
-from check_c256_ffn_candidate import bits
+from check_c256_ffn_candidate import bits,multiply
 from audit_c256_residual_ptx import run as audit_residual_ptx
 
 

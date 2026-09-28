@@ -565,3 +565,66 @@ harness modes retain 595 exact endpoints. These are still prepared component
 checks, not full-model or in-game frame times. Original C256 logical maps
 remain unverified. Encoder5–14 and their skips, the public block4/preblock0
 producers, the preview and the game DLL are not connected yet.
+
+## Resident encoder5–14 and the block8/block14 downsamples
+
+`c128_resident` and `c64_resident` now have the same encoder mode and
+`Downsample` class. Encoder9–14 run with shifts `0, 3, 1, 2, 0, 3`, and
+encoder5–8 with `0, 3, 1, 2`. Blocks 14 and 8 keep their unquantized
+projection for the pool, and each downsample feeds the next C256 or C128
+chain directly. Two more argument pairs select these fronts. The 24-argument
+mode uploads the C128 boundary8 tensor and produces skip14 on the device.
+The 26-argument mode uploads the C64 boundary4 tensor and also produces
+skip8. Each skip stays borrowed until its decoder prefix consumes it in the
+same frame.
+
+```powershell
+& $py tools\check_resident_encoder22.py --first-block 5 `
+  --captured-candidate 'C:\path\to\captured-frame\candidate' `
+  --output-root 'C:\path\to\resident-encoder8'
+& $py tools\check_resident_encoder22.py --first-block 5 --synthetic --output-root 'C:\path\to\resident-encoder8-32x8'
+```
+
+`--first-block 9` stops at the C128 front; the default of 15 keeps the
+previous behavior. The checker builds independent references for every
+selected encoder stage and each of A, B and zero. It then regenerates the
+downstream cascade, declaring the C512 inputs and the skip22, skip14 and
+skip8 arrays. Finally it runs every front mode in turn (22, 24 and 26
+arguments) on the same frames. Captured A starts from the saved candidate
+block4 boundary. Its block8/14/22 skip, raw output, downsample matrix and
+output match the canonical candidate byte for byte at every stage. Captured
+A and zero reproduce the earlier head70 endpoints, including skip14 and
+skip8. B rolls the upload eight C64 columns. The larger case uses seed 805
+and standard deviation 7.0665, the captured boundary4 value. Skip4, skip0
+and RGB remain external.
+
+| Front | Upload per frame | Stage checks | Exact arrays | 8×8 interval | 32×8 interval |
+|---|---|---:|---:|---:|---:|
+| encoder15 | C256, skips 14/8/4/0, RGB (100·n) | 688 | 160 | 37.58–39.72 ms | 132.49–141.64 ms |
+| encoder9 | C128, skips 8/4/0, RGB (98·n) | 783 | 180 | 41.16–44.09 ms | 147.70–157.04 ms |
+| encoder5 | C64, skips 4/0, RGB (94·n) | 848 | 200 | 45.77–48.15 ms | 161.03–172.14 ms |
+
+The encoder5 mode adds 62 + 3 and the encoder9 mode 92 + 3 first-frame stage
+checks. Each adds four exact endpoints per submission (skip, raw, pool and
+downsampled output) and four invalid-view controls. Nine altered-expectation
+diagnostics per case corrupt the second block's handoff, the last block's
+raw output and the pool expectations of every stage. All were rejected
+before any output was written. The nine older harness modes still reproduce
+all 595 saved endpoints. The interval now covers encoder5–30, ViT31–38,
+decoder39–69 and head70. It has zero explicit GPU buffer allocations and
+zero host transfers. These are still component timings, not full-model or
+in-game frame times.
+
+The larger synthetic inputs exposed rare half-rounding ties between NumPy
+matmul and the kernels' sequential non-FMA float32 sums. There was one value
+in a C64 QKV, one in a C512 pre-projection, and a few in a C32 body. The
+C64/C128/C256 FFN and attention references, the C512 block reference and
+the C32 body trace now accumulate in kernel order. The C32 trace still
+checks the upstream matmul oracle, allowing only rare differences of up to
+four half steps from such ties. The captured case, regenerated with these
+references, still reproduces the earlier A and zero endpoints byte for
+byte. Older fixtures were not regenerated; their replays are unchanged.
+
+The public block4/preblock0 producers, the preview and the game DLL remain
+unconnected. Original C64/C128/C256 logical maps are still candidate
+assumptions.

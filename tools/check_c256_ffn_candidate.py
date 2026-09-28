@@ -15,9 +15,22 @@ import numpy as np
 ROOT=Path(__file__).resolve().parents[1]
 UPSTREAM=ROOT/'ref/dlss5-port/Development'
 sys.path.insert(0,str(UPSTREAM))
-from native_c64_reference import multiply
 from native_c32_reference import F,H
 from decode_tinlayout_global import e4m3fn
+
+
+def multiply(a,m,initial=None):
+    """Kernel-order product: sequential non-FMA float32 sums of 32 products,
+    each part added and half-rounded. NumPy matmul can differ at half ties."""
+    a=np.asarray(a,np.float32);m=np.asarray(m,np.float32)
+    result=(np.zeros((*a.shape[:-1],m.shape[0]),np.float32) if initial is None else
+            np.array(initial,np.float32))
+    for offset in range(0,m.shape[1],32):
+        part=np.zeros_like(result)
+        for col in range(offset,min(offset+32,m.shape[1])):
+            part+=a[...,col,None]*m[:,col]
+        result=H(result+part)
+    return result
 
 
 def bits(count,positions):

@@ -15,31 +15,53 @@ import head70_weights as HW
 import head70_shipped_body as S
 
 
+def _dot(a, w):
+    """Kernel-order float32 dot products: products added sequentially, no FMA."""
+    total=np.zeros((*a.shape[:-1],w.shape[0]),np.float32)
+    for k in range(a.shape[-1]):
+        total+=a[...,k,None]*w[:,k]
+    return total
+
+
 def trace(tiles, weights):
     w1,w2,qw,kw,vw,pw,bias,scale,fs,ats = weights
     H,F=N.H,N.F
-    expanded=H(F(tiles)@w1.T)
+    expanded=H(_dot(F(tiles),w1))
     gate=np.clip(expanded,-4,4)
     poly=H(gate*H(np.abs(gate)*np.float32(-.055908203125)+np.float32(.447265625))+np.float32(.89453125))
     hidden=F(H(expanded*poly))
     feature=H(tiles*fs)
     for k in range(0,128,32):
-        feature=H(feature+hidden[...,k:k+32]@w2[:,k:k+32].T)
-    q,k,v=[H(F(feature)@m.T) for m in (qw,kw,vw)]
+        feature=H(feature+_dot(hidden[...,k:k+32],w2[:,k:k+32]))
+    q,k,v=[H(_dot(F(feature),m)) for m in (qw,kw,vw)]
     qkv=np.concatenate((q,k,v),axis=-1)
     q=F(H(N.normalize(q)*H(scale))); k=F(N.normalize(k)); v=F(v)
     norm=np.concatenate((q,k,v),axis=-1)
-    scores=H(q@k.transpose(0,2,1)+bias)
+    dots=np.zeros((*q.shape[:-1],k.shape[-2]),np.float32)
+    for c in range(q.shape[-1]):
+        dots+=q[...,:,c,None]*k[...,None,:,c]
+    scores=H(dots+bias)
     bits=np.clip(H(scores*np.float32(.044921875)+np.float32(1.30078125)),1.03125,1.5693359375).astype(np.float16).view(np.uint16).astype(np.uint32)
     ex=(((bits<<5)+0x8000)&65535).astype(np.uint16).view(np.float16).astype(np.float32)
     den=N.denominator(ex)
     prob=F(H(ex*H(1/den)))
     av=np.zeros_like(tiles)
-    for k in (0,32): av=H(av+prob[:,:,k:k+32]@v[:,k:k+32])
-    projection=F(av)@pw.T
+    for k in (0,32):
+        part=np.zeros_like(av)
+        for j in range(k,k+32):
+            part+=prob[...,:,j,None]*v[...,None,j,:]
+        av=H(av+part)
+    projection=_dot(F(av),pw)
     body=H(projection.astype(np.float64)+H(feature*ats).astype(np.float64))
-    # Do not silently evolve the trace into a different oracle.
-    np.testing.assert_array_equal(body,N.block(tiles,weights,raw_output=True))
+    # Do not silently evolve the trace into a different oracle. The upstream
+    # block uses matmul, which may round differently only at rare half ties;
+    # a tie in the FFN or QKV can move a few body values by a few half steps.
+    oracle=N.block(tiles,weights,raw_output=True)
+    differ=body!=oracle
+    if differ.any():
+        ulp=np.spacing(np.abs(oracle[differ]).astype(np.float16)).astype(np.float32)
+        if differ.sum()>max(4,body.size//100000) or (np.abs(body[differ]-oracle[differ])>4*ulp).any():
+            raise AssertionError('C32 kernel-order trace departs from upstream oracle beyond half ties')
     return dict(expanded=expanded,hidden=hidden,ffn=feature,qkv=qkv,qknorm=norm,
                 scores=scores,exp=ex,den=den,prob=prob,context=av,body=body)
 

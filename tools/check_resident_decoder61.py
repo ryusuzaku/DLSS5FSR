@@ -19,7 +19,8 @@ SHIFTS = (0, 2, 0, 3, 1, 2)
 NAMES = (*OLD_NAMES, 'low56', 'merge56', 'decoder61')
 
 
-def run(source, upstream, output, captured_candidate=None, synthetic_skip=False, head_fixture=None):
+def run(source, upstream, output, captured_candidate=None, synthetic_skip=False, head_fixture=None,
+        skips=None, skips_provenance=None):
     source, upstream, output = (Path(p).resolve() for p in (source, upstream, output))
     for p in (source,upstream):
         if p==output or p in output.parents or output in p.parents:raise ValueError('use separate input/output directories')
@@ -106,7 +107,16 @@ def run(source, upstream, output, captured_candidate=None, synthetic_skip=False,
     else:
         skip_a=F(np.random.default_rng(5601).normal(0,.03125,(32,width*4,128)).astype(np.float32))
         provenance=dict(kind='synthetic FP8 Gaussian skip; seed5601, sigma0.03125')
-    skips=dict(a=skip_a,b=np.roll(skip_a,4,axis=1).copy(),zero=np.zeros_like(skip_a))
+    paired='B rolls skip14 four columns; zero has zero skip; synthetic pairs, not full upstream executions'
+    if skips is None:
+        skips=dict(a=skip_a,b=np.roll(skip_a,4,axis=1).copy(),zero=np.zeros_like(skip_a))
+    else:
+        # Same-frame encoder14 outputs; a captured A must still equal the capture.
+        if set(skips)!={'a','b','zero'} or not skips_provenance:raise ValueError('declared skips need a/b/zero and provenance')
+        skips={k:np.asarray(v,np.float32).reshape(32,width*4,128) for k,v in skips.items()}
+        if captured_candidate and skips['a'].tobytes()!=skip_a.tobytes():raise ValueError('declared skip A differs from capture')
+        provenance=dict(provenance,declared=skips_provenance)
+        paired='A/B/zero skips are same-frame encoder14 outputs of their declared C128 inputs'
     raw_path=ROOT/'dlss5-analysis/tensors'/f"tensor_{records['block56.layer0.layer']['index']:03d}.bin"
     raw=np.fromfile(raw_path,np.uint8)
     if raw.size!=230176:raise ValueError('wrong block56 tensor extent')
@@ -188,7 +198,7 @@ def run(source, upstream, output, captured_candidate=None, synthetic_skip=False,
         controls.append('altered block57 input rejected before publishing outputs')
     report=dict(extent=[width,8,512],output_extent=[width*4,32,128],sequence=sequence,metrics=m,exact_outputs=exact,
         source_report_sha256=digest(source/'report.json'),upstream_report_sha256=digest(upstream/'report.json'),
-        skip_provenance=provenance,paired_controls='B rolls skip14 four columns; zero has zero skip; synthetic pairs, not full upstream executions',
+        skip_provenance=provenance,paired_controls=paired,
         prefix_tensor_sha256=digest(raw_path),c128_references=refs,negative_controls=controls,original_kernel_executed=False,production_wiring=False,
         c128_map_status='measured FFN/matrix/bias rules; candidate attention residual order')
     (output/'report.json').write_text(json.dumps(report,indent=2)+'\n')

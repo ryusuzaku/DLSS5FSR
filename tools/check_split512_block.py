@@ -11,6 +11,10 @@ import numpy as np
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/'ref/dlss5-port/Development'))
 import native_split_reference as R
+from check_c256_ffn_candidate import multiply as kernel_order_multiply
+# The upstream per-part matmul can differ from the kernels' sequential non-FMA
+# float32 sums at half-rounding ties; keep the reference in kernel order.
+R.multiply = kernel_order_multiply
 from decode_tinlayout_global import e4m3fn
 
 
@@ -115,7 +119,7 @@ def run(decoder=False):
                   'projection_tensor':proj_record['index'],'projection_sha256':hashlib.sha256(proj_raw).hexdigest(),
                   'attention_tensor':attention_record['index'],'attention_sha256':hashlib.sha256(attention_raw).hexdigest(),
                   'final_tensor':final_record['index'],'final_sha256':hashlib.sha256(final_record_bytes).hexdigest(),
-                  'oracle':'unchanged native_split_reference and native_c64_reference.multiply',
+                  'oracle':'native_split_reference with kernel-order sequential multiply',
                   'tokens':len(x),'windows':windows,'comparison':'exact numeric equality',
                   'files':{p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in folder.glob('*.f32')}}
         (folder/'manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')

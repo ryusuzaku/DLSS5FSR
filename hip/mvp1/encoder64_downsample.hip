@@ -1,3 +1,4 @@
+#pragma once
 // Candidate block8 raw body -> 2x2 pool -> measured C64-to-C128 projection.
 #include "split512_block.hip"
 
