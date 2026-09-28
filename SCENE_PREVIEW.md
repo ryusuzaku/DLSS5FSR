@@ -225,7 +225,12 @@ are not whole-model frame times. A further resident extension connects the
 inverse bridge and decoder39, using the same-frame encoder30 skip, through
 decoder40–47. Both tested sizes pass 394 ViT/decoder stage checks and 100
 byte-exact output comparisons with no host transfers during measured
-execution. This is a standalone building block;
+execution. The resident path now also reaches decoder55 through block48's
+transition and eight C256 blocks. It accepts a separately supplied encoder22
+skip and passes 642 ViT/decoder stage checks and 130 endpoint comparisons
+across captured-size and larger synthetic controls. The captured A input
+uses its same-frame skip; shifted/zero runs use explicitly synthetic skip
+pairs. This is a standalone building block;
 the scene-preview path above still uses its existing diagnostic files.
 
 To process an already saved capture without a game, pass `--existing-capture
