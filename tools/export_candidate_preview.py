@@ -18,6 +18,34 @@ def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
+def srgb8(linear):
+    """The candidate PNG encoding: clip, sRGB transfer, round to 8 bits."""
+    v = np.clip(linear, 0, 1)
+    srgb = np.where(v <= .0031308, 12.92*v, 1.055*np.power(v, 1/2.4)-.055)
+    return np.rint(srgb*255).astype(np.uint8)
+
+
+def write_payload(rgb, output):
+    """Atomically write the shim's D5PREV01 RGBA8 + RGBA16F preview payload."""
+    rgb = np.asarray(rgb)
+    if rgb.shape != (256, 256, 3) or rgb.dtype != np.uint8:
+        raise ValueError('expected a 256x256 RGB8 candidate preview')
+    rgba8 = np.empty((256, 256, 4), dtype=np.uint8)
+    rgba8[..., :3] = rgb
+    rgba8[..., 3] = 255
+    rgba16 = (rgba8.astype(np.float32) / np.float32(255)).astype('<f2')
+    rgba16[..., 3] = np.float16(1)
+    payload = b'D5PREV01' + struct.pack('<II', 256, 256) + rgba8.tobytes() + rgba16.tobytes()
+    if len(payload) != 16 + 256 * 256 * (4 + 8):
+        raise AssertionError('preview payload extent differs')
+    output = Path(output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temp = output.with_name(output.name + '.tmp')
+    temp.write_bytes(payload)
+    temp.replace(output)
+    return digest(output)
+
+
 def run(frame_dir, connected_dir, output, gain='public_gain'):
     frame_dir = Path(frame_dir).resolve()
     connected_dir = Path(connected_dir).resolve()
@@ -38,20 +66,7 @@ def run(frame_dir, connected_dir, output, gain='public_gain'):
             frame['image_sha256'][image_key] != digest(frame_path)):
         raise ValueError('candidate frame/GPU provenance differs')
     rgb = np.asarray(Image.open(frame_path).convert('RGB'))
-    if rgb.shape != (256, 256, 3):
-        raise ValueError('expected a 256x256 RGB candidate preview')
-    rgba8 = np.empty((256, 256, 4), dtype=np.uint8)
-    rgba8[..., :3] = rgb
-    rgba8[..., 3] = 255
-    rgba16 = (rgba8.astype(np.float32) / np.float32(255)).astype('<f2')
-    rgba16[..., 3] = np.float16(1)
-    payload = b'D5PREV01' + struct.pack('<II', 256, 256) + rgba8.tobytes() + rgba16.tobytes()
-    if len(payload) != 16 + 256 * 256 * (4 + 8):
-        raise AssertionError('preview payload extent differs')
-    output.parent.mkdir(parents=True, exist_ok=True)
-    temp = output.with_name(output.name + '.tmp')
-    temp.write_bytes(payload)
-    temp.replace(output)
+    write_payload(rgb, output)
     report = dict(preview_path=str(output), preview_sha256=digest(output),
                   source_frame_manifest_sha256=digest(frame_dir / 'manifest.json'),
                   source_connected_manifest_sha256=digest(connected_dir / 'manifest.json'),

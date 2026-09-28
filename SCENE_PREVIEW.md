@@ -260,3 +260,46 @@ The preview is intentionally a square at 256×256 candidate resolution. The
 game's HUD may be drawn over it. Its age is visible in `status.json`; it is
 not temporally aligned to current gameplay and should not be used for
 quality or performance claims about a real-time port.
+
+## Resident engine
+
+`--engine resident` replaces the offline scalar-checked stages with one
+persistent GPU process, `build/resident_frame_server.exe` (built by
+`tools/build_split512_resident.sh`). It loads all weights once, then runs
+encoder5–30, ViT31–38, decoder39–69 and head70 for every capture, with
+device-only handoffs. Its only external inputs come from a small extracted
+public ONNX branch: the block4 downsample, the block4 skip and the
+preblock0 skip. They get the same FP8 rounding and channel maps as the
+offline stages. The sidecar keeps that ONNX session open too. The preview is
+encoded exactly as the offline PNG path (clip, sRGB, 8-bit rounding).
+
+```powershell
+& $py tools\run_candidate_scene_preview.py --engine resident `
+  --gpu-input-path 'C:\path\to\scene_preview\game_input_gpu.f32' `
+  --preview-gain native_gain
+```
+
+The other arguments and the shim INI keys are unchanged. `--resident-command`
+selects the weight fixtures. It defaults to the validated 256×256 run at
+`build/resident_encoder8_check/captured/mode5/native_command.json`; that
+tree must stay in place. On startup the engine checks the source report and
+replays that run's frame A, which must reproduce both RGB gains byte for
+byte before any capture is armed. `tools/check_resident_frame_server.py`
+replays all five changing frames of a validated run through one server, and
+also checks rejection of a truncated request and recovery afterwards.
+
+On the saved storefront capture with its paired GPU tensor, the resident
+sidecar wrote the same `native_gain` preview, byte for byte, as the offline
+pipeline run on that capture. Per update, the public inputs took 0.33 s and
+the resident server 0.08 s (49 ms device interval), versus about 88 s for
+the offline stages. A three-update loop against a simulated trigger
+protocol took 5.9 s including engine startup. The NGX harness also ran the
+built shim through capture, the GPU input tensor, a resident preview and
+its upload, with exact readback. None of this has run in the game yet.
+
+The resident engine skips the per-frame scalar comparisons. Its arithmetic
+is the resident path checked by `check_resident_encoder22.py`. The same
+model assumptions apply: public block0–4 producers, candidate
+C64–C256/C32 logical maps and 16-token ViT attention. It is not an original
+NVIDIA kernel or real-time inference; the preview still updates
+asynchronously, roughly once per second.

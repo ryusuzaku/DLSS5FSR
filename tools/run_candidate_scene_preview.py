@@ -5,6 +5,12 @@ Run this with the project's ONNX venv while the shim has DebugView=2,
 CandidatePreviewReload=1, CandidateInputCaptureTrigger=1 and
 CandidateInputCaptureRepeat=1. The preview updates only after an entire
 offline pass; it is not real-time inference or an original-kernel result.
+
+With --engine resident, one persistent native server runs encoder5-30,
+ViT31-38, decoder39-69 and head70 with retained weights, fed by a small
+early-graph public ONNX branch. It skips the offline scalar checks; its
+arithmetic is the resident path validated by check_resident_encoder22.py and
+check_resident_frame_server.py, and it self-tests on startup.
 """
 
 from pathlib import Path
@@ -15,7 +21,9 @@ import json
 import shutil
 import time
 
-from export_candidate_preview import run as export_preview
+import numpy as np
+
+from export_candidate_preview import run as export_preview, srgb8, write_payload
 from prepare_candidate_input import run as prepare_input
 from run_candidate_frame_from_capture import run as run_frame
 from validate_candidate_input_pair import run as validate_input_pair
@@ -71,10 +79,61 @@ def capture_next(capture_path, timeout, poll, gpu_input_path=None):
             trigger.unlink(missing_ok=True)
 
 
+ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_RESIDENT = ROOT / 'build/resident_encoder8_check/captured/mode5/native_command.json'
+
+
+class ResidentEngine:
+    """Persistent public-input session plus resident server, self-tested once."""
+
+    def __init__(self, command_path, cache_dir):
+        from resident_frame_server import INPUTS, ResidentServer, extents
+        from resident_public_inputs import PublicInputs
+        command_path = Path(command_path).resolve()
+        source = command_path.parents[1]
+        report = json.loads((source / 'report.json').read_text())
+        if (report.get('first_block') != 5 or report['extent'] != [8, 8, 512] or
+                report['modes']['5']['exact_arrays'] != 200):
+            raise ValueError('resident command must come from a validated 256x256 encoder5 front run')
+        self.public = PublicInputs(cache_dir)
+        self.server = ResidentServer(json.loads(command_path.read_text()))
+        self.command_sha256 = digest(command_path)
+        # Startup self-test: validated frame A must reproduce both gains exactly.
+        test = Path(cache_dir) / 'self_test'
+        frame = source / 'frames/a'
+        shapes = extents(8)
+        self.server.write_request(test, {k: np.fromfile(frame / f'{k}.f32', '<f4').reshape(shapes[k])
+                                         for k in INPUTS})
+        self.server.run(test)
+        for key in ('rgb_native', 'rgb_public'):
+            if (test / f'{key}.f32').read_bytes() != (frame / f'{key}.f32').read_bytes():
+                self.server.close()
+                raise AssertionError(f'resident server self-test {key} differs')
+
+    def run(self, prepared, work, gain):
+        start = time.monotonic()
+        inputs, info = self.public.run(prepared)
+        public_seconds = time.monotonic() - start
+        request = work / 'resident_request'
+        self.server.write_request(request, inputs)
+        device_ms = self.server.run(request)
+        rgb = self.server.read_outputs(request)['rgb_native' if gain == 'native_gain' else 'rgb_public']
+        return srgb8(rgb), dict(info, public_inputs_seconds=public_seconds,
+                                resident_device_ms=device_ms,
+                                resident_seconds=time.monotonic() - start - public_seconds,
+                                resident_command_sha256=self.command_sha256,
+                                server=self.server.ready)
+
+    def close(self):
+        self.server.close()
+
+
 def run(capture_path, output_root, preview_path, max_updates=0,
         existing_capture=False, capture_timeout=120, poll=0.5,
         gpu_input_path=None, preview_gain='public_gain', reference_mode='shared',
-        gpu_test_mode='auto'):
+        gpu_test_mode='auto', engine='offline', resident_command=DEFAULT_RESIDENT):
+    if engine not in ('offline', 'resident'):
+        raise ValueError(f'unknown engine: {engine}')
     capture_path = Path(capture_path).resolve()
     output_root = Path(output_root).resolve()
     preview_path = Path(preview_path).resolve()
@@ -102,6 +161,9 @@ def run(capture_path, output_root, preview_path, max_updates=0,
             last_preview_sha = previous['preview_sha256']
             last_preview_completed = datetime.fromtimestamp(
                 preview_path.stat().st_mtime, timezone.utc).isoformat()
+    resident = ResidentEngine(resident_command, output_root / 'resident') if engine == 'resident' else None
+    if resident:
+        print(f'resident engine ready ({resident.server.ready}); self-test exact', flush=True)
     iteration = 0
     while not max_updates or iteration < max_updates:
         iteration += 1
@@ -145,22 +207,38 @@ def run(capture_path, output_root, preview_path, max_updates=0,
                 raise AssertionError('capture changed during preparation')
             work = output_root / 'candidate'
             write_status(status_path, state='running_candidate', iteration=iteration,
-                         capture_sha256=capture_sha,
+                         capture_sha256=capture_sha, engine=engine,
                          input_tensor_source=input_source,
                          last_preview_sha256=last_preview_sha,
                          last_preview_completed_at_utc=last_preview_completed)
-            report = run_frame(prepared, work, reference_mode=reference_mode,
-                               gpu_test_mode=gpu_test_mode)
-            if report['source_capture_sha256'] != capture_sha:
-                raise AssertionError('candidate output has a different source capture')
-            preview = export_preview(work / 'head70', work / 'head70_connected_gpu',
-                                     preview_path, preview_gain)
+            if resident:
+                work.mkdir(parents=True, exist_ok=True)
+                rgb8, info = resident.run(prepared, work, preview_gain)
+                if info['source_capture_sha256'] != capture_sha:
+                    raise AssertionError('resident inputs have a different source capture')
+                preview = dict(preview_sha256=write_payload(rgb8, preview_path),
+                               preview_path=str(preview_path), size=[256, 256], gain=preview_gain,
+                               engine='resident', source_capture_sha256=capture_sha,
+                               resident=info,
+                               purpose='resident candidate game model-texture diagnostic; '
+                                       'not original-kernel inference')
+                preview_manifest.write_text(json.dumps(preview, indent=2) + '\n')
+                report = dict(stage_seconds=dict(public_inputs=info['public_inputs_seconds'],
+                                                 resident=info['resident_seconds'],
+                                                 resident_device_ms=info['resident_device_ms']))
+            else:
+                report = run_frame(prepared, work, reference_mode=reference_mode,
+                                   gpu_test_mode=gpu_test_mode)
+                if report['source_capture_sha256'] != capture_sha:
+                    raise AssertionError('candidate output has a different source capture')
+                preview = export_preview(work / 'head70', work / 'head70_connected_gpu',
+                                         preview_path, preview_gain)
             write_status(status_path, state='preview_ready', iteration=iteration,
                          capture_sha256=capture_sha,
                          preview_sha256=preview['preview_sha256'],
                          preview_path=str(preview_path),
                          preview_completed_at_utc=datetime.now(timezone.utc).isoformat(),
-                         stage_seconds=report['stage_seconds'],
+                         stage_seconds=report['stage_seconds'], engine=engine,
                          input_tensor_source=input_source,
                          gpu_tensor_sha256=pair['gpu_tensor_sha256'] if gpu_snapshot else None,
                          preview_gain=preview_gain,
@@ -200,6 +278,8 @@ def run(capture_path, output_root, preview_path, max_updates=0,
                          last_preview_sha256=last_preview_sha,
                          last_preview_path=str(preview_path) if preview_path.exists() else None)
             raise
+    if resident:
+        resident.close()
     return json.loads(status_path.read_text())
 
 
@@ -225,6 +305,10 @@ if __name__ == '__main__':
                         help='reuse a built HIP test worker, require it, or use standalone processes')
     parser.add_argument('--existing-capture', action='store_true',
                         help='process --capture-path once without arming the game trigger')
+    parser.add_argument('--engine', choices=('offline', 'resident'), default='offline',
+                        help='offline scalar-checked stages, or the persistent resident GPU server')
+    parser.add_argument('--resident-command', type=Path, default=DEFAULT_RESIDENT,
+                        help='mode5/native_command.json of a validated 256x256 encoder5 front run')
     parser.add_argument('--capture-timeout', type=float, default=120)
     parser.add_argument('--poll', type=float, default=0.5)
     args = parser.parse_args()
@@ -232,4 +316,5 @@ if __name__ == '__main__':
         parser.error('max-updates must be nonnegative; timeout and poll must be positive')
     run(args.capture_path, args.output_root, args.preview_path,
         args.max_updates, args.existing_capture, args.capture_timeout, args.poll,
-        args.gpu_input_path, args.preview_gain, args.reference_mode, args.gpu_test_mode)
+        args.gpu_input_path, args.preview_gain, args.reference_mode, args.gpu_test_mode,
+        args.engine, args.resident_command)
