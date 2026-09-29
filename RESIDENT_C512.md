@@ -677,3 +677,39 @@ colour-to-RGB path takes 56–58 ms at 256×256.
 <server-check report>` uses this path, with no ONNX at run time. On the
 saved storefront capture its preview is within 3 levels (PSNR 55.6 dB) of
 the ONNX-fed resident preview.
+
+## Performance work (bit-identical kernels)
+
+`build/resident_profile.exe <engine config> <capture>` times each stage and
+each kernel of the engine's network with GPU events. It uses an optional
+launch hook that is null in normal runs. At 1024×768 (the 991×620 game
+frame), the network went from 630 ms to 253 ms with every regression still
+byte-exact:
+- `tiled_gemm.hip` stages 32-wide input and weight slices in LDS. Each
+  output keeps its sequential float32 sum and half boundary. The kernel
+  covers raw, FP8, gate and double-residual epilogues, column groups and K
+  partitions, with taller or wider tiles for narrow outputs. The C32 bodies,
+  the C64–C256 blocks, and the ViT/C512 blocks above 64 tokens use it.
+  Smaller token counts keep the one-thread-per-output kernels, which are
+  faster there.
+- Softmax denominators and Q/K norms were recomputed for every element.
+  They are now computed once per row or head, in two-phase kernels with
+  coalesced element passes.
+- The tiled h70 rounding uses a half conversion that equals
+  `__float2half_rn` for every one of the 2^32 float inputs (checked
+  exhaustively), in the form that stays fast inside tiles.
+- Verification-only outputs (C64–C256 linear projection, raw expanded
+  arrays) are skipped outside stage checks.
+
+Crop mode takes 33 ms per frame, and the 26-argument chain at 256×256
+takes about 32 ms.
+
+`wmma_gemm.hip` is an experimental FP8 WMMA form of the same contract. It
+is selected by `RESIDENT_WMMA=1` and off by default. Operands are converted
+to FP8 bytes (exact, since every GEMM input is an FP8 value), and each
+32-wide slice is two 16×16×16 WMMA steps followed by the same half boundary.
+It reproduced every captured-chain check, and the front end at both extents,
+byte for byte. In the larger synthetic chain it differed at one rounding tie
+(one value in 4.7 million, one half step). The first version is not yet
+faster (about 200 ms of GEMM against 190 ms): 128×128 tiles waste most of
+the narrow C32 shapes, and ViT token counts leave the grid nearly empty.

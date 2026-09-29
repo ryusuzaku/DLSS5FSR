@@ -9,6 +9,7 @@
 // group computes 64 tokens x 64 outputs, staging 32-wide slices in LDS.
 #include "split512_block.hip"
 #include "resident_stream.h"
+#include "wmma_gemm.hip"
 #include <cstdio>
 
 namespace tiled {
@@ -116,6 +117,11 @@ inline void gemm(hipStream_t stream, const float* X, int ldx, const float* W, in
                  const float* R, int ldr, const float* S, float* out, float* out2, int ldo,
                  int T, int O, int groups = 1, long long gx = 0, long long gw = 0, long long go = 0,
                  int parts = 1) {
+    if (wmma_gemm::enabled &&
+        wmma_gemm::gemm<P,EPI,RESIDUAL>(stream, X, ldx, W, K, R, ldr, S, out, out2, ldo, T, O, groups, gx, gw, go, parts)) {
+        if (c512_resident::launch_hook) c512_resident::launch_hook("wmma_gemm");
+        return;
+    }
     // Narrow outputs use taller tiles so no thread idles; the arithmetic per
     // output is identical for every tile shape.
     if (O <= 32) {
