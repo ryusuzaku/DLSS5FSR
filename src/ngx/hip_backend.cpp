@@ -114,6 +114,10 @@ struct State {
     hipModule_t candidateInputModule = nullptr;
     hipFunction_t candidateInputKernel = nullptr;
     void* candidateInputRgb = nullptr;
+    // Private copy of the captured staging bytes; the shared staging buffer
+    // can already hold a later frame by the time the GPU tensor is computed.
+    void* candidateInputRaw = nullptr;
+    size_t candidateInputRawBytes = 0;
 
     // The FP8 GEMM self-test: runs once when configured, proves the whole
     // "real weights through rocWMMA inside the shim" chain bit-exactly.
@@ -355,6 +359,11 @@ void Shutdown() {
         s.Free(s.candidateInputRgb);
         s.candidateInputRgb = nullptr;
     }
+    if (s.candidateInputRaw) {
+        s.Free(s.candidateInputRaw);
+        s.candidateInputRaw = nullptr;
+        s.candidateInputRawBytes = 0;
+    }
     if (s.candidateInputModule) {
         s.ModuleUnload(s.candidateInputModule);
         s.candidateInputModule = nullptr;
@@ -546,7 +555,8 @@ bool RunModel() {
     return true;
 }
 
-bool CandidateInputGpuTensor(const std::wstring& path) {
+bool CandidateInputGpuTensor(const std::wstring& path,
+                             const std::vector<unsigned char>& pixels) {
     State& s = S();
     constexpr size_t tensorBytes = 256u * 256u * 3u * sizeof(float);
     if (!s.candidateInputKernel) {
@@ -593,7 +603,24 @@ bool CandidateInputGpuTensor(const std::wstring& path) {
         LOGE("hip: candidate input GPU tensor allocation failed");
         return false;
     }
-    void* src = s.ptrIn;
+    // Convert exactly the bytes written to the raw capture, never a re-read
+    // of the shared staging buffer, so the pair always describes one frame.
+    if (s.candidateInputRawBytes != pixels.size()) {
+        if (s.candidateInputRaw) s.Free(s.candidateInputRaw);
+        s.candidateInputRaw = nullptr;
+        s.candidateInputRawBytes = 0;
+        if (s.Malloc(&s.candidateInputRaw, pixels.size()) != hipSuccess) {
+            LOGE("hip: candidate input raw copy allocation failed");
+            return false;
+        }
+        s.candidateInputRawBytes = pixels.size();
+    }
+    if (s.Memcpy(s.candidateInputRaw, pixels.data(), pixels.size(),
+                 hipMemcpyHostToDevice) != hipSuccess) {
+        LOGE("hip: candidate input raw copy upload failed");
+        return false;
+    }
+    void* src = s.candidateInputRaw;
     void* dst = s.candidateInputRgb;
     int width = (int)s.w, height = (int)s.h;
     int pitch = (int)s.pitch, bpp = (int)s.bpp;
@@ -696,7 +723,7 @@ bool CandidateInputCapture() {
          s.w, s.h, s.bpp, (unsigned long long)s.pitch,
          (unsigned long long)s.bytes, cfg.candidateInputCapturePath.c_str());
     const bool gpuOk = cfg.candidateInputGpuPath.empty() ||
-                       CandidateInputGpuTensor(cfg.candidateInputGpuPath);
+                       CandidateInputGpuTensor(cfg.candidateInputGpuPath, pixels);
     if (cfg.candidateInputCaptureTrigger && !DeleteFileW(trigger.c_str()))
         LOGW("hip: candidate input capture could not remove trigger %ls",
              trigger.c_str());

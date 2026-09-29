@@ -303,3 +303,16 @@ model assumptions apply: public block0–4 producers, candidate
 C64–C256/C32 logical maps and 16-token ViT attention. It is not an original
 NVIDIA kernel or real-time inference; the preview still updates
 asynchronously, roughly once per second.
+
+The first in-game resident run produced four previews, then stopped at the
+paired-input check. Both the raw capture and the GPU tensor came from the
+shared D3D12/HIP staging buffer, but the shim read it twice: once for the
+file, then again for the GPU conversion after writing that file. During
+camera motion the second read held a later frame (MAE 7.6e-4, maximum
+0.84). The shim now uploads the captured bytes to a private device buffer
+and converts those. In the NGX harness that tensor matches the standalone
+HIP conversion of the capture exactly. Until a shim with this fix is
+deployed, the sidecar treats such a mismatch as a pairing failure: it uses
+the CPU tensor from the same capture, logs the event and counts it in
+`status.json` (`gpu_pair_mismatches`). Any other pair failure still stops
+the sidecar.

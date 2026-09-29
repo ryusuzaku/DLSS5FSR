@@ -165,6 +165,7 @@ def run(capture_path, output_root, preview_path, max_updates=0,
     if resident:
         print(f'resident engine ready ({resident.server.ready}); self-test exact', flush=True)
     iteration = 0
+    pair_mismatches = 0
     while not max_updates or iteration < max_updates:
         iteration += 1
         try:
@@ -193,13 +194,32 @@ def run(capture_path, output_root, preview_path, max_updates=0,
                          input_tensor_source=input_source,
                          last_preview_sha256=last_preview_sha,
                          last_preview_completed_at_utc=last_preview_completed)
+            frame_source = input_source
             if gpu_snapshot:
-                pair = validate_input_pair(snapshot, gpu_snapshot,
-                                           output_root / 'input_pair')
-                if pair['raw_capture_sha256'] != capture_sha:
-                    raise AssertionError('GPU input pair has a different source capture')
-                prepared = output_root / 'input_pair' / 'gpu_prepared'
-                prep = json.loads((prepared / 'manifest.json').read_text())
+                try:
+                    pair = validate_input_pair(snapshot, gpu_snapshot,
+                                               output_root / 'input_pair')
+                except AssertionError as exc:
+                    # The deployed shim can read its shared staging buffer twice
+                    # across a frame boundary, pairing the raw capture with a
+                    # later frame's GPU tensor. Keep the capture; use its CPU tensor.
+                    if 'differs above tolerance' not in str(exc):
+                        raise
+                    pair_mismatches += 1
+                    report_path = output_root / 'input_pair' / 'report.json'
+                    pair = json.loads(report_path.read_text())
+                    if pair['raw_capture_sha256'] != capture_sha:
+                        raise AssertionError('GPU input pair has a different source capture')
+                    print(f'capture {iteration}: GPU tensor is from another frame '
+                          f"(max {pair['gpu_vs_cpu_max_abs']:.3g}); using the CPU tensor", flush=True)
+                    prepared = output_root / 'input_pair' / 'cpu_prepared'
+                    prep = json.loads((prepared / 'manifest.json').read_text())
+                    frame_source = 'CPU candidate (paired GPU tensor was from a different frame)'
+                else:
+                    if pair['raw_capture_sha256'] != capture_sha:
+                        raise AssertionError('GPU input pair has a different source capture')
+                    prepared = output_root / 'input_pair' / 'gpu_prepared'
+                    prep = json.loads((prepared / 'manifest.json').read_text())
             else:
                 prepared = output_root / 'prepared'
                 prep = prepare_input(snapshot, prepared)
@@ -239,7 +259,8 @@ def run(capture_path, output_root, preview_path, max_updates=0,
                          preview_path=str(preview_path),
                          preview_completed_at_utc=datetime.now(timezone.utc).isoformat(),
                          stage_seconds=report['stage_seconds'], engine=engine,
-                         input_tensor_source=input_source,
+                         input_tensor_source=frame_source,
+                         gpu_pair_mismatches=pair_mismatches,
                          gpu_tensor_sha256=pair['gpu_tensor_sha256'] if gpu_snapshot else None,
                          preview_gain=preview_gain,
                          reference_mode=reference_mode,
