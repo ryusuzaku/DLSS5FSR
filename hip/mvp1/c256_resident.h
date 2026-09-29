@@ -13,7 +13,7 @@ using c512_resident::DeviceTensor;
 using c512_resident::traffic;
 
 #define C256_LAUNCH(kernel, count, ...) do { \
-    hipLaunchKernelGGL(kernel, dim3(((count)+255)/256), dim3(256), 0, 0, __VA_ARGS__); \
+    hipLaunchKernelGGL(kernel, dim3(((count)+255)/256), dim3(256), 0, c512_resident::stream, __VA_ARGS__); \
     HIP_CHECK(hipGetLastError()); } while (0)
 
 inline bool check(const std::string& dir, const char* name, const float* device,
@@ -98,7 +98,7 @@ public:
         result = nullptr;
         if (!source.data || source.count != n) return false;
         if (source.data != ping.data) {
-            HIP_CHECK(hipMemcpyAsync(ping.data,source.data,n*sizeof(float),hipMemcpyDeviceToDevice));
+            HIP_CHECK(hipMemcpyAsync(ping.data,source.data,n*sizeof(float),hipMemcpyDeviceToDevice,c512_resident::stream));
             traffic.d2d_bytes += n*sizeof(float);
         }
         float *input=ping.data,*output=pong.data;

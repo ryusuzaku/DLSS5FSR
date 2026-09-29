@@ -316,3 +316,45 @@ deployed, the sidecar treats such a mismatch as a pairing failure: it uses
 the CPU tensor from the same capture, logs the event and counts it in
 `status.json` (`gpu_pair_mismatches`). Any other pair failure still stops
 the sidecar.
+
+## In-process resident engine
+
+The shim can now run the candidate itself, with no sidecar, capture files or
+Python. `build/resident_engine.dll` (from `hip/mvp1/resident_engine.hip`,
+built by `tools/build_split512_resident.sh`) loads all weights once and
+holds them for the session. After each prepared frame, the shim offers it
+the HIP staging buffer. If the engine is idle, it copies the staged proxy on
+its own non-blocking stream and returns. A worker thread then runs:
+- the 256×256 candidate input crop,
+- the C32 front end,
+- encoder5–30, ViT31–38, decoder39–69 and head70.
+
+It publishes an RGBA8/RGBA16F preview, which the existing `DebugView=2`
+display path uploads. A busy engine refuses new frames instead of queueing
+them. Engine failures are logged once and disable only the engine.
+
+```ini
+DebugView=2
+ResidentEngineDll=P:\path\to\build\resident_engine.dll
+ResidentEngineConfig=P:\path\to\engine_config.txt
+ResidentEngineGain=0
+ResidentEngineInterval=30
+```
+
+The configuration has 24 lines: the `resident_frame_server` arguments
+after the executable, ending with the front-end fixture. Gain 0 is the
+native .03125 head gain and 1 the public gain. The interval is the minimum
+number of frames between submissions, which bounds the GPU time the engine
+takes from the game. Leaving `ResidentEngineConfig` empty restores the
+file-based preview.
+
+`build/resident_engine_test.exe` loads the DLL the way the shim does and
+submits the saved storefront capture's raw staging bytes three times. The
+colour tensor and both RGB gains matched the ONNX-free sidecar byte for
+byte, and so did the RGBA8 preview. Setup took 1.4 s; each frame took
+63–66 ms on the GPU. The NGX harness's opt-in engine pass
+(`DLSS5_RESIDENT_ENGINE_DLL`, `DLSS5_RESIDENT_ENGINE_CONFIG`) loads the
+engine in-process, publishes a preview and displays it (123/123 checks).
+The default and file-preview harness runs still pass 117/117 and 129/129.
+The preview is still a 256×256 centre-crop candidate; full-frame output
+and real-time speed remain future work.

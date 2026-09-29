@@ -44,13 +44,13 @@ public:
         ready = false;
         if (!vit.data || vit.count != n || !skip.data || skip.count != skip_n) return false;
         if (!check("vit", vit.data, n, verify) || !check("skip", skip.data, skip_n, verify)) return false;
-        hipLaunchKernelGGL(k_decoder39_inverse, dim3((n+255)/256), dim3(256), 0, 0,
+        hipLaunchKernelGGL(k_decoder39_inverse, dim3((n+255)/256), dim3(256), 0, c512_resident::stream,
                            vit.data, inverse.data, main.data, int(n));
         HIP_CHECK(hipGetLastError());
-        hipLaunchKernelGGL(k_decoder39_project, dim3((projected.count+255)/256), dim3(256), 0, 0,
+        hipLaunchKernelGGL(k_decoder39_project, dim3((projected.count+255)/256), dim3(256), 0, c512_resident::stream,
                            main.data, weights.data, projected.data, tokens);
         HIP_CHECK(hipGetLastError());
-        hipLaunchKernelGGL(k_decoder39_upsample_skip, dim3((skip_n+255)/256), dim3(256), 0, 0,
+        hipLaunchKernelGGL(k_decoder39_upsample_skip, dim3((skip_n+255)/256), dim3(256), 0, c512_resident::stream,
                            projected.data, skip.data, scale.data, output.data, width, height);
         HIP_CHECK(hipGetLastError());
         if (!check("main", main.data, n, verify) ||

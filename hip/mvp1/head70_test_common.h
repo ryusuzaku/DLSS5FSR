@@ -8,17 +8,27 @@
 #include <string>
 #include <limits>
 
+// Test drivers exit on failure. An in-process engine defines HIP_CHECK,
+// HEAD70_FATAL and HEAD70_INVALID before including these headers to throw.
+#ifndef HIP_CHECK
 #define HIP_CHECK(expr) do { hipError_t e = (expr); if (e != hipSuccess) { \
     fprintf(stderr, "%s: %s\n", #expr, hipGetErrorString(e)); exit(1); } } while (0)
+#endif
+#ifndef HEAD70_FATAL
+#define HEAD70_FATAL(message) do { fprintf(stderr, "%s\n", std::string(message).c_str()); exit(1); } while (0)
+#endif
+#ifndef HEAD70_INVALID
+#define HEAD70_INVALID(message) do { fputs(message "\n", stderr); exit(2); } while (0)
+#endif
 
 static std::vector<float> read(const std::string& dir, const char* name, size_t n) {
     std::string path = dir + "/" + name + ".f32";
     FILE* f = fopen(path.c_str(), "rb");
-    if (!f) { fprintf(stderr, "cannot read %s\n", path.c_str()); exit(1); }
+    if (!f) HEAD70_FATAL("cannot read " + path);
     std::vector<float> v(n);
     bool ok = fread(v.data(), sizeof(float), n, f) == n && fgetc(f) == EOF;
     fclose(f);
-    if (!ok) { fprintf(stderr, "wrong size: %s\n", path.c_str()); exit(1); }
+    if (!ok) HEAD70_FATAL("wrong size: " + path);
     return v;
 }
 

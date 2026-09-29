@@ -513,6 +513,10 @@ struct IniValues {
     int candidateInputCaptureTrigger = 0;
     int candidateInputCaptureRepeat = 0;
     std::string candidateInputGpuPath;
+    std::string residentEngineDll;
+    std::string residentEngineConfig;
+    int residentEngineGain = 0;
+    int harnessFrameSleepMs = 0;  // harness-only: lets asynchronous work land
     // S231 step 3: the default is the SHIPPED reading (2, our map), so a green run
     // means the path the game runs is right. Only the c256f2 check consults this --
     // it is the one staged check that applies the same un-permutation the live
@@ -560,6 +564,9 @@ static bool WriteIni(const std::string& dir, const IniValues& v) {
             "CandidateInputCaptureTrigger=%d\n"
             "CandidateInputCaptureRepeat=%d\n"
             "CandidateInputGpuPath=%s\n"
+            "ResidentEngineDll=%s\n"
+            "ResidentEngineConfig=%s\n"
+            "ResidentEngineGain=%d\n"
             "HipFfnTranspose=%d\n"
             "DumpField=%d\n",
             v.nrPasses, v.hipBackend, v.hipWeightsDir.c_str(),
@@ -574,6 +581,7 @@ static bool WriteIni(const std::string& dir, const IniValues& v) {
             v.candidateInputCapturePath.c_str(),
             v.candidateInputCaptureTrigger, v.candidateInputCaptureRepeat,
             v.candidateInputGpuPath.c_str(),
+            v.residentEngineDll.c_str(), v.residentEngineConfig.c_str(), v.residentEngineGain,
             v.hipFfnTranspose, v.dumpField);
     fclose(f);
     return true;
@@ -689,6 +697,7 @@ static PassResult RunPass(Ngx& ngx, D3D& d, const std::string& iniDir,
             FILE* f = fopen(trigger.c_str(), "wb");
             if (f) { pr.secondTriggerWrote = fwrite("go", 1, 2, f) == 2; fclose(f); }
         }
+        if (v.harnessFrameSleepMs > 0) Sleep((DWORD)v.harnessFrameSleepMs);
         if (i == 3 && !v.candidatePreviewSwapPath.empty()) {
             const std::string temp = v.candidatePreviewPath + ".tmp";
             pr.previewSwapped = CopyFileA(v.candidatePreviewSwapPath.c_str(),
@@ -1453,6 +1462,30 @@ int main(int argc, char** argv) {
     // a chain that never ran would produce. The shim warns when it falls back
     // to the plain resample, so the log is the only place that can tell the
     // two apart.
+    // Opt-in in-process resident candidate engine. The harness gradient is not
+    // a game frame, so this checks loading, asynchronous submission, preview
+    // publication and display, not image content.
+    const char* engineDll = getenv("DLSS5_RESIDENT_ENGINE_DLL");
+    const char* engineConfig = getenv("DLSS5_RESIDENT_ENGINE_CONFIG");
+    const bool engineRun = engineDll && *engineDll && engineConfig && *engineConfig;
+    if (engineRun) {
+        printf("\n-- pass 11: in-process resident engine --\n");
+        IniValues engine;
+        engine.debugView = 2;
+        engine.residentEngineDll = engineDll;
+        engine.residentEngineConfig = engineConfig;
+        engine.harnessFrameSleepMs = 25;
+        PassResult ep = RunPass(ngx, d, iniDir, engine, color.Get(), output.Get(),
+                                SRC_W, SRC_H, DST_W, DST_H, 120);
+        Check(ep.evalFailures == 0, "resident engine frames evaluate");
+        Check(MaxChannelDiff(p1.rb, ep.rb) > 20,
+              "resident engine preview visibly changes the model texture");
+        bool opaque = ep.rb.pixels.size() == (size_t)DST_W * DST_H * 4;
+        for (size_t k = 0; opaque && k < (size_t)DST_W * DST_H; ++k)
+            opaque = ep.rb.pixels[k * 4 + 3] == 255;
+        Check(opaque, "resident engine preview stays opaque");
+    }
+
     printf("\n-- shim log --\n");
     {
         char path[MAX_PATH];
@@ -1480,6 +1513,15 @@ int main(int argc, char** argv) {
             if (captureEnv && *captureEnv)
                 Check(text.find("hip: candidate input GPU tensor saved ") != std::string::npos,
                       "candidate GPU input was logged");
+            if (engineRun) {
+                Check(text.find("hip: resident engine ready in ") != std::string::npos,
+                      "resident engine loaded in process");
+                Check(text.find("hip: resident engine preview 1 (") != std::string::npos,
+                      "resident engine published a preview");
+                Check(text.find("resident engine disabled") == std::string::npos &&
+                          text.find("resident engine setup failed") == std::string::npos,
+                      "resident engine reported no failure");
+            }
 
             // Counted, not just searched: every pass should have run the
             // chain, and one fallback anywhere is a failure.
@@ -2147,7 +2189,7 @@ int main(int argc, char** argv) {
             Check(inits == 1 + 8 + 2 + 1 + ((previewEnv && *previewEnv) ? 1 : 0) +
                       ((getenv("DLSS5_CANDIDATE_PREVIEW_SWAP") &&
                         *getenv("DLSS5_CANDIDATE_PREVIEW_SWAP")) ? 1 : 0) +
-                      ((captureEnv && *captureEnv) ? 1 : 0),
+                      ((captureEnv && *captureEnv) ? 1 : 0) + (engineRun ? 1 : 0),
                   "every pass initialised the shim");
             Check(hipReady >= 1, "the HIP model ran at least once");
             Check(hipDegraded == 0, "no degradation to the identity model");

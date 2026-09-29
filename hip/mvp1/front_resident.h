@@ -6,7 +6,7 @@
 #include "c32_resident.h"
 
 namespace front_resident {
-#define FRONT_LAUNCH(kernel,count,...) do {     hipLaunchKernelGGL(kernel,dim3(((count)+255)/256),dim3(256),0,0,__VA_ARGS__);     HIP_CHECK(hipGetLastError()); } while(0)
+#define FRONT_LAUNCH(kernel,count,...) do {     hipLaunchKernelGGL(kernel,dim3(((count)+255)/256),dim3(256),0,c512_resident::stream,__VA_ARGS__);     HIP_CHECK(hipGetLastError()); } while(0)
 using c512_resident::Buffer;
 using c512_resident::DeviceTensor;
 using c32_resident::Body;

@@ -12,6 +12,9 @@ struct Traffic {
     size_t allocations = 0, h2d_bytes = 0, d2h_bytes = 0, d2d_bytes = 0;
 };
 inline Traffic traffic;
+// Stream for every resident launch and device copy; null keeps the harness's
+// default-stream behaviour, an engine may select a non-blocking stream.
+inline hipStream_t stream = nullptr;
 
 // Borrowed default-stream device view; it never owns or frees its pointer.
 struct DeviceTensor {
@@ -31,7 +34,7 @@ struct Buffer {
         HIP_CHECK(hipMemcpy(data, values.data(), n * sizeof(float), hipMemcpyHostToDevice));
         traffic.h2d_bytes += n * sizeof(float);
     }
-    ~Buffer() { if (data) HIP_CHECK(hipFree(data)); }
+    ~Buffer() { if (data) (void)hipFree(data); }  // destructors never throw or exit
     Buffer(const Buffer&) = delete;
     Buffer& operator=(const Buffer&) = delete;
 };
@@ -49,7 +52,7 @@ struct Weights {
 };
 
 #define C512_LAUNCH(kernel, count, ...) do { \
-    hipLaunchKernelGGL(kernel, dim3(((count)+255)/256), dim3(256), 0, 0, __VA_ARGS__); \
+    hipLaunchKernelGGL(kernel, dim3(((count)+255)/256), dim3(256), 0, c512_resident::stream, __VA_ARGS__); \
     HIP_CHECK(hipGetLastError()); } while (0)
 
 class Chain {
@@ -103,7 +106,7 @@ public:
         result = nullptr;
         if (!source.data || source.count != n) return false;
         if (source.data != ping.data) {
-            HIP_CHECK(hipMemcpyAsync(ping.data, source.data, n*sizeof(float), hipMemcpyDeviceToDevice));
+            HIP_CHECK(hipMemcpyAsync(ping.data, source.data, n*sizeof(float), hipMemcpyDeviceToDevice,c512_resident::stream));
             traffic.d2d_bytes += n*sizeof(float);
         }
         float* input = ping.data;

@@ -8,7 +8,7 @@ struct IndexMap {
     IndexMap(const char* path, size_t count) {
         std::vector<int32_t> values(count);
         FILE* f = fopen(path, "rb");
-        if (!f) { fputs("cannot read bridge map\n", stderr); exit(2); }
+        if (!f) HEAD70_INVALID("cannot read bridge map");
         bool ok = fread(values.data(), sizeof(int32_t), count, f) == count && fgetc(f) == EOF;
         fclose(f);
         std::vector<bool> seen(count);
@@ -16,7 +16,7 @@ struct IndexMap {
             if (value < 0 || size_t(value) >= count || seen[value]) { ok = false; break; }
             seen[value] = true;
         }
-        if (!ok) { fputs("invalid bridge map\n", stderr); exit(2); }
+        if (!ok) HEAD70_INVALID("invalid bridge map");
         HIP_CHECK(hipMalloc(&data, count*sizeof(int32_t)));
         ++traffic.allocations;
         HIP_CHECK(hipMemcpy(data, values.data(), count*sizeof(int32_t), hipMemcpyHostToDevice));
@@ -24,6 +24,6 @@ struct IndexMap {
     }
     IndexMap(const IndexMap&) = delete;
     IndexMap& operator=(const IndexMap&) = delete;
-    ~IndexMap() { HIP_CHECK(hipFree(data)); }
+    ~IndexMap() { if (data) (void)hipFree(data); }
 };
 } // namespace c512_resident

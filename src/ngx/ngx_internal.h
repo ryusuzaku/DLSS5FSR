@@ -167,6 +167,17 @@ struct Config {
     // only when CandidateInputCapturePath captures; never changes the model.
     std::wstring candidateInputGpuPath;
 
+    // In-process resident candidate engine (hip/mvp1/resident_engine.hip),
+    // loaded from ResidentEngineDll and configured by ResidentEngineConfig.
+    // It snapshots the staged proxy, runs the whole candidate network on its
+    // own worker thread and non-blocking stream, and feeds the DebugView=2
+    // preview directly. Gain 0 is the native .03125 head gain, 1 public 1.0.
+    // Interval is the minimum number of frames between submissions.
+    std::wstring residentEngineDll;
+    std::wstring residentEngineConfig;
+    int residentEngineGain = 0;
+    int residentEngineInterval = 1;
+
     // Scene value the game's tonemapper calls white. Everything the encode
     // does is relative to it, and getting it wrong is not a subtle error: the
     // proxy is either crushed or clipped and the model is shown a picture that
@@ -505,6 +516,7 @@ bool HipStartup();
 void HipShutdown();
 bool HipEnsureStaging(unsigned int w, unsigned int h, unsigned int bpp);
 bool HipRunModel();
+bool HipResidentEngineSubmit();  // resident engine: snapshot this staged frame
 bool HipSelfTest();  // one-shot FP8 GEMM with real weights; see Config
 bool HipChainTest();  // one-shot Stage-1 v4 chain on real weights (§27)
 bool HipFeBlockTest();  // one-shot frontend+chain debug block (§34)

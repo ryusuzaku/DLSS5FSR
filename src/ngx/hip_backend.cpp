@@ -119,6 +119,16 @@ struct State {
     void* candidateInputRaw = nullptr;
     size_t candidateInputRawBytes = 0;
 
+    // In-process resident candidate engine; -1 disabled after a failure.
+    HMODULE engineDll = nullptr;
+    int engineState = 0;
+    int (*EngineCreate)(const char*) = nullptr;
+    int (*EngineSubmit)(const void*, int, int, int, int) = nullptr;
+    int (*EnginePoll)(int, unsigned char*, unsigned char*, float*) = nullptr;
+    const char* (*EngineError)() = nullptr;
+    void (*EngineDestroy)() = nullptr;
+    uint64_t engineFrames = 0, engineLastSubmit = 0, engineSubmits = 0, enginePreviews = 0;
+
     // The FP8 GEMM self-test: runs once when configured, proves the whole
     // "real weights through rocWMMA inside the shim" chain bit-exactly.
     bool selfTestDone = false;
@@ -354,6 +364,13 @@ bool Startup() {
 
 void Shutdown() {
     State& s = S();
+    if (s.engineDll) {
+        // Stops the worker and frees engine memory before the runtime goes away.
+        if (s.EngineDestroy) s.EngineDestroy();
+        FreeLibrary(s.engineDll);
+        s.engineDll = nullptr;
+        s.engineState = 0;
+    }
     DropStaging();
     if (s.candidateInputRgb) {
         s.Free(s.candidateInputRgb);
@@ -730,10 +747,79 @@ bool CandidateInputCapture() {
     return gpuOk;
 }
 
+// Load and create the resident engine once; any failure disables it for the
+// session and leaves the normal model path untouched.
+static bool EngineReady() {
+    State& s = S();
+    const Config& cfg = Cfg();
+    if (s.engineState) return s.engineState > 0;
+    s.engineState = -1;
+    if (cfg.residentEngineDll.empty() || cfg.residentEngineConfig.empty()) {
+        LOGE("hip: resident engine needs both ResidentEngineDll and ResidentEngineConfig");
+        return false;
+    }
+    s.engineDll = LoadLibraryW(cfg.residentEngineDll.c_str());
+    if (!s.engineDll) {
+        LOGE("hip: resident engine %ls could not be loaded (%lu)", cfg.residentEngineDll.c_str(),
+             (unsigned long)GetLastError());
+        return false;
+    }
+    s.EngineCreate = (int (*)(const char*))GetProcAddress(s.engineDll, "re_create");
+    s.EngineSubmit = (int (*)(const void*, int, int, int, int))GetProcAddress(s.engineDll, "re_submit");
+    s.EnginePoll = (int (*)(int, unsigned char*, unsigned char*, float*))GetProcAddress(s.engineDll, "re_poll");
+    s.EngineError = (const char* (*)())GetProcAddress(s.engineDll, "re_last_error");
+    s.EngineDestroy = (void (*)())GetProcAddress(s.engineDll, "re_destroy");
+    if (!s.EngineCreate || !s.EngineSubmit || !s.EnginePoll || !s.EngineError || !s.EngineDestroy) {
+        LOGE("hip: resident engine is missing an export");
+        FreeLibrary(s.engineDll); s.engineDll = nullptr; s.EngineDestroy = nullptr;
+        return false;
+    }
+    char config[1024]{};
+    if (!WideCharToMultiByte(CP_UTF8, 0, cfg.residentEngineConfig.c_str(), -1, config,
+                             sizeof(config), nullptr, nullptr)) {
+        LOGE("hip: resident engine config path too long");
+        return false;
+    }
+    LARGE_INTEGER frequency{}, begin{}, end{};
+    QueryPerformanceFrequency(&frequency);
+    QueryPerformanceCounter(&begin);
+    if (!s.EngineCreate(config)) {
+        LOGE("hip: resident engine setup failed: %s", s.EngineError());
+        return false;
+    }
+    QueryPerformanceCounter(&end);
+    s.engineState = 1;
+    LOGI("hip: resident engine ready in %.0f ms (candidate encoder5-70 + C32 front end; not original kernels)",
+         frequency.QuadPart ? 1000.0 * (double)(end.QuadPart - begin.QuadPart) / (double)frequency.QuadPart : 0.0);
+    return true;
+}
+
+// Called once per prepared frame while the staging buffer holds this frame.
+bool ResidentEngineSubmit() {
+    State& s = S();
+    const Config& cfg = Cfg();
+    if (cfg.residentEngineConfig.empty() || cfg.debugView != 2) return true;
+    if (!s.usable || !s.ptrIn || !EngineReady()) return false;
+    ++s.engineFrames;
+    if (s.engineFrames - s.engineLastSubmit < (uint64_t)cfg.residentEngineInterval &&
+        s.engineLastSubmit) return true;
+    const int r = s.EngineSubmit(s.ptrIn, (int)s.w, (int)s.h, (int)s.pitch, (int)s.bpp);
+    if (r < 0) {
+        LOGE("hip: resident engine disabled: %s", s.EngineError());
+        s.engineState = -1;
+        return false;
+    }
+    if (r == 1) {
+        s.engineLastSubmit = s.engineFrames;
+        ++s.engineSubmits;
+    }
+    return true;
+}
+
 bool CandidatePreview() {
     State& s = S();
     const Config& cfg = Cfg();
-    if (cfg.candidatePreviewPath.empty()) return true;
+    if (cfg.candidatePreviewPath.empty() && cfg.residentEngineConfig.empty()) return true;
     if (cfg.debugView != 2) {
         static bool warned = false;
         if (!warned) {
@@ -749,7 +835,27 @@ bool CandidatePreview() {
         LOGW("hip: fixed candidate preview staging format/extent unsupported");
         return false;
     }
-    if (s.previewPath != cfg.candidatePreviewPath) {
+    const bool engine = !cfg.residentEngineConfig.empty();
+    if (engine) {
+        // The engine publishes finished frames; take the newest, keep the last.
+        if (!EngineReady()) return false;
+        std::vector<unsigned char> next8(256u * 256u * 4u), next16(256u * 256u * 8u);
+        float deviceMs = 0.0f;
+        const int r = s.EnginePoll(cfg.residentEngineGain, next8.data(), next16.data(), &deviceMs);
+        if (r < 0) {
+            LOGE("hip: resident engine disabled: %s", s.EngineError());
+            s.engineState = -1;
+            return false;
+        }
+        if (r == 1) {
+            s.preview8.swap(next8); s.preview16.swap(next16);
+            s.previewFrame.clear();
+            if ((s.enginePreviews++ % 100) == 0)
+                LOGI("hip: resident engine preview %llu (%llu frames, %llu submissions, %.3f ms device)",
+                     (unsigned long long)s.enginePreviews, (unsigned long long)s.engineFrames,
+                     (unsigned long long)s.engineSubmits, deviceMs);
+        }
+    } else if (s.previewPath != cfg.candidatePreviewPath) {
         s.previewPath = cfg.candidatePreviewPath;
         s.previewLoadAttempted = false;
         s.previewFileKnown = false;
@@ -760,7 +866,7 @@ bool CandidatePreview() {
     // The sidecar atomically replaces the file after a whole offline pass.
     // Poll metadata infrequently so the render path does not do file I/O on
     // every frame. Keep the last valid image if a replacement is malformed.
-    if (cfg.candidatePreviewReload && (++s.previewChecks % 60) == 0) {
+    if (!engine && cfg.candidatePreviewReload && (++s.previewChecks % 60) == 0) {
         WIN32_FILE_ATTRIBUTE_DATA info{};
         if (GetFileAttributesExW(s.previewPath.c_str(), GetFileExInfoStandard, &info) &&
             (!s.previewFileKnown ||
@@ -768,7 +874,7 @@ bool CandidatePreview() {
              (((uint64_t)info.nFileSizeHigh << 32) | info.nFileSizeLow) != s.previewFileBytes))
             s.previewLoadAttempted = false;
     }
-    if (!s.previewLoadAttempted) {
+    if (!engine && !s.previewLoadAttempted) {
         s.previewLoadAttempted = true;
         FILE* file = _wfopen(s.previewPath.c_str(), L"rb");
         if (!file) {
@@ -10571,6 +10677,7 @@ bool HipC32blkBlockTest() { return hipb::C32blkBlockTestImpl(); }
 void HipFeBlockView() { hipb::FeBlockView(); }
 bool HipFeBlockStaged() { return hipb::FeBlockStaged(); }
 bool HipCandidatePreview() { return hipb::CandidatePreview(); }
+bool HipResidentEngineSubmit() { return hipb::ResidentEngineSubmit(); }
 bool HipCandidateInputCapture() { return hipb::CandidateInputCapture(); }
 UINT64 HipStagingRowPitch() { return hipb::StagingRowPitch(); }
 UINT64 HipStagingBytes() { return hipb::StagingBytes(); }

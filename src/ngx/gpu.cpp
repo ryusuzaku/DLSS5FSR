@@ -871,6 +871,13 @@ bool GpuPrepareHipModel(uint64_t n, const Config& cfg) {
     // The staged proxy bytes are the model's input; the launch synchronises,
     // so sharedOut holds the answer by the time it returns.
     if (!HipRunModel()) return false;
+    if (!cfg.residentEngineConfig.empty() && !HipResidentEngineSubmit()) {
+        static bool engineFailureLogged = false;
+        if (!engineFailureLogged) {
+            engineFailureLogged = true;
+            LOGW("nr: resident engine submission failed; model output is unaffected");
+        }
+    }
     if (!cfg.candidateInputCapturePath.empty() && !HipCandidateInputCapture()) {
         static bool captureFailureLogged = false;
         if (!captureFailureLogged) {
@@ -1003,7 +1010,8 @@ bool GpuPrepareHipModel(uint64_t n, const Config& cfg) {
     // through the frontend+chain, block answer into sharedOut, window
     // bytes + block checksum logged for the offline oracle recompute.
     HipFeBlockStaged();
-    if (!cfg.candidatePreviewPath.empty() && !HipCandidatePreview()) {
+    if ((!cfg.candidatePreviewPath.empty() || !cfg.residentEngineConfig.empty()) &&
+        !HipCandidatePreview()) {
         static bool previewFailureLogged = false;
         if (!previewFailureLogged) {
             previewFailureLogged = true;
