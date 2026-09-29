@@ -1,0 +1,171 @@
+#pragma once
+// Resident candidate C32 front end: stem -> block0 -> pool -> encoder1-4 ->
+// block4 downsample. Runs in the public (peer) channel basis and writes the
+// resident chain's native-basis C64 input, block4 skip and preblock0 skip.
+// C32 bodies reuse the existing head70 body kernels unchanged.
+#include "c32_resident.h"
+
+namespace front_resident {
+#define FRONT_LAUNCH(kernel,count,...) do {     hipLaunchKernelGGL(kernel,dim3(((count)+255)/256),dim3(256),0,0,__VA_ARGS__);     HIP_CHECK(hipGetLastError()); } while(0)
+using c512_resident::Buffer;
+using c512_resident::DeviceTensor;
+using c32_resident::Body;
+using c32_resident::Weights;
+using c32_resident::check;
+
+// Window order of an image with the resident shift convention (4-pixel pads).
+__device__ inline bool front_window_pixel(int token, int width, int height, int shift, int& x, int& y) {
+    int px = (shift&1) ? 4 : 0, py = (shift&2) ? 4 : 0;
+    int wx = (width+px+7)/8;
+    int window = token/64, local = token%64;
+    x = (window%wx)*8 + local%8 - px;
+    y = (window/wx)*8 + local/8 - py;
+    return x >= 0 && x < width && y >= 0 && y < height;
+}
+
+// 15 input channels: noise(3), 1, x(3), x(3), zeros(5); x=half((rgb-.5)*.125).
+__global__ void k_front_stem(const float* rgb, const float* noise, const float* stem,
+                             float* tokens, int width, int height) {
+    int id = blockIdx.x*blockDim.x+threadIdx.x;
+    if (id >= width*height*32) return;
+    int token = id/32, c = id%32, x, y;
+    front_window_pixel(token, width, height, 0, x, y);
+    const float* p = rgb + (size_t(y)*width+x)*3;
+    const float* n = noise + (size_t(y)*width+x)*3;
+    float f[15];
+    for (int k = 0; k < 3; ++k) f[k] = h70_h(n[k]);
+    f[3] = 1.0f;
+    for (int k = 0; k < 3; ++k) {
+        volatile float centered = p[k]-.5f;
+        float v = h70_h(centered*.125f);
+        f[4+k] = v; f[7+k] = v;
+    }
+    for (int k = 10; k < 15; ++k) f[k] = 0.0f;
+    float part = 0.0f;
+    for (int k = 0; k < 15; ++k) part += f[k]*stem[k*32+c];
+    tokens[id] = h70_h(part);
+}
+
+__global__ void k_front_gather(const float* image, float* tokens, int width, int height, int shift) {
+    int id = blockIdx.x*blockDim.x+threadIdx.x;
+    int px = (shift&1) ? 4 : 0, py = (shift&2) ? 4 : 0;
+    int count = ((width+px+7)/8)*((height+py+7)/8)*64*32;
+    if (id >= count) return;
+    int x, y;
+    tokens[id] = front_window_pixel(id/32, width, height, shift, x, y) ?
+                 image[(size_t(y)*width+x)*32+id%32] : 0.0f;
+}
+
+__global__ void k_front_scatter(const float* tokens, float* image, int width, int height, int shift) {
+    int id = blockIdx.x*blockDim.x+threadIdx.x;
+    int px = (shift&1) ? 4 : 0, py = (shift&2) ? 4 : 0;
+    int count = ((width+px+7)/8)*((height+py+7)/8)*64*32;
+    if (id >= count) return;
+    int x, y;
+    if (front_window_pixel(id/32, width, height, shift, x, y))
+        image[(size_t(y)*width+x)*32+id%32] = tokens[id];
+}
+
+// Rounded 2x2 pool then FP8, as the other encoder pools.
+__global__ void k_front_pool(const float* raw, float* pool, int width, int height, int channels) {
+    int i = blockIdx.x*blockDim.x+threadIdx.x;
+    int pw = width/2, ph = height/2;
+    if (i >= pw*ph*channels) return;
+    int c = i%channels, x = i/channels%pw, y = i/channels/pw;
+    size_t top = (size_t(2*y)*width+2*x)*channels+c, bottom = (size_t(2*y+1)*width+2*x)*channels+c;
+    float a = h70_h(raw[top]+raw[top+channels]);
+    float b = h70_h(raw[bottom]+raw[bottom+channels]);
+    pool[i] = h70_f(h70_h(h70_h(a+b)*.25f));
+}
+
+// C32 -> C64 projection with one 32-product half boundary, then FP8.
+__global__ void k_front_down(const float* pool, const float* matrix, float* output, int pixels) {
+    int i = blockIdx.x*blockDim.x+threadIdx.x;
+    if (i >= pixels*64) return;
+    const float* x = pool + (i/64)*32;
+    const float* w = matrix + (i%64)*32;
+    float part = 0.0f;
+    for (int k = 0; k < 32; ++k) part += x[k]*w[k];
+    output[i] = h70_f(h70_h(part));
+}
+
+__device__ inline int front_multihead64(int c) { return (c/16)*16+(c%8)*2+(c%16/8); }
+
+__global__ void k_front_native64(const float* peer, float* native, int n) {
+    int i = blockIdx.x*blockDim.x+threadIdx.x;
+    if (i < n) native[(i&~63)+front_multihead64(i&63)] = peer[i];
+}
+
+__global__ void k_front_native32(const float* peer, float* native, int n, int clamp) {
+    int i = blockIdx.x*blockDim.x+threadIdx.x;
+    if (i >= n) return;
+    float v = peer[i];
+    if (clamp) v = fminf(448.0f, fmaxf(-448.0f, v));
+    native[(i&~31)+peer_to_native32(i&31)] = v;
+}
+
+class FrontEnd {
+    static int checked(int w, int h) {
+        if ((w != 256 && w != 1024) || h != 256) throw std::invalid_argument("front end requires 256x256 or 1024x256 RGB");
+        return w;
+    }
+    int width, height;
+    size_t pixels;
+    std::string dir;
+    Buffer noise, stem, matrix, tokens, raw0, image, raw4, down_pool, down, c64, skip4, skip0;
+    std::vector<std::unique_ptr<Weights>> weights;
+    Body body;
+    bool ready = false;
+public:
+    size_t comparisons = 0;
+    FrontEnd(int w, int h, const std::string& fixture) : width(checked(w,h)), height(h), pixels(size_t(w)*h),
+        dir(fixture), noise(dir,"noise",pixels*3), stem(dir,"stem_weights",15*32), matrix(dir,"matrix",64*32),
+        tokens(size_t(w/2+8)*(h/2+8)*32 > pixels*32 ? size_t(w/2+8)*(h/2+8)*32 : pixels*32),
+        raw0(pixels*32), image(pixels/4*32), raw4(pixels/4*32), down_pool(pixels/16*32), down(pixels/16*64),
+        c64(pixels/16*64), skip4(pixels/4*32), skip0(pixels*32), body(int(pixels)) {
+        for (int b = 0; b < 5; ++b) weights.emplace_back(new Weights(dir+"/block"+std::to_string(b)));
+    }
+    bool run_from_device(DeviceTensor rgb, bool verify = false) {
+        ready = false;
+        if (!rgb.data || rgb.count != pixels*3) return false;
+        if (!check(dir,"rgb",rgb.data,pixels*3,verify,comparisons)) return false;
+        FRONT_LAUNCH(k_front_stem,pixels*32,rgb.data,noise.data,stem.data,tokens.data,width,height);
+        if (!check(dir+"/block0","input",tokens.data,pixels*32,verify,comparisons) ||
+            !body.run(*weights[0],tokens.data,int(pixels),verify,comparisons)) return false;
+        FRONT_LAUNCH(k_front_scatter,pixels*32,body.raw(),raw0.data,width,height,0);
+        FRONT_LAUNCH(k_front_pool,pixels/4*32,raw0.data,image.data,width,height,32);
+        if (!check(dir+"/block0","raw",raw0.data,pixels*32,verify,comparisons) ||
+            !check(dir,"pre_down",image.data,pixels/4*32,verify,comparisons)) return false;
+        const int shifts[5] = {0,0,3,0,3};
+        int w = width/2, h = height/2;
+        for (int b = 1; b <= 4; ++b) {
+            int px = (shifts[b]&1) ? 4 : 0, py = (shifts[b]&2) ? 4 : 0;
+            int rows = ((w+px+7)/8)*((h+py+7)/8)*64;
+            std::string block = dir+"/block"+std::to_string(b);
+            FRONT_LAUNCH(k_front_gather,size_t(rows)*32,image.data,tokens.data,w,h,shifts[b]);
+            if (!check(block,"input",tokens.data,size_t(rows)*32,verify,comparisons) ||
+                !body.run(*weights[b],tokens.data,rows,verify,comparisons)) return false;
+            if (b == 4) FRONT_LAUNCH(k_front_scatter,size_t(rows)*32,body.raw(),raw4.data,w,h,shifts[b]);
+            FRONT_LAUNCH(k_front_scatter,size_t(rows)*32,body.quantized(),image.data,w,h,shifts[b]);
+            if (!check(block,"image",image.data,size_t(w)*h*32,verify,comparisons) ||
+                (b == 4 && !check(block,"raw",raw4.data,size_t(w)*h*32,verify,comparisons))) return false;
+        }
+        FRONT_LAUNCH(k_front_pool,size_t(w/2)*(h/2)*32,raw4.data,down_pool.data,w,h,32);
+        FRONT_LAUNCH(k_front_down,size_t(w/2)*(h/2)*64,down_pool.data,matrix.data,down.data,(w/2)*(h/2));
+        FRONT_LAUNCH(k_front_native64,down.count,down.data,c64.data,int(down.count));
+        FRONT_LAUNCH(k_front_native32,skip4.count,image.data,skip4.data,int(skip4.count),0);
+        FRONT_LAUNCH(k_front_native32,skip0.count,raw0.data,skip0.data,int(skip0.count),1);
+        if (!check(dir,"down_pool",down_pool.data,down_pool.count,verify,comparisons) ||
+            !check(dir,"down",down.data,down.count,verify,comparisons) ||
+            !check(dir,"c64_input",c64.data,c64.count,verify,comparisons) ||
+            !check(dir,"skip4",skip4.data,skip4.count,verify,comparisons) ||
+            !check(dir,"skip0",skip0.data,skip0.count,verify,comparisons)) return false;
+        ready = true;
+        return true;
+    }
+    DeviceTensor c64_view() const { return ready ? DeviceTensor{c64.data,c64.count} : DeviceTensor{}; }
+    DeviceTensor skip4_view() const { return ready ? DeviceTensor{skip4.data,skip4.count} : DeviceTensor{}; }
+    DeviceTensor skip0_view() const { return ready ? DeviceTensor{skip0.data,skip0.count} : DeviceTensor{}; }
+};
+#undef FRONT_LAUNCH
+} // namespace front_resident

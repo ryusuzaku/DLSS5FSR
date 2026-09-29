@@ -86,33 +86,60 @@ DEFAULT_RESIDENT = ROOT / 'build/resident_encoder8_check/captured/mode5/native_c
 class ResidentEngine:
     """Persistent public-input session plus resident server, self-tested once."""
 
-    def __init__(self, command_path, cache_dir):
+    def __init__(self, command_path, cache_dir, front_report=None):
         from resident_frame_server import INPUTS, ResidentServer, extents
-        from resident_public_inputs import PublicInputs
         command_path = Path(command_path).resolve()
         source = command_path.parents[1]
         report = json.loads((source / 'report.json').read_text())
         if (report.get('first_block') != 5 or report['extent'] != [8, 8, 512] or
                 report['modes']['5']['exact_arrays'] != 200):
             raise ValueError('resident command must come from a validated 256x256 encoder5 front run')
-        self.public = PublicInputs(cache_dir)
-        self.server = ResidentServer(json.loads(command_path.read_text()))
-        self.command_sha256 = digest(command_path)
-        # Startup self-test: validated frame A must reproduce both gains exactly.
-        test = Path(cache_dir) / 'self_test'
-        frame = source / 'frames/a'
         shapes = extents(8)
-        self.server.write_request(test, {k: np.fromfile(frame / f'{k}.f32', '<f4').reshape(shapes[k])
-                                         for k in INPUTS})
-        self.server.run(test)
-        for key in ('rgb_native', 'rgb_public'):
-            if (test / f'{key}.f32').read_bytes() != (frame / f'{key}.f32').read_bytes():
-                self.server.close()
-                raise AssertionError(f'resident server self-test {key} differs')
+        test = Path(cache_dir) / 'self_test'
+        self.front = None
+        if front_report:
+            # GPU C32 front end: the frame needs only colour, no public ONNX.
+            checked = json.loads(Path(front_report).read_text())
+            front = checked.get('front_end')
+            if not front or checked.get('source_report_sha256') != digest(source / 'report.json'):
+                raise ValueError('front report must come from check_resident_frame_server.py on this run')
+            self.front = Path(front['front_fixture'])
+            self.public = None
+            self.server = ResidentServer(json.loads(command_path.read_text()), front_fixture=self.front)
+            self.server.write_request(test, dict(color=np.fromfile(self.front / 'rgb.f32', '<f4').reshape(shapes['color'])))
+            self.server.run(test)
+            expected = dict(zip(('rgb_native', 'rgb_public'), front['rgb']))
+            for key, sha in expected.items():
+                if digest(test / f'{key}.f32') != sha:
+                    self.server.close()
+                    raise AssertionError(f'resident front-end self-test {key} differs')
+        else:
+            from resident_public_inputs import PublicInputs
+            self.public = PublicInputs(cache_dir)
+            self.server = ResidentServer(json.loads(command_path.read_text()))
+            # Startup self-test: validated frame A must reproduce both gains exactly.
+            frame = source / 'frames/a'
+            self.server.write_request(test, {k: np.fromfile(frame / f'{k}.f32', '<f4').reshape(shapes[k])
+                                             for k in INPUTS})
+            self.server.run(test)
+            for key in ('rgb_native', 'rgb_public'):
+                if (test / f'{key}.f32').read_bytes() != (frame / f'{key}.f32').read_bytes():
+                    self.server.close()
+                    raise AssertionError(f'resident server self-test {key} differs')
+        self.command_sha256 = digest(command_path)
 
     def run(self, prepared, work, gain):
         start = time.monotonic()
-        inputs, info = self.public.run(prepared)
+        if self.public:
+            inputs, info = self.public.run(prepared)
+        else:
+            manifest = json.loads((Path(prepared) / 'manifest.json').read_text())
+            rgb = np.fromfile(Path(prepared) / 'color_linear.f32', '<f4').reshape(256, 256, 3)
+            if manifest['color_linear_sha256'] != digest(Path(prepared) / 'color_linear.f32'):
+                raise ValueError('prepared colour differs from its manifest')
+            inputs = dict(color=rgb)
+            info = dict(source_capture_sha256=manifest['source_capture_sha256'],
+                        front_end='GPU candidate C32 front end', front_fixture=str(self.front))
         public_seconds = time.monotonic() - start
         request = work / 'resident_request'
         self.server.write_request(request, inputs)
@@ -131,7 +158,8 @@ class ResidentEngine:
 def run(capture_path, output_root, preview_path, max_updates=0,
         existing_capture=False, capture_timeout=120, poll=0.5,
         gpu_input_path=None, preview_gain='public_gain', reference_mode='shared',
-        gpu_test_mode='auto', engine='offline', resident_command=DEFAULT_RESIDENT):
+        gpu_test_mode='auto', engine='offline', resident_command=DEFAULT_RESIDENT,
+        resident_front=None):
     if engine not in ('offline', 'resident'):
         raise ValueError(f'unknown engine: {engine}')
     capture_path = Path(capture_path).resolve()
@@ -161,7 +189,8 @@ def run(capture_path, output_root, preview_path, max_updates=0,
             last_preview_sha = previous['preview_sha256']
             last_preview_completed = datetime.fromtimestamp(
                 preview_path.stat().st_mtime, timezone.utc).isoformat()
-    resident = ResidentEngine(resident_command, output_root / 'resident') if engine == 'resident' else None
+    resident = (ResidentEngine(resident_command, output_root / 'resident', resident_front)
+                if engine == 'resident' else None)
     if resident:
         print(f'resident engine ready ({resident.server.ready}); self-test exact', flush=True)
     iteration = 0
@@ -331,6 +360,9 @@ if __name__ == '__main__':
                         help='offline scalar-checked stages, or the persistent resident GPU server')
     parser.add_argument('--resident-command', type=Path, default=DEFAULT_RESIDENT,
                         help='mode5/native_command.json of a validated 256x256 encoder5 front run')
+    parser.add_argument('--resident-front', type=Path,
+                        help='check_resident_frame_server.py report with a front-end check: run the '
+                             'C32 front end on the GPU instead of the public ONNX producers')
     parser.add_argument('--capture-timeout', type=float, default=120)
     parser.add_argument('--poll', type=float, default=0.5)
     args = parser.parse_args()
@@ -339,4 +371,4 @@ if __name__ == '__main__':
     run(args.capture_path, args.output_root, args.preview_path,
         args.max_updates, args.existing_capture, args.capture_timeout, args.poll,
         args.gpu_input_path, args.preview_gain, args.reference_mode, args.gpu_test_mode,
-        args.engine, args.resident_command)
+        args.engine, args.resident_command, args.resident_front)

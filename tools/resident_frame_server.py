@@ -19,12 +19,12 @@ EXE = ROOT / 'build/resident_frame_server.exe'
 INPUTS = ('c64_input', 'skip4', 'skip0', 'color')
 
 
-def server_arguments(harness_command):
+def server_arguments(harness_command, front_fixture=None):
     """Map a validated 26-argument harness command to the server's arguments."""
     command = [str(v) for v in harness_command]
     if len(command) != 26 or Path(command[0]).name != 'split512_frames_test.exe':
         raise ValueError('expected the full 26-argument resident harness command')
-    return [str(EXE), *command[1:4], *command[6:26]]
+    return [str(EXE), *command[1:4], *command[6:26], *([str(front_fixture)] if front_fixture else [])]
 
 
 def extents(width):
@@ -34,8 +34,9 @@ def extents(width):
 
 
 class ResidentServer:
-    def __init__(self, harness_command, timeout=120):
-        self.arguments = server_arguments(harness_command)
+    def __init__(self, harness_command, timeout=120, front_fixture=None):
+        self.arguments = server_arguments(harness_command, front_fixture)
+        self.front = front_fixture is not None
         self.width = int(self.arguments[2])
         self.timeout = timeout
         self.process = subprocess.Popen(self.arguments, cwd=ROOT, stdin=subprocess.PIPE,
@@ -82,7 +83,7 @@ class ResidentServer:
         shapes = extents(self.width)
         request_dir = Path(request_dir)
         request_dir.mkdir(parents=True, exist_ok=True)
-        for name in INPUTS:
+        for name in (('color',) if self.front else INPUTS):
             array = np.asarray(arrays[name], '<f4')
             if array.shape != shapes[name] or not np.isfinite(array).all():
                 raise ValueError(f'resident input {name} has shape {array.shape}, expected {shapes[name]}')

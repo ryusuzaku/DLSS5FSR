@@ -24,7 +24,29 @@ def link(source, target):
         shutil.copyfile(source, target)
 
 
-def run(source, output):
+def front_equivalence(command, front_fixture, output):
+    """GPU front end from colour must equal the chain fed its saved outputs."""
+    front_fixture = Path(front_fixture).resolve()
+    direct, chained = output / 'front_direct', output / 'front_chained'
+    for folder in (direct, chained):
+        folder.mkdir(parents=True, exist_ok=True)
+    link(front_fixture / 'rgb.f32', direct / 'color.f32')
+    link(front_fixture / 'rgb.f32', chained / 'color.f32')
+    for key in ('c64_input', 'skip4', 'skip0'):
+        link(front_fixture / f'{key}.f32', chained / f'{key}.f32')
+    with ResidentServer(command, front_fixture=front_fixture) as server:
+        front_ms = [server.run(direct) for _ in range(3)]
+        ready = server.ready
+    with ResidentServer(command) as server:
+        chain_ms = server.run(chained)
+    for key in ('rgb_native', 'rgb_public'):
+        if (direct / f'{key}.f32').read_bytes() != (chained / f'{key}.f32').read_bytes():
+            raise AssertionError(f'front-end server {key} differs from the chained reference')
+    return dict(ready=ready, front_fixture=str(front_fixture), front_frame_ms=front_ms, chained_frame_ms=chain_ms,
+                rgb=[digest(direct / f'{k}.f32') for k in ('rgb_native', 'rgb_public')])
+
+
+def run(source, output, front_fixture=None):
     source, output = Path(source).resolve(), Path(output).resolve()
     report = json.loads((source / 'report.json').read_text())
     if report['first_block'] != 5 or report['sequence'] != ['a', 'b', 'zero', 'b', 'a']:
@@ -69,7 +91,8 @@ def run(source, output):
         if (output / 'request_0/rgb_public.f32').read_bytes() != (source / 'frames/a/rgb_public.f32').read_bytes():
             raise AssertionError('server did not recover after a rejected request')
         ready = server.ready
-    result = dict(source_report_sha256=digest(source / 'report.json'), ready=ready,
+    front = front_equivalence(command, front_fixture, output) if front_fixture else None
+    result = dict(source_report_sha256=digest(source / 'report.json'), ready=ready, front_end=front,
                   requests=len(exact), exact_outputs=exact, frame_ms=timings,
                   recovery_ms=recovery, rejected=['truncated skip0 request'],
                   original_kernel_executed=False)
@@ -82,5 +105,6 @@ if __name__ == '__main__':
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('encoder5_front', type=Path)
     p.add_argument('--output-root', type=Path, required=True)
+    p.add_argument('--front-fixture', type=Path, help='check_resident_front.py case folder of the same extent')
     a = p.parse_args()
-    run(a.encoder5_front, a.output_root)
+    run(a.encoder5_front, a.output_root, a.front_fixture)

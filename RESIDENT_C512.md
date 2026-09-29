@@ -628,3 +628,52 @@ byte. Older fixtures were not regenerated; their replays are unchanged.
 The public block4/preblock0 producers, the preview and the game DLL remain
 unconnected. Original C64/C128/C256 logical maps are still candidate
 assumptions.
+
+## Resident C32 front end (stem, block0–4, block4 downsample)
+
+`front_resident::FrontEnd` replaces the last public ONNX producers. From
+linear RGB it runs:
+- the 15-channel stem (noise, constant, twice the centred colour),
+- block0 at full resolution,
+- a 2×2 pool,
+- encoder C32 blocks 1–4 with shifts `0, 3, 0, 3`,
+- the block4 C32→C64 downsample.
+
+It writes the resident chain's C64 input, block4 skip and preblock0 skip in
+the native basis. The C32 bodies reuse the head70 body kernels unchanged.
+The front end itself runs in the public channel basis and converts only at
+its outputs, with the same maps as before.
+
+Weights come from the original tensors:
+- block0 (`tensor_000`) is a C32 body with a 16×32 FP16 stem inserted at
+  `0x2010` (address bits r0 r3 c3 r1 r2 c0 c1 c2 c4; row 15 is padding),
+- blocks 1–3 are plain C32 bodies,
+- block4 (`tensor_091`) holds its 64×32 FP8 downsample at `0x50B0` in the
+  public QMMA layout.
+
+Both recovered layouts reproduce the public graph's coefficients exactly;
+`front_end_reference.py` rechecks this on every run. The public graph's
+32×32 texture adapter is the identity. Its noise texture is a public
+constant, tiled for wider synthetic extents (an assumption). Shifts were
+chosen by comparing all four per block against the public graph.
+
+```powershell
+& $py tools\check_resident_front.py 'C:\path\to\prepared' --output-root 'C:\path\to\front-check'
+& $py tools\check_resident_frame_server.py 'C:\path\to\resident-encoder8' `
+  --output-root 'C:\path\to\server-check' --front-fixture 'C:\path\to\front-check\captured'
+```
+
+Both extents pass all 78 front-end stage checks, and five repeated runs are
+byte-exact. The front end takes 10.4–11.9 ms at 256×256 and 43.6–47.0 ms at
+1024×256. On the captured frame, the candidate outputs compare with the
+public ones they replace at correlation 0.9974 (C64 input), 0.9929 (block4
+skip) and 0.9996 (preblock0 skip). The difference is by design: the
+candidate rounds to FP8 between blocks, while the public graph only clamps
+in FP16. The server's front-end mode, given only colour, reproduces exactly
+the RGB the chain gives when fed the saved front-end outputs. Its full
+colour-to-RGB path takes 56–58 ms at 256×256.
+
+`run_candidate_scene_preview.py --engine resident --resident-front
+<server-check report>` uses this path, with no ONNX at run time. On the
+saved storefront capture its preview is within 3 levels (PSNR 55.6 dB) of
+the ONNX-fed resident preview.

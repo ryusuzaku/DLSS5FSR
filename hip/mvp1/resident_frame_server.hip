@@ -11,6 +11,7 @@
 #include "c128_resident.h"
 #include "c64_resident.h"
 #include "c32_resident.h"
+#include "front_resident.h"
 #include <chrono>
 #include <cstring>
 #include <fstream>
@@ -73,12 +74,13 @@ static void consume(DeviceTensor view, Buffer& destination) {
 }
 
 int main(int argc, char** argv) {
-    if (argc != 24) {
+    if (argc != 24 && argc != 25) {
         fputs("usage: resident_frame_server c512-blocks width height head-fixture bridge-map vit-blocks "
               "decoder39-fixture decoder-blocks prefix48 c256-blocks prefix56 c128-blocks prefix62 c64-blocks "
               "prefix66 c32-blocks head70 encoder15-blocks downsample22 encoder9-blocks downsample14 "
-              "encoder5-blocks downsample8\n"
-              "then one request directory per stdin line (c64_input, skip4, skip0, color .f32);\n"
+              "encoder5-blocks downsample8 [front-fixture]\n"
+              "then one request directory per stdin line (c64_input, skip4, skip0, color .f32;\n"
+              "with front-fixture only color: the C32 front end then runs on the GPU);\n"
               "writes rgb_native.f32 and rgb_public.f32 and answers OK <gpu-ms> or ERR <reason>\n", stderr);
         return 2;
     }
@@ -96,6 +98,7 @@ int main(int argc, char** argv) {
         return 2;
     }
     size_t n = size_t(width)*height*512, hn = size_t(width)*height/4*1024;
+    const bool with_front = argc == 25;
     try {
         c64_resident::Chain encoder8(width*8,height*8,enc8_blocks,true);
         c64_resident::Downsample down8(width*8,height*8,argv[23]);
@@ -118,12 +121,14 @@ int main(int argc, char** argv) {
         c32_resident::Prefix prefix66(width*8,height*8,argv[15]);
         c32_resident::Chain c32(width*16,height*16,c32_blocks);
         c32_resident::Head head70(width*32,height*32,argv[17]);
+        std::unique_ptr<front_resident::FrontEnd> front;
+        if (with_front) front.reset(new front_resident::FrontEnd(width*32,height*32,argv[24]));
         Buffer c64_input(8*n), skip4(16*n), skip0(64*n), color(6*n), rgb_native(6*n), rgb_public(6*n);
         hipEvent_t start, stop;
         HIP_CHECK(hipEventCreate(&start)); HIP_CHECK(hipEventCreate(&stop));
         HIP_CHECK(hipDeviceSynchronize());
         const Traffic setup = traffic;
-        printf("READY width=%d height=%d allocations=%zu\n", width, height, setup.allocations);
+        printf("READY width=%d height=%d front=%d allocations=%zu\n", width, height, int(with_front), setup.allocations);
         fflush(stdout);
         std::string request;
         std::vector<float> host;
@@ -135,6 +140,7 @@ int main(int argc, char** argv) {
                 {"c64_input",&c64_input},{"skip4",&skip4},{"skip0",&skip0},{"color",&color}};
             bool valid = true;
             for (const auto& item : inputs) {
+                if (with_front && item.buffer != &color) continue;
                 if (!load(request+"/"+item.name+".f32", host, item.buffer->count)) {
                     printf("ERR missing, wrong-size or nonfinite %s\n", item.name);
                     valid = false;
@@ -146,7 +152,13 @@ int main(int argc, char** argv) {
             const Traffic before = traffic;
             HIP_CHECK(hipEventRecord(start));
             // Skips stay borrowed on the device until their decoder prefixes consume them.
-            bool ok = encoder8.run_from_device({c64_input.data,8*n}) &&
+            DeviceTensor boundary4{c64_input.data,8*n}, block4_skip{skip4.data,16*n}, preblock0{skip0.data,64*n};
+            bool ok = true;
+            if (front) {
+                ok = front->run_from_device({color.data,6*n});
+                boundary4 = front->c64_view(); block4_skip = front->skip4_view(); preblock0 = front->skip0_view();
+            }
+            ok = ok && encoder8.run_from_device(boundary4) &&
                 down8.run_from_device(encoder8.raw_view()) &&
                 encoder14.run_from_device(down8.final_view()) &&
                 down14.run_from_device(encoder14.raw_view()) &&
@@ -167,9 +179,9 @@ int main(int argc, char** argv) {
                     c128.run_from_device(prefix56.final_view()) &&
                     prefix62.run_from_device(c128.final_view(), encoder8.final_view()) &&
                     c64.run_from_device(prefix62.final_view()) &&
-                    prefix66.run_from_device(c64.final_view(), {skip4.data,16*n}) &&
+                    prefix66.run_from_device(c64.final_view(), block4_skip) &&
                     c32.run_from_device(prefix66.final_view()) &&
-                    head70.run_from_device(c32.final_view(), {skip0.data,64*n}, {color.data,6*n});
+                    head70.run_from_device(c32.final_view(), preblock0, {color.data,6*n});
             }
             if (!ok) { printf("ERR resident execution rejected a view\n"); fflush(stdout); continue; }
             consume(head70.final_view(), rgb_native);
