@@ -9,13 +9,28 @@
 #include "head70_normalized.hip"
 #include <stdexcept>
 
+#include "tiled_gemm.hip"
+
 namespace c32_resident {
+// Tiled-GEMM rounding policies of the head70/C32 kernels. The expand and QKV
+// kernels quantize their input to FP8 on every product; the tile does it once
+// per staged value, which is the same value. FFN inputs are used as stored.
+struct H70 {
+    // Same RNE value as h70_h (exhaustively checked); this form stays fast in tiles.
+    __device__ static float half(float x) { return split512_half(x); }
+    __device__ static float fp8(float x) { return h70_f(x); }
+    __device__ static float load(float x) { return h70_f(x); }
+    __device__ static float hd(double x) { return h70_hd(x); }
+};
+struct H70Raw : H70 {
+    __device__ static float load(float x) { return x; }
+};
 using c512_resident::Buffer;
 using c512_resident::DeviceTensor;
 using c512_resident::traffic;
 #define C32_LAUNCH(kernel,count,...) do { \
     hipLaunchKernelGGL(kernel,dim3(((count)+255)/256),dim3(256),0,c512_resident::stream,__VA_ARGS__); \
-    HIP_CHECK(hipGetLastError()); } while(0)
+    HIP_CHECK(hipGetLastError()); if (c512_resident::launch_hook) c512_resident::launch_hook(#kernel); } while(0)
 inline bool check(const std::string& dir,const char* name,const float* data,
                   size_t count,bool verify,size_t& comparisons) {
     if (!verify) return true;
@@ -43,25 +58,31 @@ struct Weights {
 // Shared retained workspace for sequential C32 body dispatches.
 class Body {
     int capacity;
-    Buffer expanded,hidden,ffn,qkv,norm,scores,ex,den,prob,context,body,output;
+    Buffer expanded,hidden,ffn,qkv,norm,ninv,scores,ex,den,prob,context,body,output;
 public:
     explicit Body(int rows):capacity(rows),expanded(size_t(rows)*128),hidden(expanded.count),
-        ffn(size_t(rows)*32),qkv(size_t(rows)*96),norm(qkv.count),scores(size_t(rows)*64),
+        ffn(size_t(rows)*32),qkv(size_t(rows)*96),norm(qkv.count),ninv(size_t(rows)*2),scores(size_t(rows)*64),
         ex(scores.count),den(rows),prob(scores.count),context(ffn.count),body(ffn.count),output(ffn.count) {}
     bool run(const Weights& w,const float* input,int rows,bool verify,size_t& comparisons) {
         if (!input || rows<=0 || rows>capacity || rows%64) return false;
         auto dw=w.data.data;size_t n=size_t(rows)*32;
-        C32_LAUNCH(k_h70_expand,size_t(rows)*128,input,dw,expanded.data,rows);
-        C32_LAUNCH(k_h70_hidden,size_t(rows)*128,expanded.data,hidden.data,rows*128);
-        C32_LAUNCH(k_h70_ffn,n,input,hidden.data,dw+4096,dw+16385,ffn.data,rows);
-        C32_LAUNCH(k_h70_qkv,size_t(rows)*96,ffn.data,dw+8192,qkv.data,rows);
-        C32_LAUNCH(k_h70_qknorm,size_t(rows)*96,qkv.data,norm.data,rows,w.scale);
+        tiled::gemm<H70,tiled::GATE,false>(c512_resident::stream,input,32,dw,32,nullptr,0,nullptr,
+            verify?expanded.data:nullptr,hidden.data,128,rows,128);
+        tiled::gemm<H70Raw,tiled::RAW,true>(c512_resident::stream,hidden.data,128,dw+4096,128,input,32,dw+16385,
+            ffn.data,nullptr,32,rows,32);
+        tiled::gemm<H70,tiled::RAW,false>(c512_resident::stream,ffn.data,32,dw+8192,32,nullptr,0,nullptr,
+            qkv.data,nullptr,96,rows,96);
+        HIP_CHECK(hipGetLastError());
+        C32_LAUNCH(k_h70_qknorm_inv,size_t(rows)*2,qkv.data,ninv.data,rows);
+        C32_LAUNCH(k_h70_qknorm_apply,size_t(rows)*96,qkv.data,ninv.data,norm.data,rows,w.scale);
         C32_LAUNCH(k_h70_scores,size_t(rows)*64,norm.data,dw+12288,scores.data,rows/64);
         C32_LAUNCH(k_h70_exp,size_t(rows)*64,scores.data,ex.data,rows*64);
         C32_LAUNCH(k_h70_den,rows,ex.data,den.data,rows);
         C32_LAUNCH(k_h70_prob,size_t(rows)*64,ex.data,den.data,prob.data,rows*64);
         C32_LAUNCH(k_h70_context,n,prob.data,norm.data,context.data,rows/64);
-        C32_LAUNCH(k_h70_projection,n,context.data,ffn.data,dw+11264,dw+16417,body.data,rows);
+        tiled::gemm<H70,tiled::DOUBLE_RES,true>(c512_resident::stream,context.data,32,dw+11264,32,ffn.data,32,dw+16417,
+            body.data,nullptr,32,rows,32);
+        HIP_CHECK(hipGetLastError());
         C32_LAUNCH(quantize_body,n,body.data,output.data,int(n));
         struct Stage {const char* name;float* data;size_t count;};
         Stage stages[]={{"expanded",expanded.data,size_t(rows)*128},{"hidden",hidden.data,size_t(rows)*128},
@@ -85,17 +106,23 @@ public:
             size_t n=size_t(r)*32;
             const float* in=input+size_t(start)*32;
             float* out=raw_out+size_t(start)*32;
-            C32_LAUNCH(k_h70_expand,size_t(r)*128,in,dw,expanded.data,r);
-            C32_LAUNCH(k_h70_hidden,size_t(r)*128,expanded.data,hidden.data,r*128);
-            C32_LAUNCH(k_h70_ffn,n,in,hidden.data,dw+4096,dw+16385,ffn.data,r);
-            C32_LAUNCH(k_h70_qkv,size_t(r)*96,ffn.data,dw+8192,qkv.data,r);
-            C32_LAUNCH(k_h70_qknorm,size_t(r)*96,qkv.data,norm.data,r,w.scale);
+            tiled::gemm<H70,tiled::GATE,false>(c512_resident::stream,in,32,dw,32,nullptr,0,nullptr,
+                nullptr,hidden.data,128,r,128);
+            tiled::gemm<H70Raw,tiled::RAW,true>(c512_resident::stream,hidden.data,128,dw+4096,128,in,32,dw+16385,
+                ffn.data,nullptr,32,r,32);
+            tiled::gemm<H70,tiled::RAW,false>(c512_resident::stream,ffn.data,32,dw+8192,32,nullptr,0,nullptr,
+                qkv.data,nullptr,96,r,96);
+            HIP_CHECK(hipGetLastError());
+            C32_LAUNCH(k_h70_qknorm_inv,size_t(r)*2,qkv.data,ninv.data,r);
+        C32_LAUNCH(k_h70_qknorm_apply,size_t(r)*96,qkv.data,ninv.data,norm.data,r,w.scale);
             C32_LAUNCH(k_h70_scores,size_t(r)*64,norm.data,dw+12288,scores.data,r/64);
             C32_LAUNCH(k_h70_exp,size_t(r)*64,scores.data,ex.data,r*64);
             C32_LAUNCH(k_h70_den,r,ex.data,den.data,r);
             C32_LAUNCH(k_h70_prob,size_t(r)*64,ex.data,den.data,prob.data,r*64);
             C32_LAUNCH(k_h70_context,n,prob.data,norm.data,context.data,r/64);
-            C32_LAUNCH(k_h70_projection,n,context.data,ffn.data,dw+11264,dw+16417,out,r);
+            tiled::gemm<H70,tiled::DOUBLE_RES,true>(c512_resident::stream,context.data,32,dw+11264,32,ffn.data,32,
+                dw+16417,out,nullptr,32,r,32);
+            HIP_CHECK(hipGetLastError());
             if (quant_out) C32_LAUNCH(quantize_body,n,out,quant_out+size_t(start)*32,int(n));
         }
         return true;

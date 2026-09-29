@@ -8,7 +8,10 @@
 #include <math.h>
 
 __device__ static float head70_half(float x) {
-    return __half2float(__float2half_rn(x));
+    // Same RNE rounding as __float2half_rn for all 2^32 inputs (exhaustively
+    // checked), but compiles to the fast hardware conversion.
+    _Float16 v = (_Float16)x;
+    return (float)v;
 }
 
 // Write directly into [window][64][32] for an 8x8-window body.

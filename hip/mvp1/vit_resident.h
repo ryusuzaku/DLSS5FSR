@@ -2,6 +2,7 @@
 // Persistent ViT31-38 workspace; arithmetic stays in the standalone kernels.
 #include "split512_resident.h"
 #include "vit_expand_chain.hip"
+#include "tiled_gemm.hip"
 #include <stdexcept>
 
 namespace vit_resident {
@@ -21,7 +22,7 @@ struct Weights {
 
 #define VIT_LAUNCH(kernel, count, ...) do { \
     hipLaunchKernelGGL(kernel, dim3(((count)+255)/256), dim3(256), 0, c512_resident::stream, __VA_ARGS__); \
-    HIP_CHECK(hipGetLastError()); } while (0)
+    HIP_CHECK(hipGetLastError()); if (c512_resident::launch_hook) c512_resident::launch_hook(#kernel); } while (0)
 
 class Chain {
     static int checked_tokens(int tokens, size_t blocks) {
@@ -64,10 +65,23 @@ public:
         for (const auto& owned : weights) {
             const auto& w = *owned;
             if (!check(w.dir, "input", input, n, verify)) return false;
-            VIT_LAUNCH(k_vit_expand, 4*n, input, w.expand.data, expanded.data, hidden.data, tokens);
-            VIT_LAUNCH(k_vit_residual_projection, n, hidden.data, input, w.contract.data,
-                       w.skip.data, contract.data, tokens, 4096);
-            VIT_LAUNCH(k_vit_qkv_projection, 3*n, contract.data, w.qkv.data, projected.data, tokens);
+            // Few tokens keep the one-thread-per-output kernels (more parallel);
+            // larger counts use the tiled, bit-identical forms (4-/2-part partitions).
+            const bool small = tokens <= 64;
+            if (small) {
+                VIT_LAUNCH(k_vit_expand, 4*n, input, w.expand.data, expanded.data, hidden.data, tokens);
+                VIT_LAUNCH(k_vit_residual_projection, n, hidden.data, input, w.contract.data,
+                           w.skip.data, contract.data, tokens, 4096);
+                VIT_LAUNCH(k_vit_qkv_projection, 3*n, contract.data, w.qkv.data, projected.data, tokens);
+            } else {
+                tiled::gemm<tiled::Split,tiled::GATE,false>(c512_resident::stream, input, 1024, w.expand.data, 1024, nullptr, 0, nullptr,
+                    verify ? expanded.data : nullptr, hidden.data, 4096, tokens, 4096);
+                tiled::gemm<tiled::Split,tiled::FP8,true>(c512_resident::stream, hidden.data, 4096, w.contract.data, 4096, input, 1024,
+                    w.skip.data, contract.data, nullptr, 1024, tokens, 1024, 1, 0, 0, 0, 4);
+                tiled::gemm<tiled::Split,tiled::RAW,false>(c512_resident::stream, contract.data, 1024, w.qkv.data, 1024, nullptr, 0, nullptr,
+                    projected.data, nullptr, 3072, tokens, 3072, 1, 0, 0, 0, 2);
+                HIP_CHECK(hipGetLastError());
+            }
             VIT_LAUNCH(k_vit_qkv_normalize, 3*n, projected.data, w.scales.data, qkv.data, tokens);
             VIT_LAUNCH(k_vit_scores, sn, qkv.data, scores.data, tokens);
             VIT_LAUNCH(k_vit_exponents, sn, scores.data, exponents.data, int(sn));
@@ -76,8 +90,14 @@ public:
             } else {
                 VIT_LAUNCH(k_vit_attention16_candidate, n, qkv.data, exponents.data, attention.data);
             }
-            VIT_LAUNCH(k_vit_residual_projection, n, attention.data, contract.data,
-                       w.projection.data, w.projection_skip.data, output, tokens, 1024);
+            if (small) {
+                VIT_LAUNCH(k_vit_residual_projection, n, attention.data, contract.data,
+                           w.projection.data, w.projection_skip.data, output, tokens, 1024);
+            } else {
+                tiled::gemm<tiled::Split,tiled::FP8,true>(c512_resident::stream, attention.data, 1024, w.projection.data, 1024, contract.data, 1024,
+                    w.projection_skip.data, output, nullptr, 1024, tokens, 1024, 1, 0, 0, 0, 4);
+                HIP_CHECK(hipGetLastError());
+            }
             if (!check(w.dir, "expanded", expanded.data, 4*n, verify) ||
                 !check(w.dir, "hidden", hidden.data, 4*n, verify) ||
                 !check(w.dir, "contract", contract.data, n, verify) ||

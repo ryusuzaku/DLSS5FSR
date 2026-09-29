@@ -4,6 +4,8 @@
 #include "split512_attention.hip"
 #include "split512_window.hip"
 #include "split512_bridge.hip"
+#include "resident_stream.h"
+#include "tiled_gemm.hip"
 #include <memory>
 #include <utility>
 
@@ -12,9 +14,7 @@ struct Traffic {
     size_t allocations = 0, h2d_bytes = 0, d2h_bytes = 0, d2d_bytes = 0;
 };
 inline Traffic traffic;
-// Stream for every resident launch and device copy; null keeps the harness's
-// default-stream behaviour, an engine may select a non-blocking stream.
-inline hipStream_t stream = nullptr;
+
 
 // Borrowed default-stream device view; it never owns or frees its pointer.
 struct DeviceTensor {
@@ -53,7 +53,7 @@ struct Weights {
 
 #define C512_LAUNCH(kernel, count, ...) do { \
     hipLaunchKernelGGL(kernel, dim3(((count)+255)/256), dim3(256), 0, c512_resident::stream, __VA_ARGS__); \
-    HIP_CHECK(hipGetLastError()); } while (0)
+    HIP_CHECK(hipGetLastError()); if (c512_resident::launch_hook) c512_resident::launch_hook(#kernel); } while (0)
 
 class Chain {
     int width, height, tokens, max_window_tokens;
@@ -61,7 +61,7 @@ class Chain {
     std::unique_ptr<Buffer> seed;  // standalone replay input, loaded on first run()
     std::string seed_dir;
     Buffer ping, pong, pre, mixed, hidden, branch, feature, window, qkv,
-           normalized, scores, exponents, probabilities, context, crop;
+           normalized, scores, exponents, probabilities, inverse, context, crop;
     std::vector<std::unique_ptr<Weights>> weights;
     std::unique_ptr<Buffer> head_weights, pooled, head_output;
     std::string head_dir;
@@ -86,7 +86,8 @@ public:
         hidden(size_t(tokens)*2048), branch(n), feature(n), window(size_t(max_window_tokens)*512),
         qkv(size_t(max_window_tokens)*1536), normalized(size_t(max_window_tokens)*1536),
         scores(size_t(max_window_tokens)*1024), exponents(size_t(max_window_tokens)*1024),
-        probabilities(size_t(max_window_tokens)*1024), context(size_t(max_window_tokens)*512),
+        probabilities(size_t(max_window_tokens)*1024), inverse(size_t(max_window_tokens)*32),
+        context(size_t(max_window_tokens)*512),
         crop(n), head_dir(head), raw_output(n) {
         for (const auto& block : blocks)
             weights.emplace_back(new Weights(block.first, block.second));
@@ -121,23 +122,51 @@ public:
             size_t wn = size_t(wt)*512, qn = size_t(wt)*1536, sn = size_t(windows)*16*4096;
             // This is a readback assertion only. No later input fixture is uploaded.
             if (!check(w.dir, "input", input, n, verify)) return false;
-            C512_LAUNCH(k_split512_pre, n, input, w.matrix.data, pre.data, tokens);
+            // Few tokens keep the one-thread-per-output kernels; larger extents tile.
+            const bool small = tokens <= 64;
+            if (small) {
+                C512_LAUNCH(k_split512_pre, n, input, w.matrix.data, pre.data, tokens);
+            } else {
+                tiled::gemm<tiled::Split,tiled::RAW,false>(c512_resident::stream, input, 512, w.matrix.data, 512, nullptr, 0, nullptr,
+                    pre.data, nullptr, 512, tokens, 512);
+            }
             if (!check(w.dir, "expected", pre.data, n, verify)) return false;
             C512_LAUNCH(k_split512_quant, n, pre.data, mixed.data, int(n));
-            C512_LAUNCH(k_split512_expand, size_t(tokens)*2048, mixed.data, w.expand.data, hidden.data, tokens);
-            C512_LAUNCH(k_split512_contract, n, hidden.data, w.contract.data, branch.data, tokens);
+            // Eight groups: 64 -> 256 expand with gate, 256 -> 64 contract.
+            if (small) {
+                C512_LAUNCH(k_split512_expand, size_t(tokens)*2048, mixed.data, w.expand.data, hidden.data, tokens);
+                C512_LAUNCH(k_split512_contract, n, hidden.data, w.contract.data, branch.data, tokens);
+            } else {
+                tiled::gemm<tiled::Split,tiled::GATE,false>(c512_resident::stream, mixed.data, 512, w.expand.data, 64, nullptr, 0, nullptr,
+                    nullptr, hidden.data, 2048, tokens, 256, 8, 64, 256*64, 256);
+                tiled::gemm<tiled::Split,tiled::FP8,false>(c512_resident::stream, hidden.data, 2048, w.contract.data, 256, nullptr, 0, nullptr,
+                    branch.data, nullptr, 512, tokens, 64, 8, 256, 64*256, 64);
+                HIP_CHECK(hipGetLastError());
+            }
             if (!check(w.dir, "branch", branch.data, n, verify)) return false;
-            C512_LAUNCH(k_split512_ffn_projection, n, branch.data, input, w.projection.data,
-                        w.skip.data, nullptr, feature.data, tokens);
+            if (small) {
+                C512_LAUNCH(k_split512_ffn_projection, n, branch.data, input, w.projection.data,
+                            w.skip.data, nullptr, feature.data, tokens);
+            } else {
+                tiled::gemm<tiled::Split,tiled::FP8,true>(c512_resident::stream, branch.data, 512, w.projection.data, 512, input, 512,
+                    w.skip.data, feature.data, nullptr, 512, tokens, 512);
+            }
             if (!check(w.dir, "feature", feature.data, n, verify)) return false;
             C512_LAUNCH(k_split512_window_gather, wn, feature.data, window.data, width, height, w.shift);
             if (!check(w.dir, "feature_window", window.data, wn, verify)) return false;
-            C512_LAUNCH(k_split512_qkv, qn, window.data, w.qkv.data, qkv.data, wt);
+            if (small) {
+                C512_LAUNCH(k_split512_qkv, qn, window.data, w.qkv.data, qkv.data, wt);
+            } else {
+                tiled::gemm<tiled::Split,tiled::RAW,false>(c512_resident::stream, window.data, 512, w.qkv.data, 512, nullptr, 0, nullptr,
+                    qkv.data, nullptr, 1536, wt, 1536);
+            }
             if (!check(w.dir, "qkv", qkv.data, qn, verify)) return false;
-            C512_LAUNCH(k_split512_qknorm, qn, qkv.data, w.scales.data, normalized.data, windows);
+            C512_LAUNCH(k_split512_qknorm_inv, size_t(wt)*2*16, qkv.data, inverse.data, wt, 512);
+            C512_LAUNCH(k_split512_qknorm_apply, size_t(wt)*3*512, qkv.data, w.scales.data, inverse.data, normalized.data, wt, 512);
             C512_LAUNCH(k_split512_scores, sn, normalized.data, w.bias.data, scores.data, windows);
             C512_LAUNCH(k_split512_exp, sn, scores.data, exponents.data, int(sn));
-            C512_LAUNCH(k_split512_prob, sn, exponents.data, probabilities.data, int(sn));
+            C512_LAUNCH(k_split512_inv_rows, sn/64, exponents.data, inverse.data, int(sn/64));
+            C512_LAUNCH(k_split512_prob_rows, sn, exponents.data, inverse.data, probabilities.data, int(sn));
             C512_LAUNCH(k_split512_context, wn, probabilities.data, normalized.data, context.data, windows);
             if (!check(w.dir, "normalized", normalized.data, qn, verify) ||
                 !check(w.dir, "scores", scores.data, sn, verify) ||
@@ -146,8 +175,14 @@ public:
                 !check(w.dir, "context", context.data, wn, verify)) return false;
             C512_LAUNCH(k_split512_window_scatter, n, context.data, crop.data, width, height, w.shift);
             if (!check(w.dir, "context_hwc", crop.data, n, verify)) return false;
-            C512_LAUNCH(k_split512_ffn_projection, n, crop.data, feature.data, w.final.data,
-                        w.final_skip.data, raw_output.data, output, tokens);
+            if (small) {
+                C512_LAUNCH(k_split512_ffn_projection, n, crop.data, feature.data, w.final.data,
+                            w.final_skip.data, raw_output.data, output, tokens);
+            } else {
+                tiled::gemm<tiled::Split,tiled::FP8,true>(c512_resident::stream, crop.data, 512, w.final.data, 512, feature.data, 512,
+                    w.final_skip.data, output, raw_output.data, 512, tokens, 512);
+                HIP_CHECK(hipGetLastError());
+            }
             if (!check(w.dir, "final_raw", raw_output.data, n, verify) ||
                 !check(w.dir, "final", output, n, verify)) return false;
             std::swap(input, output);

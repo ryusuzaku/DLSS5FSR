@@ -6,6 +6,7 @@
 #include "spatial128_window.hip"
 #include "c128_ffn_candidate.hip"
 #include "c128_attention_candidate.hip"
+#include "tiled_gemm.hip"
 #include "encoder128_downsample.hip"
 #include <stdexcept>
 
@@ -16,7 +17,7 @@ using c512_resident::traffic;
 
 #define C128_LAUNCH(kernel, count, ...) do { \
     hipLaunchKernelGGL(kernel, dim3(((count)+127)/128), dim3(128), 0, c512_resident::stream, __VA_ARGS__); \
-    HIP_CHECK(hipGetLastError()); } while (0)
+    HIP_CHECK(hipGetLastError()); if (c512_resident::launch_hook) c512_resident::launch_hook(#kernel); } while (0)
 
 inline bool check(const std::string& dir, const char* name, const float* device,
                   size_t count, bool verify, size_t& comparisons) {
@@ -81,7 +82,7 @@ class Chain {
     size_t n;
     bool encoder;
     Buffer ping,pong,windows,expanded,hidden,middle,feature,qkv,normalized,scores,
-           exponents,probabilities,context,linear,residual;
+           exponents,probabilities,inverse,context,linear,residual;
     // Encoder mode also keeps the last block's unquantized projection for its pool.
     std::unique_ptr<Buffer> raw_windows,raw;
     std::vector<std::unique_ptr<Weights>> weights;
@@ -93,7 +94,7 @@ public:
         ping(n),pong(n),windows(size_t(max_tokens)*128),expanded(size_t(max_tokens)*512),
         hidden(expanded.count),middle(windows.count),feature(windows.count),qkv(windows.count*3),
         normalized(qkv.count),scores(size_t(max_tokens)*256),exponents(scores.count),
-        probabilities(scores.count),context(windows.count),linear(windows.count),residual(windows.count) {
+        probabilities(scores.count),inverse(scores.count/32),context(windows.count),linear(windows.count),residual(windows.count) {
         if (encoder) { raw_windows.reset(new Buffer(windows.count)); raw.reset(new Buffer(n)); }
         for (const auto& b:blocks) weights.emplace_back(new Weights(b.first,b.second));
     }
@@ -114,23 +115,30 @@ public:
             size_t count=size_t(tokens)*128, sc=size_t(wn)*4*4096;
             if (!check(w.dir+"/spatial","input",input,n,verify,comparisons)) return false;
             C128_LAUNCH(k_spatial128_gather,count,input,windows.data,width,height,w.shift);
-            C128_LAUNCH(k_c128_w1,4*count,windows.data,w.w1.data,expanded.data,tokens);
-            C128_LAUNCH(k_c128_gate,4*count,expanded.data,hidden.data,int(4*count));
-            C128_LAUNCH(k_c128_w2,count,hidden.data,w.w2.data,middle.data,tokens);
-            C128_LAUNCH(k_c128_w3,count,middle.data,windows.data,w.w3.data,w.skip.data,feature.data,tokens);
-            C128_LAUNCH(k_c128_qkv,3*count,feature.data,w.qkv.data,qkv.data,tokens);
-            C128_LAUNCH(k_c128_qknorm,3*count,qkv.data,w.scales.data,normalized.data,wn);
+            // Tiled, bit-identical forms of the w1+gate, w2, w3 and QKV kernels.
+            tiled::gemm<tiled::Split,tiled::GATE,false>(c512_resident::stream,windows.data,128,w.w1.data,128,
+                nullptr,0,nullptr,verify?expanded.data:nullptr,hidden.data,512,tokens,512);
+            tiled::gemm<tiled::Split,tiled::FP8,false>(c512_resident::stream,hidden.data,512,w.w2.data,512,
+                nullptr,0,nullptr,middle.data,nullptr,128,tokens,128);
+            tiled::gemm<tiled::Split,tiled::FP8,true>(c512_resident::stream,middle.data,128,w.w3.data,128,
+                windows.data,128,w.skip.data,feature.data,nullptr,128,tokens,128);
+            tiled::gemm<tiled::Split,tiled::RAW,false>(c512_resident::stream,feature.data,128,w.qkv.data,128,
+                nullptr,0,nullptr,qkv.data,nullptr,384,tokens,384);
+            HIP_CHECK(hipGetLastError());
+            C128_LAUNCH(k_split512_qknorm_inv,size_t(tokens)*2*4,qkv.data,inverse.data,tokens,128);
+            C128_LAUNCH(k_split512_qknorm_apply,size_t(tokens)*3*128,qkv.data,w.scales.data,inverse.data,normalized.data,tokens,128);
             C128_LAUNCH(k_c128_scores,sc,normalized.data,w.bias.data,scores.data,wn);
             C128_LAUNCH(k_split512_exp,sc,scores.data,exponents.data,int(sc));
-            C128_LAUNCH(k_split512_prob,sc,exponents.data,probabilities.data,int(sc));
+            C128_LAUNCH(k_split512_inv_rows,sc/64,exponents.data,inverse.data,int(sc/64));
+            C128_LAUNCH(k_split512_prob_rows,sc,exponents.data,inverse.data,probabilities.data,int(sc));
             C128_LAUNCH(k_c128_context,count,probabilities.data,normalized.data,context.data,wn);
-            C128_LAUNCH(k_c128_projection_linear,count,context.data,w.projection.data,linear.data,tokens);
-            C128_LAUNCH(k_c128_projection_residual,count,context.data,feature.data,w.projection.data,
-                        w.attention_skip.data,residual.data,tokens);
+            // The linear projection is a diagnostic output; it runs only when verifying.
+            if (verify) C128_LAUNCH(k_c128_projection_linear,count,context.data,w.projection.data,linear.data,tokens);
+            tiled::gemm<tiled::Split,tiled::FP8,true>(c512_resident::stream,context.data,128,w.projection.data,128,
+                feature.data,128,w.attention_skip.data,residual.data,last_raw?raw_windows->data:nullptr,128,tokens,128);
+            HIP_CHECK(hipGetLastError());
             C128_LAUNCH(k_spatial128_scatter,n,residual.data,output,width,height,w.shift);
             if (last_raw) {
-                C128_LAUNCH(k_c128_projection_residual,count,context.data,feature.data,w.projection.data,
-                            w.attention_skip.data,raw_windows->data,tokens,true);
                 C128_LAUNCH(k_spatial128_scatter,n,raw_windows->data,raw->data,width,height,w.shift);
             }
             if (!check(w.dir+"/spatial","windows",windows.data,count,verify,comparisons) ||

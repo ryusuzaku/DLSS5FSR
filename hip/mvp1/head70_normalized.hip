@@ -6,7 +6,9 @@
 __device__ static float h70_h(float x) { return head70_half(x); }
 __device__ static float h70_hd(double x) { return float(static_cast<_Float16>(x)); }
 __device__ static float h70_f(float x) {
-    return sw_e4m3_decode(sw_h2e4m3(__half_as_ushort(__float2half_rn(x))));
+    // _Float16 cast == __float2half_rn for every float (exhaustively checked).
+    _Float16 v = (_Float16)x; unsigned short bits; __builtin_memcpy(&bits, &v, 2);
+    return sw_e4m3_decode(sw_h2e4m3(bits));
 }
 
 extern "C" __global__ void k_h70_expand(const float* x, const float* w, float* out, int rows) {
@@ -48,7 +50,7 @@ extern "C" __global__ void k_h70_qkv(const float* x,const float* w,float* out,in
     out[i]=h70_h(sum);
 }
 
-__device__ static float h70_normalize(const float* v,int c) {
+__device__ static float h70_normalize_inverse(const float* v) {
     float partial[16];
     for(int j=0;j<16;j++) {
         volatile float upper=v[j+16]*v[j+16];
@@ -60,8 +62,64 @@ __device__ static float h70_normalize(const float* v,int c) {
         for(int j=0;j<width;j++) partial[j]=h70_h(partial[j]+partial[j+width]);
     volatile float root=sqrtf(fmaxf(partial[0],.00006198883056640625f));
     volatile float reciprocal=1.f/root;
-    volatile float value=v[c]*h70_h(reciprocal);
+    return h70_h(reciprocal);
+}
+
+__device__ static float h70_normalize(const float* v,int c) {
+    volatile float value=v[c]*h70_normalize_inverse(v);
     return h70_h(value);
+}
+
+// The same reduction without volatile temporaries (which force scratch memory).
+// Built with -ffp-contract=off and no fast-math, every operation still rounds
+// exactly as written, so the result equals h70_normalize_inverse.
+__device__ static float h70_normalize_inverse_fast(const float* v) {
+    float partial[16];
+#pragma unroll
+    for(int j=0;j<16;j++) {
+        float upper=v[j+16]*v[j+16];
+        partial[j]=h70_hd(double(v[j])*double(v[j])+double(h70_h(upper)));
+    }
+#pragma unroll
+    for(int j=0;j<8;j++) partial[j]=h70_h(partial[2*j]+partial[2*j+1]);
+#pragma unroll
+    for(int width=4;width; width/=2)
+#pragma unroll
+        for(int j=0;j<width;j++) partial[j]=h70_h(partial[j]+partial[j+width]);
+    float root=sqrtf(fmaxf(partial[0],.00006198883056640625f));
+    float reciprocal=1.f/root;
+    return h70_h(reciprocal);
+}
+
+// Two-phase k_h70_qknorm: the per-head inverse once, then coalesced elements.
+extern "C" __global__ void k_h70_qknorm_inv(const float* qkv,float* inv,int rows) {
+    int i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=rows*2) return;
+    inv[i]=h70_normalize_inverse_fast(qkv+(i/2)*96+(i%2)*32);
+}
+
+extern "C" __global__ void k_h70_qknorm_apply(const float* qkv,const float* inv,float* out,int rows,float scale) {
+    int i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=rows*96) return;
+    int r=i/96,m=i%96/32;
+    if(m==2){out[i]=h70_f(qkv[i]);return;}
+    float value=h70_h(qkv[i]*inv[r*2+m]);
+    if(m==0)value=h70_h(value*h70_h(scale));
+    out[i]=h70_f(value);
+}
+
+// Row form of k_h70_qknorm: one thread per row and matrix (one 32-channel head).
+extern "C" __global__ void k_h70_qknorm_rows(const float* qkv,float* out,int rows,float scale) {
+    int i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=rows*3) return;
+    int r=i/3,m=i%3;
+    const float* v=qkv+r*96+m*32;
+    float* o=out+r*96+m*32;
+    if(m==2){for(int c=0;c<32;c++)o[c]=h70_f(v[c]);return;}
+    float inv=h70_normalize_inverse_fast(v);
+    float head_scale=h70_h(scale);
+    for(int c=0;c<32;c++){
+        float value=h70_h(v[c]*inv);
+        if(m==0)value=h70_h(value*head_scale);
+        o[c]=h70_f(value);
+    }
 }
 
 extern "C" __global__ void k_h70_qknorm(const float* qkv,float* out,int rows,float scale) {
