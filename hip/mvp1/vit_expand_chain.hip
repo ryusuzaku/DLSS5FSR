@@ -170,6 +170,30 @@ __global__ void k_vit_attention(const float* qkv,const float* exponents,
     output[i]=split512_fp8(split512_half(numerator*split512_half(1.0f/den)));
 }
 
+// Any multiple of 64 tokens: the 64-key denominator reduction per chunk with a
+// half-rounded sum across chunks, and the 32-key numerator parts accumulated
+// with a half boundary after each part. Identical to k_vit_attention at 64.
+__global__ void k_vit_attention_chunks(const float* qkv,const float* exponents,
+                                       float* output,int tokens) {
+    int i=blockIdx.x*blockDim.x+threadIdx.x;
+    if(i>=tokens*1024)return;
+    int query=i/1024,head=i%1024/32,channel=i%32;
+    const float* e=exponents+(size_t(head)*tokens+query)*tokens;
+    float den=0.0f;
+    for(int chunk=0;chunk<tokens;chunk+=64) {
+        float part=vit_denominator(e+chunk);
+        den=chunk?split512_half(den+part):part;
+    }
+    float numerator=0.0f;
+    for(int base=0;base<tokens;base+=32) {
+        double sum=0;
+        for(int k=base;k<base+32;++k)
+            sum+=double(split512_fp8(e[k]))*double(qkv[size_t(k)*3072+2048+head*32+channel]);
+        numerator=base?split512_half((float)(double(numerator)+sum)):split512_half((float)sum);
+    }
+    output[i]=split512_fp8(split512_half(numerator*split512_half(1.0f/den)));
+}
+
 // Candidate for the image's 16 valid tokens. The original 16-token reduction
 // order has not been checked against an SM120 execution.
 __global__ void k_vit_attention16_candidate(const float* qkv,const float* exponents,

@@ -12,8 +12,8 @@ using c512_resident::traffic;
 
 class Entry {
     static int checked_width(int width, int height) {
-        if ((width != 4 && width != 16) || height != 4)
-            throw std::invalid_argument("resident decoder39 requires 4x4 or 16x4");
+        if (width <= 0 || height <= 0 || (width*height) % 16)
+            throw std::invalid_argument("resident decoder39 needs a token count that is a multiple of 16");
         return width;
     }
     int width, height, tokens;
@@ -37,6 +37,14 @@ public:
         skip_n(size_t(tokens)*4*512), dir(fixture), inverse((dir+"/inverse.i32").c_str(), n),
         weights(dir, "weights", 512*1024), scale(dir, "scale", 512),
         main(n), projected(size_t(tokens)*512), output(skip_n) {}
+    // Weights from the fixture, inverse map computed for this extent.
+    Entry(int w, int h, const std::string& fixture, const std::vector<int32_t>& inverse_map) :
+        width(checked_width(w, h)), height(h), tokens(width*height), n(size_t(tokens)*1024),
+        skip_n(size_t(tokens)*4*512), dir(fixture), inverse(inverse_map),
+        weights(dir, "weights", 512*1024), scale(dir, "scale", 512),
+        main(n), projected(size_t(tokens)*512), output(skip_n) {
+        if (inverse_map.size() != n) throw std::invalid_argument("decoder39 inverse map extent differs");
+    }
 
     // Both borrowed inputs belong to the same frame and HIP default stream.
     // Caller retains ownership; no input is overwritten. Output lasts to next run.

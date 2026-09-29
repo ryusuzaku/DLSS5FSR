@@ -25,8 +25,8 @@ struct Weights {
 
 class Chain {
     static int checked_tokens(int tokens, size_t blocks) {
-        if ((tokens != 16 && tokens != 64) || blocks != 8)
-            throw std::invalid_argument("resident ViT requires 16/64 tokens and eight blocks");
+        if ((tokens != 16 && (tokens <= 0 || tokens % 64)) || blocks != 8)
+            throw std::invalid_argument("resident ViT requires 16 or a multiple of 64 tokens and eight blocks");
         return tokens;
     }
     int tokens;
@@ -71,8 +71,8 @@ public:
             VIT_LAUNCH(k_vit_qkv_normalize, 3*n, projected.data, w.scales.data, qkv.data, tokens);
             VIT_LAUNCH(k_vit_scores, sn, qkv.data, scores.data, tokens);
             VIT_LAUNCH(k_vit_exponents, sn, scores.data, exponents.data, int(sn));
-            if (tokens == 64) {
-                VIT_LAUNCH(k_vit_attention, n, qkv.data, exponents.data, attention.data, tokens);
+            if (tokens % 64 == 0) {
+                VIT_LAUNCH(k_vit_attention_chunks, n, qkv.data, exponents.data, attention.data, tokens);
             } else {
                 VIT_LAUNCH(k_vit_attention16_candidate, n, qkv.data, exponents.data, attention.data);
             }

@@ -177,6 +177,9 @@ struct Config {
     std::wstring residentEngineConfig;
     int residentEngineGain = 0;
     int residentEngineInterval = 1;
+    // 1: run the whole frame at its padded network extent and write it back
+    // at full size; 0: the 256x256 centre-crop preview.
+    bool residentEngineFull = false;
 
     // Scene value the game's tonemapper calls white. Everything the encode
     // does is relative to it, and getting it wrong is not a subtle error: the

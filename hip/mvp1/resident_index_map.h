@@ -11,6 +11,12 @@ struct IndexMap {
         if (!f) HEAD70_INVALID("cannot read bridge map");
         bool ok = fread(values.data(), sizeof(int32_t), count, f) == count && fgetc(f) == EOF;
         fclose(f);
+        load(values, ok);
+    }
+    // In-memory map, for extents whose map is computed rather than saved.
+    explicit IndexMap(const std::vector<int32_t>& values) { load(values, true); }
+    void load(const std::vector<int32_t>& values, bool ok) {
+        size_t count = values.size();
         std::vector<bool> seen(count);
         for (int32_t value : values) {
             if (value < 0 || size_t(value) >= count || seen[value]) { ok = false; break; }

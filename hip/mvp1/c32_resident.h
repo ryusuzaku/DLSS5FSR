@@ -73,10 +73,37 @@ public:
     }
     const float* raw() const {return body.data;}
     const float* quantized() const {return output.data;}
+    int rows_capacity() const {return capacity;}
+    // Any number of windows in capacity-sized chunks, written straight into
+    // caller buffers (raw half body, optional FP8 output). Windows are
+    // independent, so chunking at multiples of 64 rows keeps the arithmetic.
+    bool run_into(const Weights& w,const float* input,int rows,float* raw_out,float* quant_out) {
+        if (!input || !raw_out || rows<=0 || rows%64 || capacity%64) return false;
+        auto dw=w.data.data;
+        for (int start=0;start<rows;start+=capacity) {
+            int r=rows-start<capacity?rows-start:capacity;
+            size_t n=size_t(r)*32;
+            const float* in=input+size_t(start)*32;
+            float* out=raw_out+size_t(start)*32;
+            C32_LAUNCH(k_h70_expand,size_t(r)*128,in,dw,expanded.data,r);
+            C32_LAUNCH(k_h70_hidden,size_t(r)*128,expanded.data,hidden.data,r*128);
+            C32_LAUNCH(k_h70_ffn,n,in,hidden.data,dw+4096,dw+16385,ffn.data,r);
+            C32_LAUNCH(k_h70_qkv,size_t(r)*96,ffn.data,dw+8192,qkv.data,r);
+            C32_LAUNCH(k_h70_qknorm,size_t(r)*96,qkv.data,norm.data,r,w.scale);
+            C32_LAUNCH(k_h70_scores,size_t(r)*64,norm.data,dw+12288,scores.data,r/64);
+            C32_LAUNCH(k_h70_exp,size_t(r)*64,scores.data,ex.data,r*64);
+            C32_LAUNCH(k_h70_den,r,ex.data,den.data,r);
+            C32_LAUNCH(k_h70_prob,size_t(r)*64,ex.data,den.data,prob.data,r*64);
+            C32_LAUNCH(k_h70_context,n,prob.data,norm.data,context.data,r/64);
+            C32_LAUNCH(k_h70_projection,n,context.data,ffn.data,dw+11264,dw+16417,out,r);
+            if (quant_out) C32_LAUNCH(quantize_body,n,out,quant_out+size_t(start)*32,int(n));
+        }
+        return true;
+    }
 };
 class Prefix {
     static int checked(int w, int h) {
-        if ((w != 64 && w != 256) || h != 64) throw std::invalid_argument("block66 requires 64x64 or 256x64 input");
+        if (w <= 0 || h <= 0 || w % 8 || h % 8) throw std::invalid_argument("block66 input must be a positive multiple of 8");
         return w;
     }
     int width, height;
@@ -107,7 +134,7 @@ public:
 
 class Chain {
     static int checked(int w,int h,const std::vector<std::pair<std::string,int>>& blocks) {
-        if ((w!=128 && w!=512)||h!=128||blocks.size()!=4)throw std::invalid_argument("C32 requires 128x128 or 512x128 and four blocks");
+        if (w<=0||h<=0||w%8||h%8||blocks.size()!=4)throw std::invalid_argument("C32 requires a positive multiple of 8 and four blocks");
         for(auto& b:blocks)if(b.second<0||b.second>3)throw std::invalid_argument("invalid shift");
         return w;
     }
@@ -149,7 +176,7 @@ public:
 
 class Head {
     static int checked(int w,int h){
-        if((w!=256&&w!=1024)||h!=256)throw std::invalid_argument("head requires 256x256 or 1024x256");return w;
+        if(w<=0||h<=0||w%8||h%8)throw std::invalid_argument("head requires a positive multiple of 8");return w;
     }
     int width,height;
     size_t n,nrgb;
@@ -157,12 +184,16 @@ class Head {
     Buffer sm,ss,coeff,merged,peer,native,rgb_native,rgb_public;
     Weights weights;
     Body body;
+    std::unique_ptr<Buffer> chunked;  // raw body when rows exceed the body capacity
     bool ready=false;
 public:
     size_t comparisons=0;
-    Head(int w,int h,const std::string& fixture):width(checked(w,h)),height(h),n(size_t(w)*h*32),nrgb(size_t(w)*h*3),dir(fixture),
+    // max_rows caps the body scratch; larger frames run in chunks without stage checks.
+    Head(int w,int h,const std::string& fixture,int max_rows=0):width(checked(w,h)),height(h),n(size_t(w)*h*32),nrgb(size_t(w)*h*3),dir(fixture),
         sm(dir,"sm",32),ss(dir,"ss",32),coeff(dir,"coeff",96),merged(n),peer(n),native(n),rgb_native(nrgb),rgb_public(nrgb),
-        weights(dir+"/body"),body(w*h) {}
+        weights(dir+"/body"),body(max_rows>0&&max_rows<w*h?max_rows:w*h) {
+        if (body.rows_capacity()<w*h) chunked.reset(new Buffer(n));
+    }
     bool run_from_device(DeviceTensor main,DeviceTensor skip,DeviceTensor color,bool verify=false){
         ready=false;
         if(!main.data||main.count!=n/4||!skip.data||skip.count!=n||!color.data||color.count!=nrgb)return false;
@@ -170,9 +201,11 @@ public:
            !check(dir,"color",color.data,nrgb,verify,comparisons))return false;
         C32_LAUNCH(k_head70_merge,n,main.data,skip.data,sm.data,ss.data,merged.data,width,height);
         C32_LAUNCH(native_to_peer,n,merged.data,peer.data,int(n));
-        if(!check(dir,"merged",merged.data,n,verify,comparisons)||!check(dir,"peer",peer.data,n,verify,comparisons)||
-           !body.run(weights,peer.data,width*height,verify,comparisons))return false;
-        C32_LAUNCH(peer_to_native,n,body.raw(),native.data,int(n));
+        if(!check(dir,"merged",merged.data,n,verify,comparisons)||!check(dir,"peer",peer.data,n,verify,comparisons))return false;
+        if(chunked){
+            if(verify||!body.run_into(weights,peer.data,width*height,chunked->data,nullptr))return false;
+        }else if(!body.run(weights,peer.data,width*height,verify,comparisons))return false;
+        C32_LAUNCH(peer_to_native,n,chunked?chunked->data:body.raw(),native.data,int(n));
         C32_LAUNCH(k_head70_finish,nrgb,native.data,coeff.data,color.data,rgb_native.data,width,height,.03125f);
         C32_LAUNCH(k_head70_finish,nrgb,native.data,coeff.data,color.data,rgb_public.data,width,height,1.f);
         if(!check(dir,"native",native.data,n,verify,comparisons)||!check(dir,"rgb_native",rgb_native.data,nrgb,verify,comparisons)||
@@ -181,7 +214,7 @@ public:
     }
     DeviceTensor merged_view()const{return ready?DeviceTensor{merged.data,n}:DeviceTensor{};}
     DeviceTensor peer_view()const{return ready?DeviceTensor{peer.data,n}:DeviceTensor{};}
-    DeviceTensor body_view()const{return ready?DeviceTensor{body.raw(),n}:DeviceTensor{};}
+    DeviceTensor body_view()const{return ready?DeviceTensor{chunked?chunked->data:body.raw(),n}:DeviceTensor{};}
     DeviceTensor native_view()const{return ready?DeviceTensor{native.data,n}:DeviceTensor{};}
     DeviceTensor final_view()const{return ready?DeviceTensor{rgb_native.data,nrgb}:DeviceTensor{};}
     DeviceTensor public_view()const{return ready?DeviceTensor{rgb_public.data,nrgb}:DeviceTensor{};}

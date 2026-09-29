@@ -26,7 +26,7 @@ inline bool check(const std::string& dir, const char* name, const float* device,
 
 class Prefix {
     static int checked(int w, int h) {
-        if ((w != 8 && w != 32) || h != 8) throw std::invalid_argument("block48 requires 8x8 or 32x8 input");
+        if (w <= 0 || h <= 0 || w % 4 || h % 4) throw std::invalid_argument("block48 input must be a positive multiple of 4");
         return w;
     }
     int width, height;
@@ -69,8 +69,8 @@ struct Weights {
 
 class Chain {
     static int checked(int w,int h,const std::vector<std::pair<std::string,int>>& blocks) {
-        if ((w != 16 && w != 64) || h != 16 || blocks.size() != 8)
-            throw std::invalid_argument("resident decoder C256 requires 16x16 or 64x16 and eight blocks");
+        if (w <= 0 || h <= 0 || w % 8 || h % 8 || blocks.size() != 8)
+            throw std::invalid_argument("resident C256 requires a positive multiple of 8 and eight blocks");
         for (const auto& b: blocks) if (b.second < 0 || b.second > 3) throw std::invalid_argument("invalid shift");
         return w;
     }
@@ -158,7 +158,7 @@ public:
 // Encoder22 raw body -> rounded 2x2 pool -> FP8 C512 projection.
 class Downsample {
     static int checked(int w,int h) {
-        if ((w != 16 && w != 64) || h != 16) throw std::invalid_argument("downsample22 requires 16x16 or 64x16");
+        if (w <= 0 || h <= 0 || w % 8 || h % 8) throw std::invalid_argument("downsample22 extent must be a positive multiple of 8");
         return w;
     }
     int width,height;

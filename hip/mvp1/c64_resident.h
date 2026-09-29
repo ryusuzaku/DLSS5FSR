@@ -28,7 +28,7 @@ inline bool check(const std::string& dir, const char* name, const float* device,
 
 class Prefix {
     static int checked(int w, int h) {
-        if ((w != 32 && w != 128) || h != 32) throw std::invalid_argument("block62 requires 32x32 or 128x32 input");
+        if (w <= 0 || h <= 0 || w % 8 || h % 8) throw std::invalid_argument("block62 input must be a positive multiple of 8");
         return w;
     }
     int width, height;
@@ -71,10 +71,9 @@ struct Weights {
 
 class Chain {
     static int checked(int w,int h,const std::vector<std::pair<std::string,int>>& blocks,bool encoder=false) {
-        if (encoder ? ((w != 64 && w != 256) || h != 64 || blocks.size() != 4)
-                    : ((w != 64 && w != 256) || h != 64 || blocks.size() != 4))
-            throw std::invalid_argument(encoder ? "resident encoder C64 requires 64x64 or 256x64 and 4 blocks"
-                                                : "resident decoder C64 requires 64x64 or 256x64 and four blocks");
+        (void)encoder;
+        if (w <= 0 || h <= 0 || w % 8 || h % 8 || blocks.size() != 4)
+            throw std::invalid_argument("resident C64 requires a positive multiple of 8 and four blocks");
         for (const auto& b: blocks) if (b.second < 0 || b.second > 3) throw std::invalid_argument("invalid shift");
         return w;
     }
@@ -162,7 +161,7 @@ public:
 // Encoder8 raw body -> rounded 2x2 pool -> FP8 C128 projection.
 class Downsample {
     static int checked(int w,int h) {
-        if ((w != 64 && w != 256) || h != 64) throw std::invalid_argument("downsample8 requires 64x64 or 256x64");
+        if (w <= 0 || h <= 0 || w % 16 || h % 16) throw std::invalid_argument("downsample8 extent must be a positive multiple of 16");
         return w;
     }
     int width,height;

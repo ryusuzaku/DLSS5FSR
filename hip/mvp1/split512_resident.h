@@ -58,7 +58,9 @@ struct Weights {
 class Chain {
     int width, height, tokens, max_window_tokens;
     size_t n;
-    Buffer seed, ping, pong, pre, mixed, hidden, branch, feature, window, qkv,
+    std::unique_ptr<Buffer> seed;  // standalone replay input, loaded on first run()
+    std::string seed_dir;
+    Buffer ping, pong, pre, mixed, hidden, branch, feature, window, qkv,
            normalized, scores, exponents, probabilities, context, crop;
     std::vector<std::unique_ptr<Weights>> weights;
     std::unique_ptr<Buffer> head_weights, pooled, head_output;
@@ -80,7 +82,7 @@ public:
           const std::string& head = "") :
         width(w), height(h), tokens(w*h),
         max_window_tokens(((w+11)/8)*8*((h+11)/8)*8), n(size_t(tokens)*512),
-        seed(blocks.front().first, "input", n), ping(n), pong(n), pre(n), mixed(n),
+        seed_dir(blocks.front().first), ping(n), pong(n), pre(n), mixed(n),
         hidden(size_t(tokens)*2048), branch(n), feature(n), window(size_t(max_window_tokens)*512),
         qkv(size_t(max_window_tokens)*1536), normalized(size_t(max_window_tokens)*1536),
         scores(size_t(max_window_tokens)*1024), exponents(size_t(max_window_tokens)*1024),
@@ -96,7 +98,8 @@ public:
     }
 
     bool run(bool verify) {
-        return run_from_device({seed.data, n}, verify);
+        if (!seed) seed.reset(new Buffer(seed_dir, "input", n));
+        return run_from_device({seed->data, n}, verify);
     }
 
     // Input must remain valid through the ordered copy on this HIP device's

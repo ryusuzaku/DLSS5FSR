@@ -124,6 +124,9 @@ struct State {
     int engineState = 0;
     int (*EngineCreate)(const char*) = nullptr;
     int (*EngineSubmit)(const void*, int, int, int, int) = nullptr;
+    int (*EngineSubmitFull)(const void*, int, int, int, int, int) = nullptr;
+    int (*EnginePollFrame)(unsigned char*, unsigned long long, int, int, int, float*) = nullptr;
+    bool engineFrameReady = false;
     int (*EnginePoll)(int, unsigned char*, unsigned char*, float*) = nullptr;
     const char* (*EngineError)() = nullptr;
     void (*EngineDestroy)() = nullptr;
@@ -769,6 +772,14 @@ static bool EngineReady() {
     s.EnginePoll = (int (*)(int, unsigned char*, unsigned char*, float*))GetProcAddress(s.engineDll, "re_poll");
     s.EngineError = (const char* (*)())GetProcAddress(s.engineDll, "re_last_error");
     s.EngineDestroy = (void (*)())GetProcAddress(s.engineDll, "re_destroy");
+    s.EngineSubmitFull = (int (*)(const void*, int, int, int, int, int))GetProcAddress(s.engineDll, "re_submit_full");
+    s.EnginePollFrame = (int (*)(unsigned char*, unsigned long long, int, int, int, float*))
+        GetProcAddress(s.engineDll, "re_poll_frame");
+    if (cfg.residentEngineFull && (!s.EngineSubmitFull || !s.EnginePollFrame)) {
+        LOGE("hip: resident engine has no full-frame exports");
+        FreeLibrary(s.engineDll); s.engineDll = nullptr; s.EngineDestroy = nullptr;
+        return false;
+    }
     if (!s.EngineCreate || !s.EngineSubmit || !s.EnginePoll || !s.EngineError || !s.EngineDestroy) {
         LOGE("hip: resident engine is missing an export");
         FreeLibrary(s.engineDll); s.engineDll = nullptr; s.EngineDestroy = nullptr;
@@ -803,7 +814,9 @@ bool ResidentEngineSubmit() {
     ++s.engineFrames;
     if (s.engineFrames - s.engineLastSubmit < (uint64_t)cfg.residentEngineInterval &&
         s.engineLastSubmit) return true;
-    const int r = s.EngineSubmit(s.ptrIn, (int)s.w, (int)s.h, (int)s.pitch, (int)s.bpp);
+    const int r = cfg.residentEngineFull
+        ? s.EngineSubmitFull(s.ptrIn, (int)s.w, (int)s.h, (int)s.pitch, (int)s.bpp, cfg.residentEngineGain)
+        : s.EngineSubmit(s.ptrIn, (int)s.w, (int)s.h, (int)s.pitch, (int)s.bpp);
     if (r < 0) {
         LOGE("hip: resident engine disabled: %s", s.EngineError());
         s.engineState = -1;
@@ -859,7 +872,32 @@ bool CandidatePreview() {
         return false;
     }
     const bool engine = !cfg.residentEngineConfig.empty();
-    if (engine) {
+    if (engine && cfg.residentEngineFull) {
+        // Whole frame: the engine writes the staging format at full size.
+        if (!EngineReady()) return false;
+        if (s.previewFrame.size() != (size_t)s.bytes || s.previewW != s.w || s.previewH != s.h ||
+            s.previewBpp != s.bpp || s.previewPitch != s.pitch) {
+            s.previewFrame.assign((size_t)s.bytes, 0);
+            s.previewW = s.w; s.previewH = s.h; s.previewBpp = s.bpp; s.previewPitch = s.pitch;
+            s.engineFrameReady = false;
+        }
+        float deviceMs = 0.0f;
+        const int r = s.EnginePollFrame(s.previewFrame.data(), (unsigned long long)s.pitch,
+                                        (int)s.w, (int)s.h, (int)s.bpp, &deviceMs);
+        if (r < 0) {
+            LOGE("hip: resident engine disabled: %s", s.EngineError());
+            s.engineState = -1;
+            return false;
+        }
+        if (r == 1) {
+            s.engineFrameReady = true;
+            if ((s.enginePreviews++ % 20) == 0)
+                LOGI("hip: resident engine frame %llu at %ux%u (%llu frames, %llu submissions, %.3f ms device)",
+                     (unsigned long long)s.enginePreviews, s.w, s.h, (unsigned long long)s.engineFrames,
+                     (unsigned long long)s.engineSubmits, deviceMs);
+        }
+        if (!s.engineFrameReady) return false;  // keep the model output until one is ready
+    } else if (engine) {
         // The engine publishes finished frames; take the newest, keep the last.
         if (!EngineReady()) return false;
         std::vector<unsigned char> next8(256u * 256u * 4u), next16(256u * 256u * 8u);
@@ -937,7 +975,7 @@ bool CandidatePreview() {
             }
         }
     }
-    if (s.preview8.empty() || s.preview16.empty()) return false;
+    if (!(engine && cfg.residentEngineFull) && (s.preview8.empty() || s.preview16.empty())) return false;
     if (s.previewFrame.empty() || s.previewW != s.w || s.previewH != s.h ||
         s.previewBpp != s.bpp || s.previewPitch != s.pitch) {
         s.previewW = s.w; s.previewH = s.h;

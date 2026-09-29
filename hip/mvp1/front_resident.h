@@ -106,7 +106,7 @@ __global__ void k_front_native32(const float* peer, float* native, int n, int cl
 
 class FrontEnd {
     static int checked(int w, int h) {
-        if ((w != 256 && w != 1024) || h != 256) throw std::invalid_argument("front end requires 256x256 or 1024x256 RGB");
+        if (w <= 0 || h <= 0 || w % 64 || h % 64) throw std::invalid_argument("front end requires RGB extents that are multiples of 64");
         return w;
     }
     int width, height;
@@ -115,24 +115,65 @@ class FrontEnd {
     Buffer noise, stem, matrix, tokens, raw0, image, raw4, down_pool, down, c64, skip4, skip0;
     std::vector<std::unique_ptr<Weights>> weights;
     Body body;
+    std::unique_ptr<Buffer> body_raw, body_quant;  // chunked body outputs above the cap
     bool ready = false;
 public:
     size_t comparisons = 0;
-    FrontEnd(int w, int h, const std::string& fixture) : width(checked(w,h)), height(h), pixels(size_t(w)*h),
-        dir(fixture), noise(dir,"noise",pixels*3), stem(dir,"stem_weights",15*32), matrix(dir,"matrix",64*32),
+    // max_rows caps the C32 body scratch; larger frames run in chunks without stage checks.
+    FrontEnd(int w, int h, const std::string& fixture, int max_rows = 0) : width(checked(w,h)), height(h), pixels(size_t(w)*h),
+        dir(fixture), noise(pixels*3), stem(dir,"stem_weights",15*32), matrix(dir,"matrix",64*32),
         tokens(size_t(w/2+8)*(h/2+8)*32 > pixels*32 ? size_t(w/2+8)*(h/2+8)*32 : pixels*32),
         raw0(pixels*32), image(pixels/4*32), raw4(pixels/4*32), down_pool(pixels/16*32), down(pixels/16*64),
-        c64(pixels/16*64), skip4(pixels/4*32), skip0(pixels*32), body(int(pixels)) {
+        c64(pixels/16*64), skip4(pixels/4*32), skip0(pixels*32),
+        body(max_rows > 0 && size_t(max_rows) < pixels ? max_rows : int(pixels)) {
         for (int b = 0; b < 5; ++b) weights.emplace_back(new Weights(dir+"/block"+std::to_string(b)));
+        load_noise();
+        if (size_t(body.rows_capacity()) < pixels) {
+            body_raw.reset(new Buffer(tokens.count));
+            body_quant.reset(new Buffer(tokens.count));
+        }
+    }
+    // The public 256x256 noise tile, repeated over this extent (the reference's
+    // tiling). Fixtures store it tiled to their own 256-row extent.
+    void load_noise() {
+        std::string path = dir + "/noise.f32";
+        FILE* f = fopen(path.c_str(), "rb");
+        if (!f) HEAD70_FATAL("cannot read " + path);
+        std::vector<float> saved;
+        float chunk[4096];
+        size_t got;
+        while ((got = fread(chunk, sizeof(float), 4096, f)) > 0) saved.insert(saved.end(), chunk, chunk+got);
+        fclose(f);
+        size_t saved_w = saved.size() / (256*3);
+        if (saved.size() != saved_w*256*3 || saved_w < 256) HEAD70_FATAL("wrong size: " + path);
+        std::vector<float> tiled(pixels*3);
+        for (int y = 0; y < height; ++y)
+            for (int x = 0; x < width; ++x)
+                for (int c = 0; c < 3; ++c)
+                    tiled[(size_t(y)*width+x)*3+c] = saved[((size_t(y%256))*saved_w+(x%256))*3+c];
+        HIP_CHECK(hipMemcpy(noise.data, tiled.data(), tiled.size()*sizeof(float), hipMemcpyHostToDevice));
+        c512_resident::traffic.h2d_bytes += tiled.size()*sizeof(float);
+    }
+    // Block body over rows windows: whole-frame with stage checks, or chunked.
+    bool block(int b, int rows, bool verify, const float*& raw, const float*& quant) {
+        if (body_raw) {
+            if (verify || !body.run_into(*weights[b], tokens.data, rows, body_raw->data, body_quant->data)) return false;
+            raw = body_raw->data; quant = body_quant->data;
+            return true;
+        }
+        if (!body.run(*weights[b], tokens.data, rows, verify, comparisons)) return false;
+        raw = body.raw(); quant = body.quantized();
+        return true;
     }
     bool run_from_device(DeviceTensor rgb, bool verify = false) {
         ready = false;
         if (!rgb.data || rgb.count != pixels*3) return false;
         if (!check(dir,"rgb",rgb.data,pixels*3,verify,comparisons)) return false;
         FRONT_LAUNCH(k_front_stem,pixels*32,rgb.data,noise.data,stem.data,tokens.data,width,height);
+        const float *raw = nullptr, *quant = nullptr;
         if (!check(dir+"/block0","input",tokens.data,pixels*32,verify,comparisons) ||
-            !body.run(*weights[0],tokens.data,int(pixels),verify,comparisons)) return false;
-        FRONT_LAUNCH(k_front_scatter,pixels*32,body.raw(),raw0.data,width,height,0);
+            !block(0,int(pixels),verify,raw,quant)) return false;
+        FRONT_LAUNCH(k_front_scatter,pixels*32,raw,raw0.data,width,height,0);
         FRONT_LAUNCH(k_front_pool,pixels/4*32,raw0.data,image.data,width,height,32);
         if (!check(dir+"/block0","raw",raw0.data,pixels*32,verify,comparisons) ||
             !check(dir,"pre_down",image.data,pixels/4*32,verify,comparisons)) return false;
@@ -144,9 +185,9 @@ public:
             std::string block = dir+"/block"+std::to_string(b);
             FRONT_LAUNCH(k_front_gather,size_t(rows)*32,image.data,tokens.data,w,h,shifts[b]);
             if (!check(block,"input",tokens.data,size_t(rows)*32,verify,comparisons) ||
-                !body.run(*weights[b],tokens.data,rows,verify,comparisons)) return false;
-            if (b == 4) FRONT_LAUNCH(k_front_scatter,size_t(rows)*32,body.raw(),raw4.data,w,h,shifts[b]);
-            FRONT_LAUNCH(k_front_scatter,size_t(rows)*32,body.quantized(),image.data,w,h,shifts[b]);
+                !this->block(b,rows,verify,raw,quant)) return false;
+            if (b == 4) FRONT_LAUNCH(k_front_scatter,size_t(rows)*32,raw,raw4.data,w,h,shifts[b]);
+            FRONT_LAUNCH(k_front_scatter,size_t(rows)*32,quant,image.data,w,h,shifts[b]);
             if (!check(block,"image",image.data,size_t(w)*h*32,verify,comparisons) ||
                 (b == 4 && !check(block,"raw",raw4.data,size_t(w)*h*32,verify,comparisons))) return false;
         }

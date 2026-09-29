@@ -516,6 +516,7 @@ struct IniValues {
     std::string residentEngineDll;
     std::string residentEngineConfig;
     int residentEngineGain = 0;
+    int residentEngineFull = 0;
     int harnessFrameSleepMs = 0;  // harness-only: lets asynchronous work land
     // S231 step 3: the default is the SHIPPED reading (2, our map), so a green run
     // means the path the game runs is right. Only the c256f2 check consults this --
@@ -567,6 +568,7 @@ static bool WriteIni(const std::string& dir, const IniValues& v) {
             "ResidentEngineDll=%s\n"
             "ResidentEngineConfig=%s\n"
             "ResidentEngineGain=%d\n"
+            "ResidentEngineFull=%d\n"
             "HipFfnTranspose=%d\n"
             "DumpField=%d\n",
             v.nrPasses, v.hipBackend, v.hipWeightsDir.c_str(),
@@ -582,6 +584,7 @@ static bool WriteIni(const std::string& dir, const IniValues& v) {
             v.candidateInputCaptureTrigger, v.candidateInputCaptureRepeat,
             v.candidateInputGpuPath.c_str(),
             v.residentEngineDll.c_str(), v.residentEngineConfig.c_str(), v.residentEngineGain,
+            v.residentEngineFull,
             v.hipFfnTranspose, v.dumpField);
     fclose(f);
     return true;
@@ -1468,15 +1471,20 @@ int main(int argc, char** argv) {
     const char* engineDll = getenv("DLSS5_RESIDENT_ENGINE_DLL");
     const char* engineConfig = getenv("DLSS5_RESIDENT_ENGINE_CONFIG");
     const bool engineRun = engineDll && *engineDll && engineConfig && *engineConfig;
+    bool engineFull = false;
     if (engineRun) {
         printf("\n-- pass 11: in-process resident engine --\n");
         IniValues engine;
         engine.debugView = 2;
         engine.residentEngineDll = engineDll;
         engine.residentEngineConfig = engineConfig;
-        engine.harnessFrameSleepMs = 25;
+        const char* fullEnv = getenv("DLSS5_RESIDENT_ENGINE_FULL");
+        engineFull = fullEnv && *fullEnv == '1';
+        engine.residentEngineFull = engineFull ? 1 : 0;
+        engine.residentEngineGain = engineFull ? 1 : 0;  // public gain: a visible change
+        engine.harnessFrameSleepMs = engineFull ? 40 : 25;
         PassResult ep = RunPass(ngx, d, iniDir, engine, color.Get(), output.Get(),
-                                SRC_W, SRC_H, DST_W, DST_H, 120);
+                                SRC_W, SRC_H, DST_W, DST_H, engineFull ? 150 : 120);
         Check(ep.evalFailures == 0, "resident engine frames evaluate");
         Check(MaxChannelDiff(p1.rb, ep.rb) > 20,
               "resident engine preview visibly changes the model texture");
@@ -1516,8 +1524,10 @@ int main(int argc, char** argv) {
             if (engineRun) {
                 Check(text.find("hip: resident engine ready in ") != std::string::npos,
                       "resident engine loaded in process");
-                Check(text.find("hip: resident engine preview 1 (") != std::string::npos,
-                      "resident engine published a preview");
+                Check(text.find(engineFull ? "hip: resident engine frame 1 at " :
+                                             "hip: resident engine preview 1 (") != std::string::npos,
+                      engineFull ? "resident engine published a full frame" :
+                                   "resident engine published a preview");
                 Check(text.find("resident engine disabled") == std::string::npos &&
                           text.find("resident engine setup failed") == std::string::npos,
                       "resident engine reported no failure");

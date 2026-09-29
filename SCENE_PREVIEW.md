@@ -358,3 +358,38 @@ engine in-process, publishes a preview and displays it (123/123 checks).
 The default and file-preview harness runs still pass 117/117 and 129/129.
 The preview is still a 256×256 centre-crop candidate; full-frame output
 and real-time speed remain future work.
+
+### Full-frame engine mode
+
+With `ResidentEngineFull=1` the engine runs the whole staged frame, not a
+256×256 crop. It pads the frame by edge replication to the smallest network
+extent it supports: multiples of 64 whose ViT token count is 16 or a
+multiple of 64 (991×620 → 1024×768, 192 tokens). The result is written back
+at the frame's own size and format, with full sRGB precision in the FP16
+path. The resident components now accept these general extents:
+- The allow-lists became structural checks.
+- The ViT gather and inverse maps are computed for the token count.
+- The noise tile repeats over the frame.
+- Front-end and head C32 bodies run in 65,536-row chunks above that size.
+
+ViT attention for multiples of 64 tokens follows the upstream native
+contract, which its author verified at 64, 128 and 256 tokens. For each
+64-key chunk it uses the same denominator reduction, sums the chunks in half
+precision, and applies a half boundary after each 32-key numerator part. At
+192 tokens this extends that contract. `tools/check_vit_attention_chunks.py`
+matches the kernel exactly at 64, 128, 192 and 256 tokens. The 64-token
+chained runs reproduce every earlier output byte for byte.
+
+`build/resident_engine_full_test.exe` checks two things through the DLL
+exports. First, a 256×256 cut of the saved capture gives byte-identical
+colour and RGB in crop and full mode. Second, the whole 991×620 capture
+runs at 1024×768: 627–628 ms on the device, about 685 ms from submit to
+finished frame, all values finite. At the native gain the result is close
+to the input (0.25 of 255 mean difference). The harness full-mode pass
+(`DLSS5_RESIDENT_ENGINE_FULL=1`) runs a 1280×720 frame at 1280×1024 in about
+950 ms and displays it (123/123).
+
+Each finished frame stays on screen until the next one arrives. At the
+current speed, full-frame mode therefore shows the game at about 1.5
+updates per second. It is for checking image correctness in-game, not for
+play. Making it real-time is the next work item.
