@@ -816,6 +816,29 @@ bool ResidentEngineSubmit() {
     return true;
 }
 
+// Round-to-nearest-even float -> IEEE half, for preview values in [0, 1].
+static uint16_t PreviewHalf(float value) {
+    uint32_t bits;
+    memcpy(&bits, &value, 4);
+    const uint32_t sign = (bits >> 16) & 0x8000u;
+    int exponent = (int)((bits >> 23) & 0xFF) - 127 + 15;
+    uint32_t mantissa = bits & 0x7FFFFFu;
+    if (exponent <= 0) {
+        if (exponent < -10) return (uint16_t)sign;
+        mantissa |= 0x800000u;
+        const int shift = 14 - exponent;
+        uint32_t half = mantissa >> shift;
+        const uint32_t rest = mantissa & ((1u << shift) - 1), mid = 1u << (shift - 1);
+        if (rest > mid || (rest == mid && (half & 1))) ++half;
+        return (uint16_t)(sign | half);
+    }
+    if (exponent >= 31) return (uint16_t)(sign | 0x7C00u);
+    uint32_t half = ((uint32_t)exponent << 10) | (mantissa >> 13);
+    const uint32_t rest = mantissa & 0x1FFFu;
+    if (rest > 0x1000u || (rest == 0x1000u && (half & 1))) ++half;
+    return (uint16_t)(sign | half);
+}
+
 bool CandidatePreview() {
     State& s = S();
     const Config& cfg = Cfg();
@@ -923,18 +946,55 @@ bool CandidatePreview() {
         const unsigned int side = s.w < s.h ? s.w : s.h;
         const unsigned int left = (s.w - side) / 2, top = (s.h - side) / 2;
         const auto& src = s.bpp == 4 ? s.preview8 : s.preview16;
-        for (unsigned int y = 0; y < side; ++y) {
-            const unsigned int sy = y * 256u / side;
-            for (unsigned int x = 0; x < side; ++x) {
-                const unsigned int sx = x * 256u / side;
-                const size_t dst = (size_t)(top + y) * (size_t)s.pitch +
-                                   (size_t)(left + x) * s.bpp;
-                const size_t source = ((size_t)sy * 256u + sx) * s.bpp;
-                memcpy(s.previewFrame.data() + dst, src.data() + source, s.bpp);
+        if (engine) {
+            // Engine frames change continuously: bilinear from the 256x256
+            // RGBA8 result (pixel-centre aligned) instead of blocky nearest.
+            const float scale = 256.0f / (float)side;
+            for (unsigned int y = 0; y < side; ++y) {
+                float fy = ((float)y + 0.5f) * scale - 0.5f;
+                fy = fy < 0.0f ? 0.0f : (fy > 255.0f ? 255.0f : fy);
+                const unsigned int y0 = (unsigned int)fy, y1 = y0 < 255u ? y0 + 1u : 255u;
+                const float ty = fy - (float)y0;
+                for (unsigned int x = 0; x < side; ++x) {
+                    float fx = ((float)x + 0.5f) * scale - 0.5f;
+                    fx = fx < 0.0f ? 0.0f : (fx > 255.0f ? 255.0f : fx);
+                    const unsigned int x0 = (unsigned int)fx, x1 = x0 < 255u ? x0 + 1u : 255u;
+                    const float tx = fx - (float)x0;
+                    unsigned char* dst = s.previewFrame.data() + (size_t)(top + y) * (size_t)s.pitch +
+                                         (size_t)(left + x) * s.bpp;
+                    for (unsigned int c = 0; c < 4; ++c) {
+                        auto at = [&](unsigned int yy, unsigned int xx) {
+                            return (float)s.preview8[((size_t)yy * 256u + xx) * 4u + c];
+                        };
+                        const float v = c == 3 ? 255.0f :
+                            (at(y0, x0) * (1 - tx) + at(y0, x1) * tx) * (1 - ty) +
+                            (at(y1, x0) * (1 - tx) + at(y1, x1) * tx) * ty;
+                        if (s.bpp == 4) {
+                            dst[c] = (unsigned char)(v + 0.5f);
+                        } else {
+                            const uint16_t h = PreviewHalf(v / 255.0f);
+                            memcpy(dst + c * 2, &h, 2);
+                        }
+                    }
+                }
+            }
+        } else {
+            for (unsigned int y = 0; y < side; ++y) {
+                const unsigned int sy = y * 256u / side;
+                for (unsigned int x = 0; x < side; ++x) {
+                    const unsigned int sx = x * 256u / side;
+                    const size_t dst = (size_t)(top + y) * (size_t)s.pitch +
+                                       (size_t)(left + x) * s.bpp;
+                    const size_t source = ((size_t)sy * 256u + sx) * s.bpp;
+                    memcpy(s.previewFrame.data() + dst, src.data() + source, s.bpp);
+                }
             }
         }
-        LOGI("hip: fixed preview expanded to %ux%u bpp=%u pitch=%llu, centered square %u",
-             s.w, s.h, s.bpp, (unsigned long long)s.pitch, side);
+        static uint64_t expansions = 0;
+        if (!engine || (expansions++ % 100) == 0)
+            LOGI("hip: %s preview expanded to %ux%u bpp=%u pitch=%llu, centered square %u",
+                 engine ? "resident engine (bilinear)" : "fixed", s.w, s.h, s.bpp,
+                 (unsigned long long)s.pitch, side);
     }
     LARGE_INTEGER frequency{}, begin{}, end{};
     QueryPerformanceFrequency(&frequency);
