@@ -36,7 +36,7 @@ __global__ void k_front_stem(const float* rgb, const float* noise, const float* 
     for (int k = 0; k < 3; ++k) f[k] = h70_h(n[k]);
     f[3] = 1.0f;
     for (int k = 0; k < 3; ++k) {
-        volatile float centered = p[k]-.5f;
+        float centered = p[k]-.5f;
         float v = h70_h(centered*.125f);
         f[4+k] = v; f[7+k] = v;
     }

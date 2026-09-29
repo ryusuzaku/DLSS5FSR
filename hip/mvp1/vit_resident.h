@@ -3,6 +3,7 @@
 #include "split512_resident.h"
 #include "vit_expand_chain.hip"
 #include "tiled_gemm.hip"
+#include "vit_attention_wmma.hip"
 #include <stdexcept>
 
 namespace vit_resident {
@@ -85,7 +86,12 @@ public:
             VIT_LAUNCH(k_vit_qkv_normalize, 3*n, projected.data, w.scales.data, qkv.data, tokens);
             VIT_LAUNCH(k_vit_scores, sn, qkv.data, scores.data, tokens);
             VIT_LAUNCH(k_vit_exponents, sn, scores.data, exponents.data, int(sn));
-            if (tokens % 64 == 0) {
+            if (tokens % 64 == 0 && !c512_resident::exact_math && !verify) {
+                hipLaunchKernelGGL(k_vit_attention_wmma, dim3(tokens/64, 32), dim3(256), 0, c512_resident::stream,
+                                   qkv.data, exponents.data, attention.data, tokens);
+                HIP_CHECK(hipGetLastError());
+                if (c512_resident::launch_hook) c512_resident::launch_hook("k_vit_attention_wmma");
+            } else if (tokens % 64 == 0) {
                 VIT_LAUNCH(k_vit_attention_chunks, n, qkv.data, exponents.data, attention.data, tokens);
             } else {
                 VIT_LAUNCH(k_vit_attention16_candidate, n, qkv.data, exponents.data, attention.data);

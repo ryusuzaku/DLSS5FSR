@@ -6,6 +6,7 @@
 #include "split512_bridge.hip"
 #include "resident_stream.h"
 #include "tiled_gemm.hip"
+#include "split512_attention_wmma.hip"
 #include <memory>
 #include <utility>
 
@@ -161,13 +162,15 @@ public:
                     qkv.data, nullptr, 1536, wt, 1536);
             }
             if (!check(w.dir, "qkv", qkv.data, qn, verify)) return false;
-            C512_LAUNCH(k_split512_qknorm_inv, size_t(wt)*2*16, qkv.data, inverse.data, wt, 512);
-            C512_LAUNCH(k_split512_qknorm_apply, size_t(wt)*3*512, qkv.data, w.scales.data, inverse.data, normalized.data, wt, 512);
-            C512_LAUNCH(k_split512_scores, sn, normalized.data, w.bias.data, scores.data, windows);
-            C512_LAUNCH(k_split512_exp, sn, scores.data, exponents.data, int(sn));
-            C512_LAUNCH(k_split512_inv_rows, sn/64, exponents.data, inverse.data, int(sn/64));
-            C512_LAUNCH(k_split512_prob_rows, sn, exponents.data, inverse.data, probabilities.data, int(sn));
-            C512_LAUNCH(k_split512_context, wn, probabilities.data, normalized.data, context.data, windows);
+            if (verify || !c512_resident::fused_attention(qkv.data, w.scales.data, w.bias.data, context.data, wt, 512)) {
+                C512_LAUNCH(k_split512_qknorm_inv, size_t(wt)*2*16, qkv.data, inverse.data, wt, 512);
+                C512_LAUNCH(k_split512_qknorm_apply, size_t(wt)*3*512, qkv.data, w.scales.data, inverse.data, normalized.data, wt, 512);
+                C512_LAUNCH(k_split512_scores, sn, normalized.data, w.bias.data, scores.data, windows);
+                C512_LAUNCH(k_split512_exp, sn, scores.data, exponents.data, int(sn));
+                C512_LAUNCH(k_split512_inv_rows, sn/64, exponents.data, inverse.data, int(sn/64));
+                C512_LAUNCH(k_split512_prob_rows, sn, exponents.data, inverse.data, probabilities.data, int(sn));
+                C512_LAUNCH(k_split512_context, wn, probabilities.data, normalized.data, context.data, windows);
+            }
             if (!check(w.dir, "normalized", normalized.data, qn, verify) ||
                 !check(w.dir, "scores", scores.data, sn, verify) ||
                 !check(w.dir, "exponents", exponents.data, sn, verify) ||

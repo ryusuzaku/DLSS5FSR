@@ -10,6 +10,7 @@
 #include <stdexcept>
 
 #include "tiled_gemm.hip"
+#include "c32_fused.hip"
 
 namespace c32_resident {
 // Tiled-GEMM rounding policies of the head70/C32 kernels. The expand and QKV
@@ -53,7 +54,24 @@ struct Weights {
     std::string dir;
     float scale;
     Buffer data;
-    explicit Weights(const std::string& d):dir(d),scale(read(d,"weights",16449)[16384]),data(d,"weights",16449) {}
+    Buffer halves;  // first 12288 weights as half (6144 floats of storage) for k_c32_wmma
+    explicit Weights(const std::string& d):dir(d),scale(read(d,"weights",16449)[16384]),data(d,"weights",16449),halves(6144) {
+        hipLaunchKernelGGL(k_c32_half_weights,dim3(48),dim3(256),0,c512_resident::stream,
+                           data.data,reinterpret_cast<_Float16*>(halves.data),12288);
+        HIP_CHECK(hipGetLastError());
+    }
+    // Fused body of one launch: WMMA unless c512_resident::exact_math.
+    void body(const float* input,int rows,float* raw_out,float* quant_out) const {
+        if (c512_resident::exact_math) {
+            hipLaunchKernelGGL(k_c32_fused,dim3(rows/64),dim3(256),0,c512_resident::stream,
+                               input,data.data,scale,raw_out,quant_out);
+        } else {
+            hipLaunchKernelGGL(k_c32_wmma,dim3(rows/64),dim3(256),0,c512_resident::stream,
+                               input,data.data,reinterpret_cast<const _Float16*>(halves.data),scale,raw_out,quant_out);
+        }
+        HIP_CHECK(hipGetLastError());
+        if (c512_resident::launch_hook) c512_resident::launch_hook(c512_resident::exact_math?"k_c32_fused":"k_c32_wmma");
+    }
 };
 // Shared retained workspace for sequential C32 body dispatches.
 class Body {
@@ -65,6 +83,11 @@ public:
         ex(scores.count),den(rows),prob(scores.count),context(ffn.count),body(ffn.count),output(ffn.count) {}
     bool run(const Weights& w,const float* input,int rows,bool verify,size_t& comparisons) {
         if (!input || rows<=0 || rows>capacity || rows%64) return false;
+        if (!verify) {
+            // Fused one-window-per-workgroup body; stage outputs are not kept.
+            w.body(input,rows,body.data,output.data);
+            return true;
+        }
         auto dw=w.data.data;size_t n=size_t(rows)*32;
         tiled::gemm<H70,tiled::GATE,false>(c512_resident::stream,input,32,dw,32,nullptr,0,nullptr,
             verify?expanded.data:nullptr,hidden.data,128,rows,128);
@@ -100,6 +123,10 @@ public:
     // independent, so chunking at multiples of 64 rows keeps the arithmetic.
     bool run_into(const Weights& w,const float* input,int rows,float* raw_out,float* quant_out) {
         if (!input || !raw_out || rows<=0 || rows%64 || capacity%64) return false;
+        {
+            w.body(input,rows,raw_out,quant_out);
+            return true;
+        }
         auto dw=w.data.data;
         for (int start=0;start<rows;start+=capacity) {
             int r=rows-start<capacity?rows-start:capacity;
@@ -213,6 +240,7 @@ class Head {
     Body body;
     std::unique_ptr<Buffer> chunked;  // raw body when rows exceed the body capacity
     bool ready=false;
+    bool coeff_half=false;  // half-valued coefficients allow the fused finish pass
 public:
     size_t comparisons=0;
     // max_rows caps the body scratch; larger frames run in chunks without stage checks.
@@ -220,6 +248,8 @@ public:
         sm(dir,"sm",32),ss(dir,"ss",32),coeff(dir,"coeff",96),merged(n),peer(n),native(n),rgb_native(nrgb),rgb_public(nrgb),
         weights(dir+"/body"),body(max_rows>0&&max_rows<w*h?max_rows:w*h) {
         if (body.rows_capacity()<w*h) chunked.reset(new Buffer(n));
+        coeff_half=true;
+        for (float c:read(dir,"coeff",96)) coeff_half=coeff_half&&float(_Float16(c))==c;
     }
     bool run_from_device(DeviceTensor main,DeviceTensor skip,DeviceTensor color,bool verify=false){
         ready=false;
@@ -233,8 +263,13 @@ public:
             if(verify||!body.run_into(weights,peer.data,width*height,chunked->data,nullptr))return false;
         }else if(!body.run(weights,peer.data,width*height,verify,comparisons))return false;
         C32_LAUNCH(peer_to_native,n,chunked?chunked->data:body.raw(),native.data,int(n));
-        C32_LAUNCH(k_head70_finish,nrgb,native.data,coeff.data,color.data,rgb_native.data,width,height,.03125f);
-        C32_LAUNCH(k_head70_finish,nrgb,native.data,coeff.data,color.data,rgb_public.data,width,height,1.f);
+        if(coeff_half){
+            C32_LAUNCH(k_head70_finish_pair,size_t(width)*height,native.data,coeff.data,color.data,
+                       rgb_native.data,rgb_public.data,width,height,.03125f);
+        }else{
+            C32_LAUNCH(k_head70_finish,nrgb,native.data,coeff.data,color.data,rgb_native.data,width,height,.03125f);
+            C32_LAUNCH(k_head70_finish,nrgb,native.data,coeff.data,color.data,rgb_public.data,width,height,1.f);
+        }
         if(!check(dir,"native",native.data,n,verify,comparisons)||!check(dir,"rgb_native",rgb_native.data,nrgb,verify,comparisons)||
            !check(dir,"rgb_public",rgb_public.data,nrgb,verify,comparisons))return false;
         ready=true;return true;

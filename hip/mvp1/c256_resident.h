@@ -122,13 +122,15 @@ public:
             tiled::gemm<tiled::Split,tiled::RAW,false>(c512_resident::stream,feature.data,256,w.qkv.data,256,
                 nullptr,0,nullptr,qkv.data,nullptr,768,tokens,768);
             HIP_CHECK(hipGetLastError());
-            C256_LAUNCH(k_split512_qknorm_inv,size_t(tokens)*2*8,qkv.data,inverse.data,tokens,256);
-            C256_LAUNCH(k_split512_qknorm_apply,size_t(tokens)*3*256,qkv.data,w.scales.data,inverse.data,normalized.data,tokens,256);
-            C256_LAUNCH(k_c256_scores,sc,normalized.data,w.bias.data,scores.data,wn);
-            C256_LAUNCH(k_split512_exp,sc,scores.data,exponents.data,int(sc));
-            C256_LAUNCH(k_split512_inv_rows,sc/64,exponents.data,inverse.data,int(sc/64));
-            C256_LAUNCH(k_split512_prob_rows,sc,exponents.data,inverse.data,probabilities.data,int(sc));
-            C256_LAUNCH(k_c256_context,count,probabilities.data,normalized.data,context.data,wn);
+            if (verify || !c512_resident::fused_attention(qkv.data, w.scales.data, w.bias.data, context.data, tokens, 256)) {
+                C256_LAUNCH(k_split512_qknorm_inv,size_t(tokens)*2*8,qkv.data,inverse.data,tokens,256);
+                C256_LAUNCH(k_split512_qknorm_apply,size_t(tokens)*3*256,qkv.data,w.scales.data,inverse.data,normalized.data,tokens,256);
+                C256_LAUNCH(k_c256_scores,sc,normalized.data,w.bias.data,scores.data,wn);
+                C256_LAUNCH(k_split512_exp,sc,scores.data,exponents.data,int(sc));
+                C256_LAUNCH(k_split512_inv_rows,sc/64,exponents.data,inverse.data,int(sc/64));
+                C256_LAUNCH(k_split512_prob_rows,sc,exponents.data,inverse.data,probabilities.data,int(sc));
+                C256_LAUNCH(k_c256_context,count,probabilities.data,normalized.data,context.data,wn);
+            }
             // The linear projection is a diagnostic output; it runs only when verifying.
             if (verify) C256_LAUNCH(k_c256_projection_linear,count,context.data,w.projection.data,linear.data,tokens);
             tiled::gemm<tiled::Split,tiled::FP8,true>(c512_resident::stream,context.data,256,w.projection.data,256,

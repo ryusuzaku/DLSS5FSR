@@ -678,7 +678,7 @@ colour-to-RGB path takes 56–58 ms at 256×256.
 saved storefront capture its preview is within 3 levels (PSNR 55.6 dB) of
 the ONNX-fed resident preview.
 
-## Performance work (bit-identical kernels)
+## Performance work
 
 `build/resident_profile.exe <engine config> <capture>` times each stage and
 each kernel of the engine's network with GPU events. It uses an optional
@@ -704,12 +704,42 @@ byte-exact:
 Crop mode takes 33 ms per frame, and the 26-argument chain at 256×256
 takes about 32 ms.
 
-`wmma_gemm.hip` is an experimental FP8 WMMA form of the same contract. It
-is selected by `RESIDENT_WMMA=1` and off by default. Operands are converted
-to FP8 bytes (exact, since every GEMM input is an FP8 value), and each
-32-wide slice is two 16×16×16 WMMA steps followed by the same half boundary.
-It reproduced every captured-chain check, and the front end at both extents,
-byte for byte. In the larger synthetic chain it differed at one rounding tie
-(one value in 4.7 million, one half step). The first version is not yet
-faster (about 200 ms of GEMM against 190 ms): 128×128 tiles waste most of
-the narrow C32 shapes, and ViT token counts leave the grid nearly empty.
+### Fast path (default) and `RESIDENT_EXACT=1`
+
+The default path takes the network at 1024×768 from 253 ms to about 37 ms.
+Two of the changes stay bit-identical and are used in both modes:
+- Rounding helpers use hardware conversions. `split512_half`/`head70_half`
+  use `__float2half_rn`, which is value-identical to the old volatile cast
+  for all 2^32 floats and about 27 times faster. `split512_fp8` and `h70_f`
+  use the gfx12 E4M3 instructions after a ±448 clamp, which match the
+  software rounding for every non-NaN float and for every half value.
+  `volatile` temporaries were removed. They only prevented contraction,
+  which `-ffp-contract=off` already does.
+- The head70 finish runs once per pixel for both outputs. Products of half
+  values are exact in float, and the truncated terms are summed as
+  integers. It falls back to the old kernel when the coefficients are not
+  half-valued.
+
+Four changes use f16 WMMA (16×16×16, fp32 accumulate). Every operand is an
+FP8 or half value, so the conversion to half is exact and so is each
+product. Only the fp32 summation order inside a 32-product slice differs
+from the sequential reference. The rounding boundaries, epilogues and fixed
+softmax denominator orders are unchanged:
+- `wmma_gemm.hip`: every `tiled::gemm` (half weight copies cached per
+  weight pointer, float activations converted while staging, epilogue
+  straight from the accumulator registers).
+- `c32_fused.hip`: `k_c32_wmma` runs a whole C32 body window (FFN,
+  attention, projection) in one workgroup. `k_c32_fused` is the exact
+  scalar form of the same fusion.
+- `split512_attention_wmma.hip`: one workgroup per window and head goes from
+  raw qkv to the FP8 context for the C64–C512 blocks, replacing seven
+  launches.
+- `vit_attention_wmma.hip`: the ViT numerator as a query×key×channel
+  product, with one denominator per query.
+
+On the captured data, the fast path reproduces every captured-chain check,
+the front end at both extents, the engine crop checks, and the whole
+1024×768 engine frame byte for byte. The synthetic chain differs at one
+rounding tie (one value in 4.7 million, one half step). `RESIDENT_EXACT=1`
+selects the sequential kernels everywhere, and the regressions run in that
+mode. `RESIDENT_WMMA=0` disables only the GEMM path.

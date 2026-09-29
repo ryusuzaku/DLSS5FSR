@@ -8,7 +8,7 @@ __device__ inline float split512_norm_inverse(const float* v) {
     float parts[16];
     for (int j=0;j<16;++j) {
         float upper=split512_half(v[j+16]*v[j+16]);
-        volatile _Float16 fused=(_Float16)(double(v[j])*double(v[j])+double(upper));
+        _Float16 fused=(_Float16)(double(v[j])*double(v[j])+double(upper));
         parts[j]=(float)fused;
     }
     for (int j=0;j<8;++j) parts[j]=split512_half(parts[2*j]+parts[2*j+1]);
@@ -109,10 +109,10 @@ __global__ void k_split512_scores(const float* normalized,const float* bias,
 __global__ void k_split512_exp(const float* scores,float* exp,int n) {
     int i=blockIdx.x*blockDim.x+threadIdx.x;
     if(i>=n)return;
-    volatile float a=scores[i]*.044921875f;
-    volatile float b=a+1.30078125f;
+    float a=scores[i]*.044921875f;
+    float b=a+1.30078125f;
     float clipped=fminf(1.5693359375f,fmaxf(1.03125f,split512_half(b)));
-    _Float16 half=(_Float16)clipped;
+    _Float16 half=split512_to_half(clipped);
     unsigned short bits;
     memcpy(&bits,&half,2);
     bits=(unsigned short)(((unsigned)bits<<5)+0x8000u);

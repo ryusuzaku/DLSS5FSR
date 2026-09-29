@@ -26,7 +26,7 @@ __global__ void k_upsample48_merge(const float* low,const float* skip,
     if(i>=outwidth*outheight*256)return;
     int c=i%256,x=i/256%outwidth,y=i/256/outwidth;
     float main=low[((y/2)*width+x/2)*256+c];
-    volatile float product=skip[i]*scale[c];
-    volatile float total=main+product;
+    float product=skip[i]*scale[c];
+    float total=main+product;
     merged[i]=split512_fp8(split512_half(total));
 }

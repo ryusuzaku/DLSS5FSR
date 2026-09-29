@@ -125,13 +125,15 @@ public:
             tiled::gemm<tiled::Split,tiled::RAW,false>(c512_resident::stream,feature.data,64,w.qkv.data,64,
                 nullptr,0,nullptr,qkv.data,nullptr,192,tokens,192);
             HIP_CHECK(hipGetLastError());
-            C64_LAUNCH(k_split512_qknorm_inv,size_t(tokens)*2*2,qkv.data,inverse.data,tokens,64);
-            C64_LAUNCH(k_split512_qknorm_apply,size_t(tokens)*3*64,qkv.data,w.scales.data,inverse.data,normalized.data,tokens,64);
-            C64_LAUNCH(k_c64_scores,sc,normalized.data,w.bias.data,scores.data,wn);
-            C64_LAUNCH(k_split512_exp,sc,scores.data,exponents.data,int(sc));
-            C64_LAUNCH(k_split512_inv_rows,sc/64,exponents.data,inverse.data,int(sc/64));
-            C64_LAUNCH(k_split512_prob_rows,sc,exponents.data,inverse.data,probabilities.data,int(sc));
-            C64_LAUNCH(k_c64_context,count,probabilities.data,normalized.data,context.data,wn);
+            if (verify || !c512_resident::fused_attention(qkv.data, w.scales.data, w.bias.data, context.data, tokens, 64)) {
+                C64_LAUNCH(k_split512_qknorm_inv,size_t(tokens)*2*2,qkv.data,inverse.data,tokens,64);
+                C64_LAUNCH(k_split512_qknorm_apply,size_t(tokens)*3*64,qkv.data,w.scales.data,inverse.data,normalized.data,tokens,64);
+                C64_LAUNCH(k_c64_scores,sc,normalized.data,w.bias.data,scores.data,wn);
+                C64_LAUNCH(k_split512_exp,sc,scores.data,exponents.data,int(sc));
+                C64_LAUNCH(k_split512_inv_rows,sc/64,exponents.data,inverse.data,int(sc/64));
+                C64_LAUNCH(k_split512_prob_rows,sc,exponents.data,inverse.data,probabilities.data,int(sc));
+                C64_LAUNCH(k_c64_context,count,probabilities.data,normalized.data,context.data,wn);
+            }
             // The linear projection is a diagnostic output; it runs only when verifying.
             if (verify) C64_LAUNCH(k_c64_projection_linear,count,context.data,w.projection.data,linear.data,tokens);
             tiled::gemm<tiled::Split,tiled::FP8,true>(c512_resident::stream,context.data,64,w.projection.data,64,

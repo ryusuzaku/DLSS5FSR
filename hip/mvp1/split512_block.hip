@@ -2,14 +2,25 @@
 // Standalone first C512 bottleneck projection. Input is already FP8-decoded.
 // Each 32-wide product rounds to half, as in native_split_reference.multiply.
 #include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
 
+// Round to half (RNE) and back. __float2half_rn is the native conversion; the
+// previous volatile _Float16 form gives the same value for every float (the
+// cast equals __float2half_rn on all 2^32 inputs) but spilled to scratch and
+// was ~27x slower.
 __device__ inline float split512_half(float x) {
-    volatile _Float16 v = (_Float16)x;
-    return (float)v;
+    return __half2float(__float2half_rn(x));
+}
+// The same rounding, as a _Float16 for exact storage in half buffers.
+__device__ inline _Float16 split512_to_half(float x) {
+    __half h = __float2half_rn(x);
+    _Float16 v;
+    __builtin_memcpy(&v, &h, 2);
+    return v;
 }
 
 // F(x) in the upstream reference: saturating E4M3FN, ties to even.
-__device__ inline float split512_fp8(float x) {
+__device__ inline float split512_fp8_sw(float x) {
     float a = fabsf(x);
     if (a >= 448.0f) return copysignf(448.0f, x);
     if (a < 0.015625f) {
@@ -23,6 +34,17 @@ __device__ inline float split512_fp8(float x) {
     if (m == 8.0f) { ++e; m = 0.0f; }
     if (e >= 8) { e = 8; m = fminf(m, 6.0f); }
     return copysignf(ldexpf(1.0f + m / 8.0f, e), x);
+}
+// gfx12 hardware E4M3FN conversion (round to nearest even) after clamping to
+// +-448; identical to split512_fp8_sw for every non-NaN float (exhaustive
+// check in build/fp8_equiv.hip).
+__device__ inline float split512_fp8(float x) {
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    x = fminf(448.0f, fmaxf(-448.0f, x));
+    return __builtin_amdgcn_cvt_f32_fp8(__builtin_amdgcn_cvt_pk_fp8_f32(x, 0.0f, 0, false), 0);
+#else
+    return split512_fp8_sw(x);
+#endif
 }
 
 __global__ void k_split512_pre(const float* input, const float* matrix,

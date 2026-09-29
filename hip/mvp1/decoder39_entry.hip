@@ -36,7 +36,7 @@ __global__ void k_decoder39_upsample_skip(const float* projected,const float* sk
     if(i>=outwidth*outheight*512)return;
     int c=i%512,x=i/512%outwidth,y=i/512/outwidth;
     float main=projected[((y/2)*width+x/2)*512+c];
-    volatile float product=skip[i]*scale[c];
-    volatile float total=main+product;
+    float product=skip[i]*scale[c];
+    float total=main+product;
     output[i]=split512_fp8(split512_half(total));
 }

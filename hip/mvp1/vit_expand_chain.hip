@@ -84,7 +84,7 @@ __global__ void k_vit_qkv_normalize(const float* projected,const float* scales,
     float parts[16];
     for(int j=0;j<16;++j) {
         float upper=split512_half(ordered[j+16]*ordered[j+16]);
-        volatile _Float16 fused=(_Float16)(double(ordered[j])*double(ordered[j])+double(upper));
+        _Float16 fused=(_Float16)(double(ordered[j])*double(ordered[j])+double(upper));
         parts[j]=(float)fused;
     }
     for(int j=0;j<8;++j)parts[j]=split512_half(parts[2*j]+parts[2*j+1]);
@@ -114,10 +114,10 @@ __global__ void k_vit_scores(const float* qkv,float* scores,int tokens) {
 __global__ void k_vit_exponents(const float* scores,float* exponents,int count) {
     int i=blockIdx.x*blockDim.x+threadIdx.x;
     if(i>=count)return;
-    volatile float scaled=scores[i]*.08953857421875f;
-    volatile float shifted=scaled+1.708984375f;
+    float scaled=scores[i]*.08953857421875f;
+    float shifted=scaled+1.708984375f;
     float affine=fminf(1.9775390625f,fmaxf(1.439453125f,split512_half(shifted)));
-    _Float16 half=(_Float16)affine;
+    _Float16 half=split512_to_half(affine);
     unsigned short bits;
     memcpy(&bits,&half,2);
     bits=(unsigned short)(((unsigned)bits<<4)+0x4000u);

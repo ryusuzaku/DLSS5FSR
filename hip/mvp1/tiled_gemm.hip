@@ -117,14 +117,12 @@ inline void gemm(hipStream_t stream, const float* X, int ldx, const float* W, in
                  const float* R, int ldr, const float* S, float* out, float* out2, int ldo,
                  int T, int O, int groups = 1, long long gx = 0, long long gw = 0, long long go = 0,
                  int parts = 1) {
-    if (wmma_gemm::enabled &&
-        wmma_gemm::gemm<P,EPI,RESIDUAL>(stream, X, ldx, W, K, R, ldr, S, out, out2, ldo, T, O, groups, gx, gw, go, parts)) {
-        if (c512_resident::launch_hook) c512_resident::launch_hook("wmma_gemm");
-        return;
-    }
+    const bool wmma = wmma_gemm::enabled && !c512_resident::exact_math &&
+        wmma_gemm::gemm<P,EPI,RESIDUAL>(stream, X, ldx, W, K, R, ldr, S, out, out2, ldo, T, O, groups, gx, gw, go, parts);
     // Narrow outputs use taller tiles so no thread idles; the arithmetic per
     // output is identical for every tile shape.
-    if (O <= 32) {
+    if (wmma) {
+    } else if (O <= 32) {
         dim3 grid((O+31)/32, (T+127)/128, groups);
         hipLaunchKernelGGL((k_gemm<P,EPI,RESIDUAL,128,32>), grid, dim3(256), 0, stream,
                            X, ldx, W, K, R, ldr, S, out, out2, ldo, T, O, gx, gw, go, parts);
@@ -139,7 +137,7 @@ inline void gemm(hipStream_t stream, const float* X, int ldx, const float* W, in
     }
     if (c512_resident::launch_hook) {
         char name[96];
-        snprintf(name, sizeof(name), "tiled_gemm_%s%s_K%d_O%d_G%d_P%d", EPI == GATE ? "gate" : EPI == DOUBLE_RES ? "dres" :
+        snprintf(name, sizeof(name), "%s_%s%s_K%d_O%d_G%d_P%d", wmma ? "wmma" : "tiled", EPI == GATE ? "gate" : EPI == DOUBLE_RES ? "dres" :
                  EPI == FP8 ? "fp8" : "raw", RESIDUAL ? "_res" : "", K, O, groups, parts);
         c512_resident::launch_hook(name);
     }
