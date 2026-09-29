@@ -276,6 +276,7 @@ def run(capture_path, output_root, preview_path, max_updates=0,
                 break
         except KeyboardInterrupt:
             write_status(status_path, state='stopped', iteration=iteration,
+                         gpu_pair_mismatches=pair_mismatches,
                          last_preview_sha256=last_preview_sha,
                          last_preview_capture_sha256=last_capture_sha,
                          last_preview_completed_at_utc=last_preview_completed)
