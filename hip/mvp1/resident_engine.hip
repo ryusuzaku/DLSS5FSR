@@ -87,25 +87,65 @@ float srgb_encode(float linear) {
 // numpy-equivalent sRGB encoding of the head's linear RGB (clip, sRGB, rint).
 unsigned char srgb8(float linear) { return (unsigned char)nearbyintf(srgb_encode(linear)*255.0f); }
 
-// Full mode: the frame's sRGB bytes (RGBA8, or RGBA16F when bpp is 8) from
-// the network's linear RGB (row stride W pixels), on the GPU. powf may
-// differ from the host's by an ulp, which can move a rare 8-bit rounding.
-__global__ void k_encode_frame(const float* linear, unsigned char* out, int frame_w, int frame_h, int W, int bpp) {
+// Full-frame output options (optional "key=value" lines after the 24 engine
+// config lines):
+//   transfer=full  the network's RGB (default)
+//   transfer=luma  the game's colour with only the network's luminance change
+//                  applied (Y_out / Y_in on the linearized input); keeps the
+//                  game's hue where its colour is not display-referred
+//   limit=L        clamp that luminance ratio to [1-L, 1+L] (0 = no clamp)
+//   smooth=A       blend the ratio with the previous frame's by A, gated by
+//                  exp(-|Y_in - Y_in_prev| / sigma) so moving content follows
+//   sigma=S        the gate's luminance scale (default 0.02)
+//   gain=0|1       override the caller's gain (0 native .03125, 1 public 1.0)
+struct OutputOptions {
+    int luma = 0;
+    float limit = 0.0f, smooth = 0.0f, sigma = 0.02f;
+    int gain = -1;
+};
+
+__device__ inline float srgb_encode_device(float v) {
+    v = fminf(fmaxf(v, 0.0f), 1.0f);
+    return v <= 0.0031308f ? 12.92f*v : 1.055f*powf(v, 1.0f/2.4f) - 0.055f;
+}
+
+// Full mode: the frame (RGBA8, or RGBA16F when bpp is 8) from the network's
+// linear RGB (row stride W pixels), on the GPU; alpha is the input's.
+// powf may differ from the host's by an ulp, which can move a rare 8-bit rounding.
+// history: frame_w*frame_h (ratio, Y_in) pairs of the previous frame (luma + smooth).
+__global__ void k_encode_frame(const float* linear, const float* color, const unsigned char* src, int pitch,
+                               float2* history, int history_valid, OutputOptions o,
+                               unsigned char* out, int frame_w, int frame_h, int W, int bpp) {
     int i = blockIdx.x*blockDim.x + threadIdx.x;
     if (i >= frame_w*frame_h) return;
     int x = i % frame_w, y = i / frame_w;
     const float* p = linear + (size_t(y)*W + x)*3;
-    for (int c = 0; c < 4; ++c) {
-        float s = 1.0f;
-        if (c < 3) {
-            float v = fminf(fmaxf(p[c], 0.0f), 1.0f);
-            s = v <= 0.0031308f ? 12.92f*v : 1.055f*powf(v, 1.0f/2.4f) - 0.055f;
+    float rgb[3] = {p[0], p[1], p[2]};
+    if (o.luma) {
+        const float* q = color + (size_t(y)*W + x)*3;
+        float yin = .2126f*q[0] + .7152f*q[1] + .0722f*q[2];
+        float yout = .2126f*fmaxf(p[0], 0.0f) + .7152f*fmaxf(p[1], 0.0f) + .0722f*fmaxf(p[2], 0.0f);
+        float ratio = (yout + 1e-4f) / (yin + 1e-4f);
+        if (o.limit > 0.0f) ratio = fminf(1.0f + o.limit, fmaxf(1.0f - o.limit, ratio));
+        if (history) {
+            float2 h = history[i];
+            if (history_valid && o.smooth > 0.0f) {
+                float wgt = o.smooth * expf(-fabsf(yin - h.y) / o.sigma);
+                ratio = ratio + (h.x - ratio)*wgt;
+            }
+            history[i] = make_float2(ratio, yin);
         }
+        for (int c = 0; c < 3; ++c) rgb[c] = q[c]*ratio;
+    }
+    const unsigned char* in = src + size_t(y)*pitch + size_t(x)*bpp;
+    for (int c = 0; c < 4; ++c) {
         if (bpp == 4) {
-            out[size_t(i)*4+c] = c < 3 ? (unsigned char)nearbyintf(s*255.0f) : 255;
-        } else {
-            _Float16 h = (_Float16)s;
+            out[size_t(i)*4+c] = c < 3 ? (unsigned char)nearbyintf(srgb_encode_device(rgb[c])*255.0f) : in[3];
+        } else if (c < 3) {
+            _Float16 h = (_Float16)srgb_encode_device(rgb[c]);
             __builtin_memcpy(out + size_t(i)*8 + c*2, &h, 2);
+        } else {
+            __builtin_memcpy(out + size_t(i)*8 + 6, in + 6, 2);
         }
     }
 }
@@ -267,6 +307,9 @@ struct Engine {
     std::vector<float> host_native, host_public, host_color;
     bool host_valid = false;                        // full mode fetches the floats on demand
     std::unique_ptr<Buffer> encoded;                // full mode: device frame bytes
+    OutputOptions options;                          // full-frame output (config lines after 24)
+    std::unique_ptr<Buffer> history;                // full mode: (ratio, Y_in) per frame pixel
+    int history_w = 0, history_h = 0;
     unsigned char* pinned = nullptr;                // full mode: host readback of the frame bytes
     size_t pinned_bytes = 0;
     int result_w = 0, result_h = 0;                 // network extent of the latest result
@@ -277,7 +320,21 @@ struct Engine {
     std::string error;
 
     explicit Engine(const std::vector<std::string>& lines) : config(lines) {
-        if (config.size() != 24) throw std::runtime_error("engine config needs 24 lines");
+        if (config.size() < 24) throw std::runtime_error("engine config needs 24 lines");
+        for (size_t i = 24; i < config.size(); ++i) {  // optional output options
+            const std::string& line = config[i];
+            size_t eq = line.find('=');
+            if (eq == std::string::npos) throw std::runtime_error("engine option needs key=value: " + line);
+            std::string key = line.substr(0, eq), value = line.substr(eq+1);
+            if (key == "transfer" && (value == "luma" || value == "full")) options.luma = value == "luma";
+            else if (key == "limit") options.limit = std::stof(value);
+            else if (key == "smooth") options.smooth = std::stof(value);
+            else if (key == "sigma") options.sigma = std::stof(value);
+            else if (key == "gain" && (value == "0" || value == "1")) options.gain = value == "1";
+            else throw std::runtime_error("unknown engine option: " + line);
+        }
+        if (options.sigma <= 0.0f || options.smooth < 0.0f || options.smooth > 1.0f || options.limit < 0.0f)
+            throw std::runtime_error("engine options out of range");
         // The caller's thread may carry a stale HIP error from its own work;
         // setup checks hipGetLastError() after its first launches.
         (void)hipGetLastError();
@@ -301,7 +358,7 @@ struct Engine {
         if (start) (void)hipEventDestroy(start);
         if (stop) (void)hipEventDestroy(stop);
         if (pinned) (void)hipHostFree(pinned);
-        net.reset(); raw_input.reset(); encoded.reset();
+        net.reset(); raw_input.reset(); encoded.reset(); history.reset();
         wmma_gemm::state().clear();  // half weight copies are keyed by the freed pointers
         c512_resident::stream = nullptr;
         if (stream) (void)hipStreamDestroy(stream);
@@ -382,8 +439,17 @@ struct Engine {
                 pinned_bytes = bytes;
             }
             auto* out = reinterpret_cast<unsigned char*>(encoded->data);
+            int history_valid = history && history_w == frame_w && history_h == frame_h;
+            if (options.luma && !history_valid) {
+                history.reset(new Buffer(size_t(frame_w)*frame_h*2));
+                history_w = frame_w; history_h = frame_h;
+            }
+            int gain = options.gain >= 0 ? options.gain : job_gain;
             hipLaunchKernelGGL(k_encode_frame, dim3((frame_w*frame_h+255)/256), dim3(256), 0, stream,
-                               job_gain ? net->rgb_public->data : net->rgb_native->data, out, frame_w, frame_h, W, frame_bpp);
+                               gain ? net->rgb_public->data : net->rgb_native->data, net->color->data,
+                               reinterpret_cast<const unsigned char*>(raw_input->data), frame_pitch,
+                               options.luma ? reinterpret_cast<float2*>(history->data) : nullptr, history_valid,
+                               options, out, frame_w, frame_h, W, frame_bpp);
             HIP_CHECK(hipGetLastError());
             HIP_CHECK(hipMemcpyAsync(pinned, out, bytes, hipMemcpyDeviceToHost, stream));
             HIP_CHECK(hipStreamSynchronize(stream));

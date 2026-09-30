@@ -743,3 +743,22 @@ the front end at both extents, the engine crop checks, and the whole
 rounding tie (one value in 4.7 million, one half step). `RESIDENT_EXACT=1`
 selects the sequential kernels everywhere, and the regressions run in that
 mode. `RESIDENT_WMMA=0` disables only the GEMM path.
+
+### Full-frame output options
+
+Optional `key=value` lines after the 24 engine config lines control how
+the engine writes the full frame (the input's alpha is always kept):
+- `transfer=full` (default) writes the network's RGB. `transfer=luma`
+  keeps the game's colour and applies only the network's luminance change
+  (Y_out / Y_in on the linearized input). The upscaler input in Cyberpunk
+  2077 comes before the game's tone mapper and grade (its values are
+  washed out when viewed as sRGB), so the network's hue there does not
+  match the final image; other AMD ports use the same luminance-only
+  transfer for it.
+- `limit=L` clamps the luminance ratio to [1-L, 1+L].
+- `smooth=A` and `sigma=S` blend the ratio with the previous frame's,
+  gated by exp(-|Y_in - Y_in_prev| / S), against frame-to-frame shimmer.
+- `gain=0|1` overrides the shim's gain. The native gain (.03125) changes
+  the frame by well under one 8-bit level; the public gain (1.0) carries
+  the network's full change.
+
