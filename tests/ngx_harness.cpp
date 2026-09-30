@@ -1542,8 +1542,9 @@ int main(int argc, char** argv) {
             if (engineRun) {
                 Check(text.find("hip: resident engine ready in ") != std::string::npos,
                       "resident engine loaded in process");
-                Check(text.find(engineFull ? "hip: resident engine frame 1 at " :
-                                             "hip: resident engine preview 1 (") != std::string::npos,
+                Check(engineFull ? (text.find("hip: resident engine frame 1 at ") != std::string::npos ||
+                                    text.find("hip: resident engine composed frame 1 at ") != std::string::npos)
+                                 : text.find("hip: resident engine preview 1 (") != std::string::npos,
                       engineFull ? "resident engine published a full frame" :
                                    "resident engine published a preview");
                 if (engineFull)

@@ -134,6 +134,7 @@ struct State {
     int (*EngineSubmit)(const void*, int, int, int, int) = nullptr;
     int (*EngineSubmitFull)(const void*, int, int, int, int, int) = nullptr;
     int (*EngineMotion)(const void*, int, int, int) = nullptr;  // optional (re_motion)
+    int (*EngineComposeDevice)(void*, unsigned long long, int, int, int, float*) = nullptr;  // optional
     int (*EnginePollFrame)(unsigned char*, unsigned long long, int, int, int, float*) = nullptr;
     bool engineFrameReady = false;
     int (*EnginePoll)(int, unsigned char*, unsigned char*, float*) = nullptr;
@@ -825,6 +826,8 @@ static bool EngineReady() {
     s.EngineDestroy = (void (*)())GetProcAddress(s.engineDll, "re_destroy");
     s.EngineSubmitFull = (int (*)(const void*, int, int, int, int, int))GetProcAddress(s.engineDll, "re_submit_full");
     s.EngineMotion = (int (*)(const void*, int, int, int))GetProcAddress(s.engineDll, "re_motion");
+    s.EngineComposeDevice = (int (*)(void*, unsigned long long, int, int, int, float*))
+        GetProcAddress(s.engineDll, "re_compose_device");
     s.EnginePollFrame = (int (*)(unsigned char*, unsigned long long, int, int, int, float*))
         GetProcAddress(s.engineDll, "re_poll_frame");
     if (cfg.residentEngineFull && (!s.EngineSubmitFull || !s.EnginePollFrame)) {
@@ -876,8 +879,20 @@ bool ResidentEngineSubmit() {
             s.engineState = -1;
             return false;
         }
-        if (m == 1 && (s.engineMotionFrames++ % 600) == 0)
-            LOGI("hip: resident engine motion %llu at %ux%u", (unsigned long long)s.engineMotionFrames, s.w, s.h);
+        if (m == 1 && (s.engineMotionFrames++ % 600) == 0) {
+            // A sample of the staged field (middle row), to see its units in game.
+            std::vector<float> row((size_t)s.w * 2);
+            float maxX = 0.0f, maxY = 0.0f, sumX = 0.0f;
+            if (s.Memcpy(row.data(), (const unsigned char*)s.ptrMv + (size_t)(s.h / 2) * s.mvPitch,
+                         row.size() * sizeof(float), hipMemcpyDeviceToHost) == hipSuccess) {
+                for (size_t i = 0; i < row.size(); i += 2) {
+                    maxX = fmaxf(maxX, fabsf(row[i])); maxY = fmaxf(maxY, fabsf(row[i+1]));
+                    sumX += fabsf(row[i]);
+                }
+            }
+            LOGI("hip: resident engine motion %llu at %ux%u (middle row: max |x| %.3f max |y| %.3f mean |x| %.3f px)",
+                 (unsigned long long)s.engineMotionFrames, s.w, s.h, maxX, maxY, sumX / (float)s.w);
+        }
     }
     const int r = cfg.residentEngineFull
         ? s.EngineSubmitFull(s.ptrIn, (int)s.w, (int)s.h, (int)s.pitch, (int)s.bpp, cfg.residentEngineGain)
@@ -949,6 +964,24 @@ bool CandidatePreview() {
             s.engineFrameReady = false;
         }
         float deviceMs = 0.0f;
+        if (s.EngineComposeDevice) {
+            // Composed straight into the model staging on the engine's
+            // high-priority stream: no host round trip on the render thread.
+            const int c = s.EngineComposeDevice(s.ptrOut, (unsigned long long)s.pitch,
+                                                (int)s.w, (int)s.h, (int)s.bpp, &deviceMs);
+            if (c < 0) {
+                LOGE("hip: resident engine disabled: %s", s.EngineError());
+                s.engineState = -1;
+                return false;
+            }
+            if (c == 1) {
+                if ((s.enginePreviews++ % 120) == 0)
+                    LOGI("hip: resident engine composed frame %llu at %ux%u (%llu frames, %llu submissions, %.3f ms device)",
+                         (unsigned long long)s.enginePreviews, s.w, s.h, (unsigned long long)s.engineFrames,
+                         (unsigned long long)s.engineSubmits, deviceMs);
+                return true;  // ptrOut already holds the answer
+            }
+        }
         const int r = s.EnginePollFrame(s.previewFrame.data(), (unsigned long long)s.pitch,
                                         (int)s.w, (int)s.h, (int)s.bpp, &deviceMs);
         if (r < 0) {

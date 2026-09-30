@@ -203,11 +203,12 @@ __global__ void k_warp_map(const float2* src, const float2* motion, float2* dst,
 
 // Luma mode, every frame: the current frame with the latest ratio map.
 __global__ void k_compose(const unsigned char* src, int pitch, int bpp, const float2* map, OutputOptions o,
-                          unsigned char* out, int frame_w, int frame_h) {
+                          unsigned char* out, size_t out_pitch, int frame_w, int frame_h) {
     int i = blockIdx.x*blockDim.x + threadIdx.x;
     if (i >= frame_w*frame_h) return;
     int x = i % frame_w, y = i / frame_w;
     const unsigned char* px = src + size_t(y)*pitch + size_t(x)*bpp;
+    out += size_t(y)*out_pitch + size_t(x)*bpp;
     float raw[3], lin[3], peak = 0.0f;
     for (int c = 0; c < 3; ++c) {
         raw[c] = frame_channel(px, bpp, c);
@@ -223,15 +224,15 @@ __global__ void k_compose(const unsigned char* src, int pitch, int bpp, const fl
     if (!isfinite(ratio)) { ratio = 1.0f; wgt = 0.0f; }
     for (int c = 0; c < 4; ++c) {
         if (c == 3 || raw[c] >= 1.0f || wgt == 0.0f) {  // alpha, HDR and untouched values pass through
-            for (int b = 0; b < bpp/4; ++b) out[size_t(i)*bpp + c*(bpp/4) + b] = px[c*(bpp/4) + b];
+            for (int b = 0; b < bpp/4; ++b) out[c*(bpp/4) + b] = px[c*(bpp/4) + b];
             continue;
         }
         float s = srgb_encode_device(lin[c]*ratio);
         if (bpp == 4) {
-            out[size_t(i)*4+c] = (unsigned char)nearbyintf(s*255.0f);
+            out[c] = (unsigned char)nearbyintf(s*255.0f);
         } else {
             _Float16 h = (_Float16)s;
-            __builtin_memcpy(out + size_t(i)*8 + c*2, &h, 2);
+            __builtin_memcpy(out + c*2, &h, 2);
         }
     }
 }
@@ -478,8 +479,12 @@ struct Engine {
         // The caller's thread may carry a stale HIP error from its own work;
         // setup checks hipGetLastError() after its first launches.
         (void)hipGetLastError();
-        HIP_CHECK(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking));
-        HIP_CHECK(hipStreamCreateWithFlags(&compose_stream, hipStreamNonBlocking));
+        // The network runs at the lowest priority and the per-frame compose
+        // at the highest, so the game's frame never queues behind a network run.
+        int least = 0, greatest = 0;
+        HIP_CHECK(hipDeviceGetStreamPriorityRange(&least, &greatest));
+        HIP_CHECK(hipStreamCreateWithPriority(&stream, hipStreamNonBlocking, least));
+        HIP_CHECK(hipStreamCreateWithPriority(&compose_stream, hipStreamNonBlocking, greatest));
         c512_resident::stream = stream;
         // Load weights and validate the configuration up front at 256x256.
         net.reset(new Network(config, 256, 256));
@@ -700,63 +705,90 @@ struct Engine {
         return 1;
     }
 
+    // Luma mode: the newest frame with the latest (motion-carried) ratio map,
+    // composed into device memory `out` (rows of out_pitch bytes) on the
+    // high-priority compose stream; returns once it is written. The caller
+    // holds the mutex. 1 composed, 0 nothing yet, -1 error.
+    int compose_into(unsigned char* out, size_t out_pitch, int w, int h, int bpp, size_t dst_pitch) {
+        if (!out || published < 0 || map_w != w || map_h != h || cur_w != w || cur_h != h || cur_bpp != bpp ||
+            dst_pitch < size_t(w)*bpp || out_pitch < size_t(w)*bpp) return 0;
+        try {
+            const float2* map = reinterpret_cast<const float2*>(maps[published]->data);
+            if (options.motion && mv_w == w && mv_h == h && map_frame[published] >= 0) {
+                // Carry the map from its own frame (a new result) or from
+                // the last carried frame to the newest submitted frame.
+                const long long target = frame_counter - 1;
+                long long from;
+                const float2* src;
+                if (warped_source != published_generation) {
+                    from = map_frame[published]; src = map;
+                    for (auto& b : warped)
+                        if (!b || b->count < size_t(w)*h*2) b.reset(new Buffer(size_t(w)*h*2));
+                } else {
+                    from = warped_frame; src = reinterpret_cast<const float2*>(warped[warped_cur]->data);
+                }
+                bool carried = true;
+                for (long long f = from + 1; f <= target; ++f) {
+                    int slot = int(f % kRing);
+                    if (ring_frame[slot] != f) { carried = false; break; }  // motion lost: stop here
+                    int next = src == reinterpret_cast<const float2*>(warped[0]->data) ? 1 : 0;
+                    hipLaunchKernelGGL(k_warp_map, dim3((w*h+255)/256), dim3(256), 0, compose_stream,
+                                       src, reinterpret_cast<const float2*>(ring[slot]->data),
+                                       reinterpret_cast<float2*>(warped[next]->data), w, h);
+                    src = reinterpret_cast<const float2*>(warped[next]->data);
+                    warped_cur = next;
+                }
+                if (src != map) {
+                    warped_frame = carried ? target : warped_frame;
+                    warped_source = published_generation;
+                    map = src;
+                } else if (carried) {
+                    // Nothing to carry yet (result for the newest frame).
+                    HIP_CHECK(hipMemcpyAsync(warped[0]->data, map, size_t(w)*h*8, hipMemcpyDeviceToDevice, compose_stream));
+                    warped_cur = 0; warped_frame = target; warped_source = published_generation;
+                }
+            }
+            hipLaunchKernelGGL(k_compose, dim3((w*h+255)/256), dim3(256), 0, compose_stream,
+                               reinterpret_cast<const unsigned char*>(current->data), cur_pitch, bpp,
+                               map, options, out, out_pitch, w, h);
+            HIP_CHECK(hipGetLastError());
+            HIP_CHECK(hipStreamSynchronize(compose_stream));
+        } catch (const std::exception& e) {
+            failed = true; error = e.what(); return -1;
+        }
+        return 1;
+    }
+
+    int compose_device(void* dst, size_t pitch, int w, int h, int bpp, float* device_ms) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (failed) return -1;
+        if (!options.luma) return 0;
+        int r = compose_into(reinterpret_cast<unsigned char*>(dst), pitch, w, h, bpp, pitch);
+        if (r == 1 && device_ms) *device_ms = last_ms;
+        return r;
+    }
+
     // Full mode: copy the newest frame if it matches the destination's size/format.
     int poll_frame(unsigned char* dst, size_t pitch, int w, int h, int bpp, float* device_ms) {
         std::lock_guard<std::mutex> lock(mutex);
         if (failed) return -1;
         if (options.luma) {
-            // The newest frame with the latest ratio map, every call.
-            if (published < 0 || map_w != w || map_h != h || cur_w != w || cur_h != h || cur_bpp != bpp ||
-                pitch < size_t(w)*bpp) return 0;
+            size_t bytes = size_t(w)*h*bpp;
             try {
-                size_t bytes = size_t(w)*h*bpp;
                 if (compose_pinned_bytes < bytes) {
                     if (compose_pinned) HIP_CHECK(hipHostFree(compose_pinned));
                     compose_pinned = nullptr; compose_pinned_bytes = 0;
                     HIP_CHECK(hipHostMalloc(reinterpret_cast<void**>(&compose_pinned), bytes));
                     compose_pinned_bytes = bytes;
                 }
-                auto* out = reinterpret_cast<unsigned char*>(composed->data);
-                const float2* map = reinterpret_cast<const float2*>(maps[published]->data);
-                if (options.motion && mv_w == w && mv_h == h && map_frame[published] >= 0) {
-                    // Carry the map from its own frame (a new result) or from
-                    // the last carried frame to the newest submitted frame.
-                    const long long target = frame_counter - 1;
-                    long long from;
-                    const float2* src;
-                    if (warped_source != published_generation) {
-                        from = map_frame[published]; src = map;
-                        for (auto& b : warped)
-                            if (!b || b->count < size_t(w)*h*2) b.reset(new Buffer(size_t(w)*h*2));
-                    } else {
-                        from = warped_frame; src = reinterpret_cast<const float2*>(warped[warped_cur]->data);
-                    }
-                    bool carried = true;
-                    for (long long f = from + 1; f <= target; ++f) {
-                        int slot = int(f % kRing);
-                        if (ring_frame[slot] != f) { carried = false; break; }  // motion lost: stop here
-                        int next = src == reinterpret_cast<const float2*>(warped[0]->data) ? 1 : 0;
-                        hipLaunchKernelGGL(k_warp_map, dim3((w*h+255)/256), dim3(256), 0, compose_stream,
-                                           src, reinterpret_cast<const float2*>(ring[slot]->data),
-                                           reinterpret_cast<float2*>(warped[next]->data), w, h);
-                        src = reinterpret_cast<const float2*>(warped[next]->data);
-                        warped_cur = next;
-                    }
-                    if (src != map) {
-                        warped_frame = carried ? target : warped_frame;
-                        warped_source = published_generation;
-                        map = src;
-                    } else if (carried) {
-                        // Nothing to carry yet (result for the newest frame).
-                        HIP_CHECK(hipMemcpyAsync(warped[0]->data, map, size_t(w)*h*8, hipMemcpyDeviceToDevice, compose_stream));
-                        warped_cur = 0; warped_frame = target; warped_source = published_generation;
-                    }
-                }
-                hipLaunchKernelGGL(k_compose, dim3((w*h+255)/256), dim3(256), 0, compose_stream,
-                                   reinterpret_cast<const unsigned char*>(current->data), cur_pitch, bpp,
-                                   map, options, out, w, h);
-                HIP_CHECK(hipGetLastError());
-                HIP_CHECK(hipMemcpyAsync(compose_pinned, out, bytes, hipMemcpyDeviceToHost, compose_stream));
+            } catch (const std::exception& e) {
+                failed = true; error = e.what(); return -1;
+            }
+            int r = compose_into(composed ? reinterpret_cast<unsigned char*>(composed->data) : nullptr,
+                                 size_t(w)*bpp, w, h, bpp, pitch);
+            if (r != 1) return r;
+            try {
+                HIP_CHECK(hipMemcpyAsync(compose_pinned, composed->data, bytes, hipMemcpyDeviceToHost, compose_stream));
                 HIP_CHECK(hipStreamSynchronize(compose_stream));
             } catch (const std::exception& e) {
                 failed = true; error = e.what(); return -1;
@@ -837,6 +869,16 @@ __declspec(dllexport) int re_motion(const void* mv, int width, int height, int p
     std::lock_guard<std::mutex> lock(g_mutex);
     if (!g_engine) return -1;
     return g_engine->motion(mv, width, height, pitch);
+}
+
+// Luma full mode: compose the newest frame straight into device memory
+// (rows of `pitch` bytes, the submit's format), no host round trip.
+// Returns 1 written, 0 nothing yet or another mode (use re_poll_frame), -1 error.
+__declspec(dllexport) int re_compose_device(void* dst, unsigned long long pitch, int width, int height,
+                                            int bpp, float* device_ms) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!g_engine) return -1;
+    return g_engine->compose_device(dst, size_t(pitch), width, height, bpp, device_ms);
 }
 
 __declspec(dllexport) int re_poll_frame(unsigned char* dst, unsigned long long pitch, int width, int height,
