@@ -98,45 +98,102 @@ unsigned char srgb8(float linear) { return (unsigned char)nearbyintf(srgb_encode
 //                  exp(-|Y_in - Y_in_prev| / sigma) so moving content follows
 //   sigma=S        the gate's luminance scale (default 0.02)
 //   gain=0|1       override the caller's gain (0 native .03125, 1 public 1.0)
+//   strength=K     scale the luminance change (ratio = 1 + K*(ratio-1))
+//   gate=G         luma mode applies the latest ratio map to every current
+//                  frame; where the current input luminance differs from the
+//                  one the map was computed on, the ratio fades by
+//                  exp(-|dY| / G) (moved content keeps the game's pixels)
+// In luma mode values at or above 1.0 (HDR, which the network only sees
+// clipped) pass through, and the ratio fades out as a channel nears 1.0.
 struct OutputOptions {
     int luma = 0;
-    float limit = 0.0f, smooth = 0.0f, sigma = 0.02f;
+    float limit = 0.0f, smooth = 0.0f, sigma = 0.02f, strength = 1.0f, gate = 0.03f;
     int gain = -1;
 };
+
+__device__ inline float srgb_decode_device(float s) {
+    s = fminf(fmaxf(s, 0.0f), 1.0f);
+    return s <= 0.04045f ? s/12.92f : powf((s+0.055f)/1.055f, 2.4f);
+}
+
+__device__ inline float frame_channel(const unsigned char* px, int bpp, int c) {
+    if (bpp == 4) return px[c] / 255.0f;
+    unsigned short bits = (unsigned short)(px[2*c] | (px[2*c+1] << 8));
+    return __half2float(__ushort_as_half(bits));
+}
 
 __device__ inline float srgb_encode_device(float v) {
     v = fminf(fmaxf(v, 0.0f), 1.0f);
     return v <= 0.0031308f ? 12.92f*v : 1.055f*powf(v, 1.0f/2.4f) - 0.055f;
 }
 
-// Full mode: the frame (RGBA8, or RGBA16F when bpp is 8) from the network's
-// linear RGB (row stride W pixels), on the GPU; alpha is the input's.
-// powf may differ from the host's by an ulp, which can move a rare 8-bit rounding.
-// history: frame_w*frame_h (ratio, Y_in) pairs of the previous frame (luma + smooth).
-__global__ void k_encode_frame(const float* linear, const float* color, const unsigned char* src, int pitch,
-                               float2* history, int history_valid, OutputOptions o,
+// Luma mode, after a network run: per frame pixel (ratio, Y_in) from the
+// network's linear output and its linearized input, optionally smoothed
+// against the previous map (gated by the input luminance change).
+__global__ void k_ratio_map(const float* linear, const float* color, const float2* previous, int previous_valid,
+                            OutputOptions o, float2* map, int frame_w, int frame_h, int W) {
+    int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= frame_w*frame_h) return;
+    int x = i % frame_w, y = i / frame_w;
+    const float* p = linear + (size_t(y)*W + x)*3;
+    const float* q = color + (size_t(y)*W + x)*3;
+    float yin = .2126f*q[0] + .7152f*q[1] + .0722f*q[2];
+    float yout = .2126f*fmaxf(p[0], 0.0f) + .7152f*fmaxf(p[1], 0.0f) + .0722f*fmaxf(p[2], 0.0f);
+    float ratio = 1.0f + o.strength*((yout + 1e-4f) / (yin + 1e-4f) - 1.0f);
+    if (o.limit > 0.0f) ratio = fminf(1.0f + o.limit, fmaxf(1.0f - o.limit, ratio));
+    if (previous && previous_valid && o.smooth > 0.0f) {
+        float2 h = previous[i];
+        float wgt = o.smooth * expf(-fabsf(yin - h.y) / o.sigma);
+        ratio = ratio + (h.x - ratio)*wgt;
+    }
+    map[i] = make_float2(ratio, yin);
+}
+
+// Luma mode, every frame: the current frame with the latest ratio map.
+__global__ void k_compose(const unsigned char* src, int pitch, int bpp, const float2* map, OutputOptions o,
+                          unsigned char* out, int frame_w, int frame_h) {
+    int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= frame_w*frame_h) return;
+    int x = i % frame_w, y = i / frame_w;
+    const unsigned char* px = src + size_t(y)*pitch + size_t(x)*bpp;
+    float raw[3], lin[3], peak = 0.0f;
+    for (int c = 0; c < 3; ++c) {
+        raw[c] = frame_channel(px, bpp, c);
+        if (!(raw[c] == raw[c])) raw[c] = 0.0f;
+        lin[c] = srgb_decode_device(raw[c]);
+        peak = fmaxf(peak, raw[c]);
+    }
+    float yin = .2126f*lin[0] + .7152f*lin[1] + .0722f*lin[2];
+    float2 m = map[i];
+    float fade = fminf(1.0f, fmaxf(0.0f, (1.0f - peak) / 0.05f));
+    float wgt = fade * expf(-fabsf(yin - m.y) / o.gate);
+    float ratio = 1.0f + (m.x - 1.0f)*wgt;
+    for (int c = 0; c < 4; ++c) {
+        if (c == 3 || raw[c] >= 1.0f || wgt == 0.0f) {  // alpha, HDR and untouched values pass through
+            for (int b = 0; b < bpp/4; ++b) out[size_t(i)*bpp + c*(bpp/4) + b] = px[c*(bpp/4) + b];
+            continue;
+        }
+        float s = srgb_encode_device(lin[c]*ratio);
+        if (bpp == 4) {
+            out[size_t(i)*4+c] = (unsigned char)nearbyintf(s*255.0f);
+        } else {
+            _Float16 h = (_Float16)s;
+            __builtin_memcpy(out + size_t(i)*8 + c*2, &h, 2);
+        }
+    }
+}
+
+// Full mode (transfer=full): the frame (RGBA8, or RGBA16F when bpp is 8)
+// from the network's linear RGB (row stride W pixels), on the GPU; alpha is
+// the input's. powf may differ from the host's by an ulp, which can move a
+// rare 8-bit rounding.
+__global__ void k_encode_frame(const float* linear, const unsigned char* src, int pitch,
                                unsigned char* out, int frame_w, int frame_h, int W, int bpp) {
     int i = blockIdx.x*blockDim.x + threadIdx.x;
     if (i >= frame_w*frame_h) return;
     int x = i % frame_w, y = i / frame_w;
     const float* p = linear + (size_t(y)*W + x)*3;
-    float rgb[3] = {p[0], p[1], p[2]};
-    if (o.luma) {
-        const float* q = color + (size_t(y)*W + x)*3;
-        float yin = .2126f*q[0] + .7152f*q[1] + .0722f*q[2];
-        float yout = .2126f*fmaxf(p[0], 0.0f) + .7152f*fmaxf(p[1], 0.0f) + .0722f*fmaxf(p[2], 0.0f);
-        float ratio = (yout + 1e-4f) / (yin + 1e-4f);
-        if (o.limit > 0.0f) ratio = fminf(1.0f + o.limit, fmaxf(1.0f - o.limit, ratio));
-        if (history) {
-            float2 h = history[i];
-            if (history_valid && o.smooth > 0.0f) {
-                float wgt = o.smooth * expf(-fabsf(yin - h.y) / o.sigma);
-                ratio = ratio + (h.x - ratio)*wgt;
-            }
-            history[i] = make_float2(ratio, yin);
-        }
-        for (int c = 0; c < 3; ++c) rgb[c] = q[c]*ratio;
-    }
+    const float rgb[3] = {p[0], p[1], p[2]};
     const unsigned char* in = src + size_t(y)*pitch + size_t(x)*bpp;
     for (int c = 0; c < 4; ++c) {
         if (bpp == 4) {
@@ -308,8 +365,17 @@ struct Engine {
     bool host_valid = false;                        // full mode fetches the floats on demand
     std::unique_ptr<Buffer> encoded;                // full mode: device frame bytes
     OutputOptions options;                          // full-frame output (config lines after 24)
-    std::unique_ptr<Buffer> history;                // full mode: (ratio, Y_in) per frame pixel
-    int history_w = 0, history_h = 0;
+    // Luma mode: ratio maps (ratio, Y_in per frame pixel), double-buffered;
+    // maps[published] is the latest finished one, the worker writes the other.
+    std::unique_ptr<Buffer> maps[2];
+    int published = -1, map_w = 0, map_h = 0;
+    // Luma mode: the newest submitted frame and the composed output.
+    hipStream_t compose_stream = nullptr;
+    std::unique_ptr<Buffer> current, composed;
+    size_t current_bytes = 0;
+    int cur_w = 0, cur_h = 0, cur_pitch = 0, cur_bpp = 0;
+    unsigned char* compose_pinned = nullptr;        // luma mode: host readback of the composed frame
+    size_t compose_pinned_bytes = 0;
     unsigned char* pinned = nullptr;                // full mode: host readback of the frame bytes
     size_t pinned_bytes = 0;
     int result_w = 0, result_h = 0;                 // network extent of the latest result
@@ -331,14 +397,18 @@ struct Engine {
             else if (key == "smooth") options.smooth = std::stof(value);
             else if (key == "sigma") options.sigma = std::stof(value);
             else if (key == "gain" && (value == "0" || value == "1")) options.gain = value == "1";
+            else if (key == "strength") options.strength = std::stof(value);
+            else if (key == "gate") options.gate = std::stof(value);
             else throw std::runtime_error("unknown engine option: " + line);
         }
-        if (options.sigma <= 0.0f || options.smooth < 0.0f || options.smooth > 1.0f || options.limit < 0.0f)
+        if (options.sigma <= 0.0f || options.gate <= 0.0f || options.smooth < 0.0f || options.smooth > 1.0f ||
+            options.limit < 0.0f || options.strength < 0.0f)
             throw std::runtime_error("engine options out of range");
         // The caller's thread may carry a stale HIP error from its own work;
         // setup checks hipGetLastError() after its first launches.
         (void)hipGetLastError();
         HIP_CHECK(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking));
+        HIP_CHECK(hipStreamCreateWithFlags(&compose_stream, hipStreamNonBlocking));
         c512_resident::stream = stream;
         // Load weights and validate the configuration up front at 256x256.
         net.reset(new Network(config, 256, 256));
@@ -358,20 +428,39 @@ struct Engine {
         if (start) (void)hipEventDestroy(start);
         if (stop) (void)hipEventDestroy(stop);
         if (pinned) (void)hipHostFree(pinned);
-        net.reset(); raw_input.reset(); encoded.reset(); history.reset();
+        if (compose_pinned) (void)hipHostFree(compose_pinned);
+        if (compose_stream) (void)hipStreamSynchronize(compose_stream);
+        net.reset(); raw_input.reset(); encoded.reset(); maps[0].reset(); maps[1].reset();
+        current.reset(); composed.reset();
         wmma_gemm::state().clear();  // half weight copies are keyed by the freed pointers
         c512_resident::stream = nullptr;
         if (stream) (void)hipStreamDestroy(stream);
+        if (compose_stream) (void)hipStreamDestroy(compose_stream);
     }
 
     // Caller thread: snapshot the staged frame; the shim's buffer is reused next frame.
     int submit(const void* staging, int w, int h, int pitch, int bpp, bool crop, int gain) {
         std::lock_guard<std::mutex> lock(mutex);
         if (failed) return -1;
-        if (busy || pending) return 0;
         if (!staging || w <= 0 || h <= 0 || w > 4096 || h > 4096 || (bpp != 4 && bpp != 8) ||
             pitch < w*bpp) { error = "unsupported staging format"; return -1; }
         size_t bytes = size_t(pitch)*h;
+        if (!crop && options.luma) {
+            // Every frame: the newest frame for k_compose (the network may be busy).
+            try {
+                if (bytes > current_bytes) {
+                    current.reset(new Buffer((bytes+3)/4));
+                    composed.reset(new Buffer((bytes+3)/4));
+                    current_bytes = current->count*sizeof(float);
+                }
+                HIP_CHECK(hipMemcpyAsync(current->data, staging, bytes, hipMemcpyDeviceToDevice, compose_stream));
+                HIP_CHECK(hipStreamSynchronize(compose_stream));
+            } catch (const std::exception& e) {
+                failed = true; error = e.what(); return -1;
+            }
+            cur_w = w; cur_h = h; cur_pitch = pitch; cur_bpp = bpp;
+        }
+        if (busy || pending) return 0;
         try {
             if (bytes > raw_bytes) {
                 raw_input.reset(new Buffer((bytes+3)/4));
@@ -439,17 +528,31 @@ struct Engine {
                 pinned_bytes = bytes;
             }
             auto* out = reinterpret_cast<unsigned char*>(encoded->data);
-            int history_valid = history && history_w == frame_w && history_h == frame_h;
-            if (options.luma && !history_valid) {
-                history.reset(new Buffer(size_t(frame_w)*frame_h*2));
-                history_w = frame_w; history_h = frame_h;
-            }
             int gain = options.gain >= 0 ? options.gain : job_gain;
+            const float* linear = gain ? net->rgb_public->data : net->rgb_native->data;
+            if (options.luma) {
+                int next = published == 0 ? 1 : 0;
+                bool previous_valid = published >= 0 && map_w == frame_w && map_h == frame_h;
+                for (auto& m : maps)
+                    if (!m || m->count < size_t(frame_w)*frame_h*2) m.reset(new Buffer(size_t(frame_w)*frame_h*2));
+                hipLaunchKernelGGL(k_ratio_map, dim3((frame_w*frame_h+255)/256), dim3(256), 0, stream,
+                                   linear, net->color->data,
+                                   previous_valid ? reinterpret_cast<const float2*>(maps[published]->data) : nullptr,
+                                   int(previous_valid), options, reinterpret_cast<float2*>(maps[next]->data),
+                                   frame_w, frame_h, W);
+                HIP_CHECK(hipGetLastError());
+                HIP_CHECK(hipStreamSynchronize(stream));
+                float elapsed = 0.0f;
+                HIP_CHECK(hipEventElapsedTime(&elapsed, start, stop));
+                std::lock_guard<std::mutex> lock(mutex);
+                published = next; map_w = frame_w; map_h = frame_h;
+                result_w = W; result_h = H; host_valid = false;
+                last_ms = elapsed; ++completed;
+                return;
+            }
             hipLaunchKernelGGL(k_encode_frame, dim3((frame_w*frame_h+255)/256), dim3(256), 0, stream,
-                               gain ? net->rgb_public->data : net->rgb_native->data, net->color->data,
-                               reinterpret_cast<const unsigned char*>(raw_input->data), frame_pitch,
-                               options.luma ? reinterpret_cast<float2*>(history->data) : nullptr, history_valid,
-                               options, out, frame_w, frame_h, W, frame_bpp);
+                               linear, reinterpret_cast<const unsigned char*>(raw_input->data), frame_pitch,
+                               out, frame_w, frame_h, W, frame_bpp);
             HIP_CHECK(hipGetLastError());
             HIP_CHECK(hipMemcpyAsync(pinned, out, bytes, hipMemcpyDeviceToHost, stream));
             HIP_CHECK(hipStreamSynchronize(stream));
@@ -498,6 +601,33 @@ struct Engine {
     int poll_frame(unsigned char* dst, size_t pitch, int w, int h, int bpp, float* device_ms) {
         std::lock_guard<std::mutex> lock(mutex);
         if (failed) return -1;
+        if (options.luma) {
+            // The newest frame with the latest ratio map, every call.
+            if (published < 0 || map_w != w || map_h != h || cur_w != w || cur_h != h || cur_bpp != bpp ||
+                pitch < size_t(w)*bpp) return 0;
+            try {
+                size_t bytes = size_t(w)*h*bpp;
+                if (compose_pinned_bytes < bytes) {
+                    if (compose_pinned) HIP_CHECK(hipHostFree(compose_pinned));
+                    compose_pinned = nullptr; compose_pinned_bytes = 0;
+                    HIP_CHECK(hipHostMalloc(reinterpret_cast<void**>(&compose_pinned), bytes));
+                    compose_pinned_bytes = bytes;
+                }
+                auto* out = reinterpret_cast<unsigned char*>(composed->data);
+                hipLaunchKernelGGL(k_compose, dim3((w*h+255)/256), dim3(256), 0, compose_stream,
+                                   reinterpret_cast<const unsigned char*>(current->data), cur_pitch, bpp,
+                                   reinterpret_cast<const float2*>(maps[published]->data), options, out, w, h);
+                HIP_CHECK(hipGetLastError());
+                HIP_CHECK(hipMemcpyAsync(compose_pinned, out, bytes, hipMemcpyDeviceToHost, compose_stream));
+                HIP_CHECK(hipStreamSynchronize(compose_stream));
+            } catch (const std::exception& e) {
+                failed = true; error = e.what(); return -1;
+            }
+            for (int y = 0; y < h; ++y)
+                memcpy(dst + size_t(y)*pitch, compose_pinned + size_t(y)*w*bpp, size_t(w)*bpp);
+            if (device_ms) *device_ms = last_ms;
+            return 1;
+        }
         if (!fresh_frame) return 0;
         if (out_w != w || out_h != h || out_bpp != bpp || pitch < size_t(w)*bpp) {
             fresh_frame = false;  // stale extent after a resolution change

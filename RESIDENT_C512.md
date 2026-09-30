@@ -758,6 +758,13 @@ the engine writes the full frame (the input's alpha is always kept):
 - `limit=L` clamps the luminance ratio to [1-L, 1+L].
 - `smooth=A` and `sigma=S` blend the ratio with the previous frame's,
   gated by exp(-|Y_in - Y_in_prev| / S), against frame-to-frame shimmer.
+- In luma mode the network produces a per-pixel ratio map; every frame
+  the engine applies the latest map to the newest submitted frame
+  (`k_compose`), so the image is never an old frame. Where the current
+  input luminance differs from the one the map was computed on, the ratio
+  fades by exp(-|dY| / G) (`gate=G`, default 0.03). HDR values at or above
+  1.0 pass through, and the ratio fades out as a channel nears 1.0, since
+  the network only sees clipped white there. `strength=K` scales the change.
 - `gain=0|1` overrides the shim's gain. The native gain (.03125) changes
   the frame by well under one 8-bit level; the public gain (1.0) carries
   the network's full change.
