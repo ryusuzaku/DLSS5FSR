@@ -242,20 +242,36 @@ __global__ void k_c32_half_weights(const float* dw, _Float16* hw, int n) {
     if (i < n) hw[i] = split512_to_half(dw[i]);
 }
 
-__global__ __launch_bounds__(256) void k_c32_wmma(const float* __restrict__ in, const float* __restrict__ dw,
+// Where a window's tokens live: token-major [window][64][32] (hwc = 0), or
+// scattered in an HWC image through a shifted 8x8 partition (hwc = 1), with
+// the peer channel order when permute is set. Invalid (padding) tokens read
+// as zero and are not written; windows own disjoint pixels, so input and
+// output may be the same image.
+struct C32Io {
+    int in_hwc = 0, out_hwc = 0, permute = 0;
+    int width = 0, height = 0, px = 0, py = 0, pw = 0;
+    __device__ long long at(bool hwc, int win, int t, int c) const {
+        if (!hwc) return (long long)(size_t(win)*64 + t)*32 + c;
+        int x = (win % (pw/8))*8 + t%8 - px, y = (win / (pw/8))*8 + t/8 - py;
+        if (x < 0 || x >= width || y < 0 || y >= height) return -1;
+        return (long long)(size_t(y)*width + x)*32 + (permute ? peer_to_native32(c) : c);
+    }
+};
+
+__global__ __launch_bounds__(256) void k_c32_wmma(const float* in, const float* __restrict__ dw,
                                                   const _Float16* __restrict__ hw, float scale,
-                                                  float* raw_out, float* quant_out) {
+                                                  float* raw_out, float* quant_out, C32Io io) {
     using namespace c32w;
     // H: FP8 hidden; after the FFN F(ffn) at [0,2048) then F(context) there,
     // probabilities at [4096,8192). Q: F(input) at [0,2048), then qkv.
     __shared__ _Float16 H[8192];
     __shared__ _Float16 Q[64*96];
-    __shared__ _Float16 fs[64*32];
     __shared__ float inv[128];
     __shared__ float den[64];
     const int tid = threadIdx.x, wave = tid/32, lane = tid%32;
     const int lr = lane/16*8, lc = lane%16;
-    const size_t base = size_t(blockIdx.x)*64*32;
+    const int win = blockIdx.x;
+    auto input = [&](int t, int c) { long long a = io.at(io.in_hwc, win, t, c); return a < 0 ? 0.0f : in[a]; };
     const float *g1 = dw+16385, *g2 = dw+16417, *bias = dw+12288;
     _Float16* sc = H+4096;
 #ifdef C32F_PROF
@@ -265,7 +281,7 @@ __global__ __launch_bounds__(256) void k_c32_wmma(const float* __restrict__ in, 
 #endif
     C32F_MARK(0);
 
-    for (int i = tid; i < 64*32; i += 256) Q[i] = split512_to_half(h70_f(in[base+i]));
+    for (int i = tid; i < 64*32; i += 256) Q[i] = split512_to_half(h70_f(input(i/32, i%32)));
     __syncthreads();
     C32F_MARK(1);
     {   // Expand (K=32) and gate: tiles 4x8, wave -> row tile, 4 column tiles.
@@ -284,12 +300,15 @@ __global__ __launch_bounds__(256) void k_c32_wmma(const float* __restrict__ in, 
     }
     __syncthreads();
     C32F_MARK(2);
+    // FFN output (half), kept in registers: the projection tile of this wave
+    // (rt = wave/2, ct = wave%2) covers the same outputs in the same lanes.
+    float ffn[8];
     {   // FFN contract (K=128, four slices) with residual: tiles 4x2.
         const int rt = wave/2, ct = wave%2;
-        float acc[8];
+        float* acc = ffn;
         for (int e = 0; e < 8; ++e) {
             int r = rt*16+lr+e, c = ct*16+lc;
-            acc[e] = c32f_h(in[base+r*32+c]*g1[c]);
+            acc[e] = c32f_h(input(r, c)*g1[c]);
         }
         for (int k0 = 0; k0 < 128; k0 += 32) {
             FC part; slice<FBc>(part, H+rt*16*128+k0, 128, hw+4096+ct*16*128+k0, 128, 16);
@@ -298,41 +317,37 @@ __global__ __launch_bounds__(256) void k_c32_wmma(const float* __restrict__ in, 
         __syncthreads();  // other waves read H (hidden) until here
         for (int e = 0; e < 8; ++e) {
             int at = (rt*16+lr+e)*32+ct*16+lc;
-            fs[at] = split512_to_half(acc[e]);
             H[at] = split512_to_half(h70_f(acc[e]));
         }
     }
     __syncthreads();
     C32F_MARK(4);
-    {   // QKV (K=32): tiles 4x6, wave -> row tile, 3 column tiles.
-        const int rt = wave%4;
-        for (int j = 0; j < 3; ++j) {
-            const int ct = wave/4*3+j;
-            FC c; slice<FBc>(c, H+rt*16*32, 32, hw+8192+ct*16*32, 32, 16);
-            for (int e = 0; e < 8; ++e) Q[(rt*16+lr+e)*96+ct*16+lc] = split512_to_half(c32f_h(c.x[e]));
+    {   // QKV (K=32) with the Q/K norm in registers. Wave w owns rows 16*(w%4)
+        // of Q (w < 4) or K (w >= 4) as two 16-column tiles, so lane l holds
+        // v[l] and v[l+16] of each of its 8 rows, plus one V tile.
+        const int rt = wave%4, m = wave/4;
+        FC c0, c1, cv;
+        slice<FBc>(c0, H+rt*16*32, 32, hw+8192+(m*32)*32, 32, 16);
+        slice<FBc>(c1, H+rt*16*32, 32, hw+8192+(m*32+16)*32, 32, 16);
+        slice<FBc>(cv, H+rt*16*32, 32, hw+8192+(64+m*16)*32, 32, 16);
+        const float head_scale = c32f_h(scale);
+        for (int e = 0; e < 8; ++e) {
+            const int r = rt*16+lr+e;
+            float v0 = c32f_h(c0.x[e]), v1 = c32f_h(c1.x[e]);
+            // h70_normalize_inverse_fast order: parts[j] = hsum(v[j]^2, h(v[j+16]^2)),
+            // then pairs (2j, 2j+1) and widths 4, 2, 1 -> lane butterflies 1, 8, 4, 2.
+            float s = split512_half_sum(v0*v0, c32f_h(v1*v1));
+            s = c32f_h(s + __shfl_xor(s, 1));
+            s = c32f_h(s + __shfl_xor(s, 8));
+            s = c32f_h(s + __shfl_xor(s, 4));
+            s = c32f_h(s + __shfl_xor(s, 2));
+            const float inverse = c32f_h(1.f/sqrtf(fmaxf(s, .00006198883056640625f)));
+            float q0 = c32f_h(v0*inverse), q1 = c32f_h(v1*inverse);
+            if (m == 0) { q0 = c32f_h(q0*head_scale); q1 = c32f_h(q1*head_scale); }
+            Q[r*96+m*32+lc] = split512_to_half(h70_f(q0));
+            Q[r*96+m*32+16+lc] = split512_to_half(h70_f(q1));
+            Q[r*96+64+m*16+lc] = split512_to_half(h70_f(c32f_h(cv.x[e])));
         }
-    }
-    __syncthreads();
-    C32F_MARK(6);
-    if (tid < 128) {
-        int r = tid/2, m = tid%2;
-        float v[32];
-        for (int c = 0; c < 32; ++c) v[c] = float(Q[r*96+m*32+c]);
-        inv[tid] = h70_normalize_inverse_fast(v);
-    }
-    __syncthreads();
-    C32F_MARK(7);
-    const float head_scale = c32f_h(scale);
-    for (int i = tid; i < 64*96; i += 256) {
-        int r = i/96, m = i%96/32;
-        float q = float(Q[i]), value;
-        if (m == 2) value = h70_f(q);
-        else {
-            value = c32f_h(q*inv[r*2+m]);
-            if (m == 0) value = c32f_h(value*head_scale);
-            value = h70_f(value);
-        }
-        Q[i] = split512_to_half(value);
     }
     __syncthreads();
     C32F_MARK(8);
@@ -398,10 +413,12 @@ __global__ __launch_bounds__(256) void k_c32_wmma(const float* __restrict__ in, 
         FC c; slice<FBc>(c, H+rt*16*32, 32, hw+11264+ct*16*32, 32, 16);
         for (int e = 0; e < 8; ++e) {
             int r = rt*16+lr+e, col = ct*16+lc;
-            float residual = c32f_h(float(fs[r*32+col])*g2[col]);
+            float residual = c32f_h(ffn[e]*g2[col]);
             float body = split512_half_sum(c.x[e], residual);
-            raw_out[base+r*32+col] = body;
-            if (quant_out) quant_out[base+r*32+col] = h70_f(body);
+            long long a = io.at(io.out_hwc, win, r, col);
+            if (a < 0) continue;
+            if (raw_out) raw_out[a] = body;
+            if (quant_out) quant_out[a] = h70_f(body);
         }
     }
 #ifdef C32F_PROF

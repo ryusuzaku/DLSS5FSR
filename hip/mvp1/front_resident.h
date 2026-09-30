@@ -171,9 +171,19 @@ public:
         if (!check(dir,"rgb",rgb.data,pixels*3,verify,comparisons)) return false;
         FRONT_LAUNCH(k_front_stem,pixels*32,rgb.data,noise.data,stem.data,tokens.data,width,height);
         const float *raw = nullptr, *quant = nullptr;
-        if (!check(dir+"/block0","input",tokens.data,pixels*32,verify,comparisons) ||
-            !block(0,int(pixels),verify,raw,quant)) return false;
-        FRONT_LAUNCH(k_front_scatter,pixels*32,raw,raw0.data,width,height,0);
+        const bool fused = !verify && !c512_resident::exact_math;  // bodies gather/scatter themselves
+        auto io = [](int in_hwc, int w, int h, int shift) {
+            C32Io v; v.in_hwc = in_hwc; v.out_hwc = 1; v.width = w; v.height = h;
+            v.px = (shift&1) ? 4 : 0; v.py = (shift&2) ? 4 : 0; v.pw = ((w+v.px+7)/8)*8;
+            return v;
+        };
+        if (fused) {
+            weights[0]->body(tokens.data, int(pixels), raw0.data, nullptr, io(0, width, height, 0));
+        } else {
+            if (!check(dir+"/block0","input",tokens.data,pixels*32,verify,comparisons) ||
+                !block(0,int(pixels),verify,raw,quant)) return false;
+            FRONT_LAUNCH(k_front_scatter,pixels*32,raw,raw0.data,width,height,0);
+        }
         FRONT_LAUNCH(k_front_pool,pixels/4*32,raw0.data,image.data,width,height,32);
         if (!check(dir+"/block0","raw",raw0.data,pixels*32,verify,comparisons) ||
             !check(dir,"pre_down",image.data,pixels/4*32,verify,comparisons)) return false;
@@ -183,6 +193,10 @@ public:
             int px = (shifts[b]&1) ? 4 : 0, py = (shifts[b]&2) ? 4 : 0;
             int rows = ((w+px+7)/8)*((h+py+7)/8)*64;
             std::string block = dir+"/block"+std::to_string(b);
+            if (fused) {
+                weights[b]->body(image.data, rows, b == 4 ? raw4.data : nullptr, image.data, io(1, w, h, shifts[b]));
+                continue;
+            }
             FRONT_LAUNCH(k_front_gather,size_t(rows)*32,image.data,tokens.data,w,h,shifts[b]);
             if (!check(block,"input",tokens.data,size_t(rows)*32,verify,comparisons) ||
                 !this->block(b,rows,verify,raw,quant)) return false;

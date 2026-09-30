@@ -61,13 +61,13 @@ struct Weights {
         HIP_CHECK(hipGetLastError());
     }
     // Fused body of one launch: WMMA unless c512_resident::exact_math.
-    void body(const float* input,int rows,float* raw_out,float* quant_out) const {
-        if (c512_resident::exact_math) {
+    void body(const float* input,int rows,float* raw_out,float* quant_out,const C32Io& io=C32Io()) const {
+        if (c512_resident::exact_math && !io.in_hwc && !io.out_hwc) {
             hipLaunchKernelGGL(k_c32_fused,dim3(rows/64),dim3(256),0,c512_resident::stream,
                                input,data.data,scale,raw_out,quant_out);
         } else {
             hipLaunchKernelGGL(k_c32_wmma,dim3(rows/64),dim3(256),0,c512_resident::stream,
-                               input,data.data,reinterpret_cast<const _Float16*>(halves.data),scale,raw_out,quant_out);
+                               input,data.data,reinterpret_cast<const _Float16*>(halves.data),scale,raw_out,quant_out,io);
         }
         HIP_CHECK(hipGetLastError());
         if (c512_resident::launch_hook) c512_resident::launch_hook(c512_resident::exact_math?"k_c32_fused":"k_c32_wmma");
@@ -216,6 +216,13 @@ public:
             int rows=((width+px+7)/8)*8*((height+py+7)/8)*8;size_t count=size_t(rows)*32;
             std::string dir=w.dir.substr(0,w.dir.size()-5);
             if(!check(dir+"/spatial","input",input,n,verify,comparisons))return false;
+            if(!verify&&!c512_resident::exact_math){
+                C32Io io;io.in_hwc=io.out_hwc=io.permute=1;io.width=width;io.height=height;io.px=px;io.py=py;
+                io.pw=((width+px+7)/8)*8;
+                w.body(input,rows,nullptr,output,io);
+                std::swap(input,output);
+                continue;
+            }
             C32_LAUNCH(k_spatial32_peer_gather,count,input,windows.data,width,height,shift);
             if(!check(dir+"/spatial","windows",windows.data,count,verify,comparisons)||
                !body.run(w,windows.data,rows,verify,comparisons))return false;

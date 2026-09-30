@@ -105,7 +105,7 @@ int main(int argc, char** argv) {
         for (auto& k : kernels) { ranked.emplace_back(k.second.first, k.first); kernel_sum += k.second.first; }
         std::sort(ranked.rbegin(), ranked.rend());
         printf("per-kernel (one run, %zu launches, %.1f ms incl. unhooked work):\n", marks.size(), kernel_sum);
-        for (size_t i = 0; i < ranked.size() && i < 30; ++i)
+        for (size_t i = 0; i < ranked.size() && i < 80; ++i)
             printf("  %-40s %8.2f ms  %4d launches\n", ranked[i].second.c_str(), ranked[i].first,
                    kernels[ranked[i].second].second);
         double sum = 0;

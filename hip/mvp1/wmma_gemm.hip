@@ -23,14 +23,35 @@ __global__ void k_to_half(const float* in, h16* out, size_t n) {
     if (i < n) out[i] = split512_to_half(in[i]);
 }
 
+// Epilogue of one output (a: the combined total; res: DOUBLE_RES residual).
+template<class P, int EPI>
+__device__ inline void store(float a, float res, size_t at, float* out, float* out2) {
+    if constexpr (EPI == RAW) {
+        out[at] = a;
+    } else if constexpr (EPI == FP8) {
+        out[at] = P::fp8(a);
+        if (out2) out2[at] = a;
+    } else if constexpr (EPI == DOUBLE_RES) {
+        out[at] = P::hd(double(a)+double(res));
+    } else {
+        if (out) out[at] = a;
+        float gate = fminf(4.0f, fmaxf(-4.0f, a));
+        float inner = P::half(fabsf(gate)*(-0.055908203125f)+0.447265625f);
+        float poly = P::half(gate*inner+0.89453125f);
+        out2[at] = P::fp8(P::half(a*poly));
+    }
+}
+
 // Block tile BT tokens x BO outputs, 8 waves, each FM x FN 16x16 fragments.
+// partial != null (one group, parts > 1): blockIdx.z is the K partition; the
+// block writes that partition's total to partial[z][T][O] for k_wmma_combine.
 // Accumulator layout (gfx12): lane l, element e -> row (l/16)*8+e, col l%16.
 template<class P, int EPI, bool RESIDUAL, int BT, int BO, int FM, int FN>
 __global__ __launch_bounds__(256) void k_wmma_gemm(
         const float* __restrict__ X, int ldx, const h16* __restrict__ W, int K,
         const float* __restrict__ R, int ldr, const float* __restrict__ S,
         float* out, float* out2, int ldo, int T, int O,
-        long long gx, long long gw, long long go, int parts) {
+        long long gx, long long gw, long long go, int parts, float* partial) {
     using namespace rocwmma;
     constexpr int WR = BT/16/FM, WC = BO/16/FN;
     static_assert(WR*WC == 8, "8 waves per block");
@@ -40,24 +61,25 @@ __global__ __launch_bounds__(256) void k_wmma_gemm(
     const int lr = lane/16*8, lc = lane%16;
     const int t0 = blockIdx.y*BT, o0 = blockIdx.x*BO;
     const int wt = t0 + (wave/WC)*FM*16, wo = o0 + (wave%WC)*FN*16;
-    X += blockIdx.z*gx; W += blockIdx.z*gw;
-    if (out) out += blockIdx.z*go;
-    if (out2) out2 += blockIdx.z*go;
-    if (RESIDUAL) R += blockIdx.z*go;
-    const int span = K / parts;
+    const int part = partial ? blockIdx.z : 0, group = partial ? 0 : blockIdx.z;
+    X += group*gx; W += group*gw;
+    if (out) out += group*go;
+    if (out2) out2 += group*go;
+    if (RESIDUAL) R += group*go;
+    const int span = K / parts, kbegin = partial ? part*span : 0, kend = partial ? kbegin+span : K;
     float acc[FM][FN][8], total[FM][FN][8], res[FM][FN][8];
     for (int i = 0; i < FM; ++i)
         for (int j = 0; j < FN; ++j)
             for (int e = 0; e < 8; ++e) {
                 int t = wt+i*16+lr+e, o = wo+j*16+lc;
                 acc[i][j][e] = 0.0f; res[i][j][e] = 0.0f; total[i][j][e] = 0.0f;
-                if (RESIDUAL && t < T && o < O) {
+                if (RESIDUAL && part == 0 && t < T && o < O) {
                     float product = R[size_t(t)*ldr+o]*S[o];
                     if (EPI == DOUBLE_RES) res[i][j][e] = P::half(product);
                     else acc[i][j][e] = P::half(product);
                 }
             }
-    for (int k0 = 0; k0 < K; k0 += KS) {
+    for (int k0 = kbegin; k0 < kend; k0 += KS) {
         for (int i = tid; i < BT*KS; i += 256) {
             int row = i / KS, col = i % KS, t = t0+row;
             xs[row*LDS_LD+col] = split512_to_half(t < T ? P::load(X[size_t(t)*ldx+k0+col]) : 0.0f);
@@ -88,7 +110,7 @@ __global__ __launch_bounds__(256) void k_wmma_gemm(
             for (int i = 0; i < FM; ++i)
                 for (int j = 0; j < FN; ++j)
                     for (int e = 0; e < 8; ++e) {
-                        total[i][j][e] = k0+KS == span ? acc[i][j][e] : P::half(total[i][j][e] + acc[i][j][e]);
+                        total[i][j][e] = k0+KS == kbegin+span ? acc[i][j][e] : P::half(total[i][j][e] + acc[i][j][e]);
                         acc[i][j][e] = 0.0f;
                     }
         }
@@ -99,31 +121,34 @@ __global__ __launch_bounds__(256) void k_wmma_gemm(
             for (int e = 0; e < 8; ++e) {
                 int t = wt+i*16+lr+e, o = wo+j*16+lc;
                 if (t >= T || o >= O) continue;
-                size_t at = size_t(t)*ldo+o;
-                float a = EPI == DOUBLE_RES ? acc[i][j][e] : total[i][j][e];
-                if constexpr (EPI == RAW) {
-                    out[at] = a;
-                } else if constexpr (EPI == FP8) {
-                    out[at] = P::fp8(a);
-                    if (out2) out2[at] = a;
-                } else if constexpr (EPI == DOUBLE_RES) {
-                    out[at] = P::hd(double(a)+double(res[i][j][e]));
-                } else {
-                    if (out) out[at] = a;
-                    float gate = fminf(4.0f, fmaxf(-4.0f, a));
-                    float inner = P::half(fabsf(gate)*(-0.055908203125f)+0.447265625f);
-                    float poly = P::half(gate*inner+0.89453125f);
-                    out2[at] = P::fp8(P::half(a*poly));
-                }
+                if (partial) { partial[(size_t(part)*T + t)*O + o] = total[i][j][e]; continue; }
+                store<P,EPI>(EPI == DOUBLE_RES ? acc[i][j][e] : total[i][j][e], res[i][j][e], size_t(t)*ldo+o, out, out2);
             }
+}
+
+// Partition totals in order: total = half(total + part), then the epilogue.
+template<class P, int EPI>
+__global__ void k_wmma_combine(const float* partial, int parts, int T, int O, float* out, float* out2, int ldo) {
+    size_t i = blockIdx.x*(size_t)blockDim.x + threadIdx.x, n = size_t(T)*O;
+    if (i >= n) return;
+    float a = partial[i];
+    for (int p = 1; p < parts; ++p) a = P::half(a + partial[p*n + i]);
+    store<P,EPI>(a, 0.0f, (i/O)*ldo + i%O, out, out2);
 }
 
 // Half copies of weight matrices, keyed by source pointer and size. Weights
 // stay resident for an engine's lifetime; clear() when they are freed.
 struct State {
     std::map<const float*, std::pair<h16*, size_t>> weights;
+    float* partial = nullptr;  // split-K partition totals
+    size_t partial_count = 0;
     ~State() { clear(); }
-    void clear() { for (auto& w : weights) (void)hipFree(w.second.first); weights.clear(); }
+    void clear() {
+        for (auto& w : weights) (void)hipFree(w.second.first);
+        weights.clear();
+        if (partial) (void)hipFree(partial);
+        partial = nullptr; partial_count = 0;
+    }
 };
 inline State& state() { static State s; return s; }
 // RESIDENT_WMMA=0 disables this path; exact_math always does.
@@ -151,13 +176,32 @@ inline bool gemm(hipStream_t stream, const float* X, int ldx, const float* W, in
     // 16-byte weight rows/slices; K whole slices in every partition.
     if (K % 32 || (K/parts) % 32 || gw % 8) return false;
     const h16* hw = half_weights(stream, W, size_t(groups-1)*gw + size_t(O)*K);
+    // Few tiles and a partitioned K (the ViT contract/projection): run the
+    // partitions as separate blocks and combine them in order afterwards.
+    float* partial = nullptr;
+    const int bo = O <= 32 ? 32 : (O <= 64 || O % 128) ? 64 : 128, bt = bo == 128 ? 64 : 128;
+    if (EPI != DOUBLE_RES && groups == 1 && parts > 1 && size_t((O+bo-1)/bo)*((T+bt-1)/bt) < 256) {
+        auto& s = state();
+        size_t need = size_t(parts)*T*O;
+        if (need > s.partial_count) {
+            if (s.partial) HIP_CHECK(hipFree(s.partial));
+            s.partial = nullptr; s.partial_count = 0;
+            HIP_CHECK(hipMalloc(&s.partial, need*sizeof(float)));
+            s.partial_count = need;
+        }
+        partial = s.partial;
+    }
+    const int zdim = partial ? parts : groups;
 #define WMMA_LAUNCH(BT, BO, FM, FN) \
-    hipLaunchKernelGGL((k_wmma_gemm<P,EPI,RESIDUAL,BT,BO,FM,FN>), dim3((O+BO-1)/BO, (T+BT-1)/BT, groups), dim3(256), 0, \
-                       stream, X, ldx, hw, K, R, ldr, S, out, out2, ldo, T, O, gx, gw, go, parts)
+    hipLaunchKernelGGL((k_wmma_gemm<P,EPI,RESIDUAL,BT,BO,FM,FN>), dim3((O+BO-1)/BO, (T+BT-1)/BT, zdim), dim3(256), 0, \
+                       stream, X, ldx, hw, K, R, ldr, S, out, out2, ldo, T, O, gx, gw, go, parts, partial)
     if (O <= 32) WMMA_LAUNCH(128, 32, 1, 2);
     else if (O <= 64 || O % 128) WMMA_LAUNCH(128, 64, 2, 2);
     else WMMA_LAUNCH(64, 128, 2, 2);
 #undef WMMA_LAUNCH
+    if (partial)
+        hipLaunchKernelGGL((k_wmma_combine<P,EPI>), dim3((size_t(T)*O+255)/256), dim3(256), 0, stream,
+                           partial, parts, T, O, out, out2, ldo);
     HIP_CHECK(hipGetLastError());
     return true;
 }
