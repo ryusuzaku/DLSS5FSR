@@ -244,14 +244,14 @@ __global__ void k_c32_half_weights(const float* dw, _Float16* hw, int n) {
 
 // Where a window's tokens live: token-major [window][64][32] (hwc = 0), or
 // scattered in an HWC image through a shifted 8x8 partition (hwc = 1), with
-// the peer channel order when permute is set. Invalid (padding) tokens read
+// the peer channel order when permute is set (either layout). Invalid (padding) tokens read
 // as zero and are not written; windows own disjoint pixels, so input and
 // output may be the same image.
 struct C32Io {
     int in_hwc = 0, out_hwc = 0, permute = 0;
     int width = 0, height = 0, px = 0, py = 0, pw = 0;
     __device__ long long at(bool hwc, int win, int t, int c) const {
-        if (!hwc) return (long long)(size_t(win)*64 + t)*32 + c;
+        if (!hwc) return (long long)(size_t(win)*64 + t)*32 + (permute ? peer_to_native32(c) : c);
         int x = (win % (pw/8))*8 + t%8 - px, y = (win / (pw/8))*8 + t/8 - py;
         if (x < 0 || x >= width || y < 0 || y >= height) return -1;
         return (long long)(size_t(y)*width + x)*32 + (permute ? peer_to_native32(c) : c);

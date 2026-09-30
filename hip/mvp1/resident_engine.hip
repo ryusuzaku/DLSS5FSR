@@ -163,6 +163,13 @@ struct Network {
     std::unique_ptr<c32_resident::Head> head70;
     std::unique_ptr<Buffer> bridge, color, rgb_native, rgb_public;
 
+    // The WMMA half weight cache is keyed by these weights' device pointers;
+    // a later network can reuse the addresses, so drop the copies with them.
+    ~Network() {
+        if (c512_resident::stream) (void)hipStreamSynchronize(c512_resident::stream);
+        wmma_gemm::state().clear();
+    }
+
     // Config: the resident_frame_server arguments after the executable; the
     // width/height lines are ignored, weights come from the listed fixtures.
     Network(const std::vector<std::string>& a, int rgb_w, int rgb_h) :

@@ -62,7 +62,7 @@ struct Weights {
     }
     // Fused body of one launch: WMMA unless c512_resident::exact_math.
     void body(const float* input,int rows,float* raw_out,float* quant_out,const C32Io& io=C32Io()) const {
-        if (c512_resident::exact_math && !io.in_hwc && !io.out_hwc) {
+        if (c512_resident::exact_math && !io.in_hwc && !io.out_hwc && !io.permute) {
             hipLaunchKernelGGL(k_c32_fused,dim3(rows/64),dim3(256),0,c512_resident::stream,
                                input,data.data,scale,raw_out,quant_out);
         } else {
@@ -264,12 +264,18 @@ public:
         if(!check(dir,"main",main.data,n/4,verify,comparisons)||!check(dir,"skip",skip.data,n,verify,comparisons)||
            !check(dir,"color",color.data,nrgb,verify,comparisons))return false;
         C32_LAUNCH(k_head70_merge,n,main.data,skip.data,sm.data,ss.data,merged.data,width,height);
-        C32_LAUNCH(native_to_peer,n,merged.data,peer.data,int(n));
-        if(!check(dir,"merged",merged.data,n,verify,comparisons)||!check(dir,"peer",peer.data,n,verify,comparisons))return false;
-        if(chunked){
-            if(verify||!body.run_into(weights,peer.data,width*height,chunked->data,nullptr))return false;
-        }else if(!body.run(weights,peer.data,width*height,verify,comparisons))return false;
-        C32_LAUNCH(peer_to_native,n,chunked?chunked->data:body.raw(),native.data,int(n));
+        if(!verify&&!c512_resident::exact_math){
+            // The body reads the native merge in peer order and writes native directly.
+            C32Io io;io.permute=1;
+            weights.body(merged.data,width*height,native.data,nullptr,io);
+        }else{
+            C32_LAUNCH(native_to_peer,n,merged.data,peer.data,int(n));
+            if(!check(dir,"merged",merged.data,n,verify,comparisons)||!check(dir,"peer",peer.data,n,verify,comparisons))return false;
+            if(chunked){
+                if(verify||!body.run_into(weights,peer.data,width*height,chunked->data,nullptr))return false;
+            }else if(!body.run(weights,peer.data,width*height,verify,comparisons))return false;
+            C32_LAUNCH(peer_to_native,n,chunked?chunked->data:body.raw(),native.data,int(n));
+        }
         if(coeff_half){
             C32_LAUNCH(k_head70_finish_pair,size_t(width)*height,native.data,coeff.data,color.data,
                        rgb_native.data,rgb_public.data,width,height,.03125f);
