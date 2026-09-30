@@ -19,6 +19,21 @@ __device__ inline _Float16 split512_to_half(float x) {
     return v;
 }
 
+// half(a + b) of the exact sum of two floats without double arithmetic:
+// TwoSum gives the float sum and its exact error, the sum is rounded to odd
+// (nudged one ulp toward the error when inexact), and one rounding to half
+// is then correct because float carries more than two extra bits.
+__device__ inline float split512_half_sum(float a, float b) {
+    float s = a + b;
+    float bv = s - a, av = s - bv;
+    float e = (a - av) + (b - bv);
+    if (e != 0.0f) {
+        unsigned u = __float_as_uint(s);
+        if (!(u & 1u)) s = __uint_as_float((e > 0.0f) == (s > 0.0f) ? u + 1u : u - 1u);
+    }
+    return split512_half(s);
+}
+
 // F(x) in the upstream reference: saturating E4M3FN, ties to even.
 __device__ inline float split512_fp8_sw(float x) {
     float a = fabsf(x);

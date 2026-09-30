@@ -7,6 +7,7 @@
 #include "resident_stream.h"
 #include "tiled_gemm.hip"
 #include "split512_attention_wmma.hip"
+#include "swin_block_wmma.hip"
 #include <memory>
 #include <utility>
 

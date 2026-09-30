@@ -84,8 +84,7 @@ __global__ void k_vit_qkv_normalize(const float* projected,const float* scales,
     float parts[16];
     for(int j=0;j<16;++j) {
         float upper=split512_half(ordered[j+16]*ordered[j+16]);
-        _Float16 fused=(_Float16)(double(ordered[j])*double(ordered[j])+double(upper));
-        parts[j]=(float)fused;
+        parts[j]=split512_half_sum(ordered[j]*ordered[j],upper);  // half-valued ordered: exact
     }
     for(int j=0;j<8;++j)parts[j]=split512_half(parts[2*j]+parts[2*j+1]);
     for(int width=4;width;width/=2)

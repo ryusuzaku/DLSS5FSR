@@ -372,12 +372,12 @@ __global__ __launch_bounds__(256) void k_c32_wmma(const float* __restrict__ in, 
             for (int j = 1; j < 4; ++j) total = c32f_h(total+partial[j]);
             parity[odd] = total;
         }
-        den[tid] = c32f_h(parity[0]+parity[1]);
+        den[tid] = c32f_h(1.f/c32f_h(parity[0]+parity[1]));  // half inverse, once per row
     }
     __syncthreads();
     C32F_MARK(10);
     for (int i = tid; i < 64*64; i += 256) {
-        float p = float(sc[i])*c32f_h(1.f/den[i/64]);
+        float p = float(sc[i])*den[i/64];
         sc[i] = split512_to_half(h70_f(c32f_h(p)));
     }
     __syncthreads();
@@ -399,7 +399,7 @@ __global__ __launch_bounds__(256) void k_c32_wmma(const float* __restrict__ in, 
         for (int e = 0; e < 8; ++e) {
             int r = rt*16+lr+e, col = ct*16+lc;
             float residual = c32f_h(float(fs[r*32+col])*g2[col]);
-            float body = h70_hd(double(c.x[e])+double(residual));
+            float body = split512_half_sum(c.x[e], residual);
             raw_out[base+r*32+col] = body;
             if (quant_out) quant_out[base+r*32+col] = h70_f(body);
         }

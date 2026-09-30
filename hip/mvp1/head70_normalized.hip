@@ -72,15 +72,15 @@ __device__ static float h70_normalize(const float* v,int c) {
     return h70_h(value);
 }
 
-// The same reduction without volatile temporaries (which force scratch memory).
-// Built with -ffp-contract=off and no fast-math, every operation still rounds
-// exactly as written, so the result equals h70_normalize_inverse.
+// The same reduction for half-valued v: v*v is exact in float, and
+// split512_half_sum rounds the exact sum once, as the double form does
+// (exhaustive over all half pairs, build/half_sum_equiv.hip).
 __device__ static float h70_normalize_inverse_fast(const float* v) {
     float partial[16];
 #pragma unroll
     for(int j=0;j<16;j++) {
         float upper=v[j+16]*v[j+16];
-        partial[j]=h70_hd(double(v[j])*double(v[j])+double(h70_h(upper)));
+        partial[j]=split512_half_sum(v[j]*v[j],h70_h(upper));
     }
 #pragma unroll
     for(int j=0;j<8;j++) partial[j]=h70_h(partial[2*j]+partial[2*j+1]);

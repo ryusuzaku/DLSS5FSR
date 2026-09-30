@@ -114,6 +114,12 @@ public:
             int wn=tokens/64;
             size_t count=size_t(tokens)*128, sc=size_t(wn)*4*4096;
             if (!check(w.dir+"/spatial","input",input,n,verify,comparisons)) return false;
+            if (!verify && swin_fused::run<128>(input,output,last_raw?raw->data:nullptr,width,height,w.shift,
+                    {w.w1.data,w.w2.data,w.w3.data,w.skip.data,w.qkv.data,w.scales.data,w.bias.data,
+                     w.projection.data,w.attention_skip.data},middle.data)) {
+                std::swap(input,output);
+                continue;
+            }
             C128_LAUNCH(k_spatial128_gather,count,input,windows.data,width,height,w.shift);
             // Tiled, bit-identical forms of the w1+gate, w2, w3 and QKV kernels.
             tiled::gemm<tiled::Split,tiled::GATE,false>(c512_resident::stream,windows.data,128,w.w1.data,128,

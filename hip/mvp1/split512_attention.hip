@@ -21,15 +21,14 @@ __device__ inline float split512_norm(const float* v, int channel) {
     return split512_half(v[channel]*split512_norm_inverse(v));
 }
 
-// split512_norm_inverse without volatile temporaries (same rounding; see
+// split512_norm_inverse for half-valued v (same rounding; see
 // h70_normalize_inverse_fast).
 __device__ inline float split512_norm_inverse_fast(const float* v) {
     float parts[16];
 #pragma unroll
     for (int j=0;j<16;++j) {
         float upper=split512_half(v[j+16]*v[j+16]);
-        _Float16 fused=(_Float16)(double(v[j])*double(v[j])+double(upper));
-        parts[j]=(float)fused;
+        parts[j]=split512_half_sum(v[j]*v[j],upper);
     }
 #pragma unroll
     for (int j=0;j<8;++j) parts[j]=split512_half(parts[2*j]+parts[2*j+1]);

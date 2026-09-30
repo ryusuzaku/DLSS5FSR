@@ -129,24 +129,28 @@ inline State& state() { static State s; return s; }
 // RESIDENT_WMMA=0 disables this path; exact_math always does.
 inline bool enabled = [] { const char* v = getenv("RESIDENT_WMMA"); return !(v && *v == '0'); }();
 
+// Cached half copy of `count` weights at W (converted once on `stream`).
+inline const h16* half_weights(hipStream_t stream, const float* W, size_t count) {
+    auto& s = state();
+    auto found = s.weights.find(W);
+    if (found == s.weights.end() || found->second.second != count) {
+        h16* packed = nullptr;
+        HIP_CHECK(hipMalloc(&packed, count*sizeof(h16)));
+        hipLaunchKernelGGL(k_to_half, dim3((count+255)/256), dim3(256), 0, stream, W, packed, count);
+        if (found != s.weights.end()) (void)hipFree(found->second.first);
+        s.weights[W] = {packed, count};
+        return packed;
+    }
+    return found->second.first;
+}
+
 template<class P, int EPI, bool RESIDUAL>
 inline bool gemm(hipStream_t stream, const float* X, int ldx, const float* W, int K,
                  const float* R, int ldr, const float* S, float* out, float* out2, int ldo,
                  int T, int O, int groups, long long gx, long long gw, long long go, int parts) {
     // 16-byte weight rows/slices; K whole slices in every partition.
     if (K % 32 || (K/parts) % 32 || gw % 8) return false;
-    auto& s = state();
-    size_t wcount = size_t(groups-1)*gw + size_t(O)*K;
-    auto found = s.weights.find(W);
-    if (found == s.weights.end() || found->second.second != wcount) {
-        h16* packed = nullptr;
-        HIP_CHECK(hipMalloc(&packed, wcount*sizeof(h16)));
-        hipLaunchKernelGGL(k_to_half, dim3((wcount+255)/256), dim3(256), 0, stream, W, packed, wcount);
-        if (found != s.weights.end()) (void)hipFree(found->second.first);
-        s.weights[W] = {packed, wcount};
-        found = s.weights.find(W);
-    }
-    const h16* hw = found->second.first;
+    const h16* hw = half_weights(stream, W, size_t(groups-1)*gw + size_t(O)*K);
 #define WMMA_LAUNCH(BT, BO, FM, FN) \
     hipLaunchKernelGGL((k_wmma_gemm<P,EPI,RESIDUAL,BT,BO,FM,FN>), dim3((O+BO-1)/BO, (T+BT-1)/BT, groups), dim3(256), 0, \
                        stream, X, ldx, hw, K, R, ldr, S, out, out2, ldo, T, O, gx, gw, go, parts)
