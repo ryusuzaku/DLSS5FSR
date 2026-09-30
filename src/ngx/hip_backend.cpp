@@ -94,6 +94,14 @@ struct State {
     HANDLE hIn = nullptr, hOut = nullptr;
     hipExternalMemory_t extIn = nullptr, extOut = nullptr;
     void *ptrIn = nullptr, *ptrOut = nullptr;
+    // Motion staging (RG32F rows) for the resident engine.
+    ComPtr<ID3D12Resource> bufMv;
+    HANDLE hMv = nullptr;
+    hipExternalMemory_t extMv = nullptr;
+    void* ptrMv = nullptr;
+    UINT64 mvPitch = 0, mvBytes = 0;
+    bool motionStaged = false;
+    uint64_t engineMotionFrames = 0;
 
     uint64_t runs = 0;  // successful model launches (for the log)
 
@@ -125,6 +133,7 @@ struct State {
     int (*EngineCreate)(const char*) = nullptr;
     int (*EngineSubmit)(const void*, int, int, int, int) = nullptr;
     int (*EngineSubmitFull)(const void*, int, int, int, int, int) = nullptr;
+    int (*EngineMotion)(const void*, int, int, int) = nullptr;  // optional (re_motion)
     int (*EnginePollFrame)(unsigned char*, unsigned long long, int, int, int, float*) = nullptr;
     bool engineFrameReady = false;
     int (*EnginePoll)(int, unsigned char*, unsigned char*, float*) = nullptr;
@@ -212,7 +221,14 @@ void DropStaging() {
     State& s = S();
     if (s.extIn) s.DestroyExternalMemory(s.extIn);
     if (s.extOut) s.DestroyExternalMemory(s.extOut);
-    s.extIn = s.extOut = nullptr;
+    if (s.extMv) s.DestroyExternalMemory(s.extMv);
+    s.extIn = s.extOut = s.extMv = nullptr;
+    s.ptrMv = nullptr;
+    if (s.hMv) CloseHandle(s.hMv);
+    s.hMv = nullptr;
+    s.bufMv.Reset();
+    s.mvPitch = s.mvBytes = 0;
+    s.motionStaged = false;
     s.ptrIn = s.ptrOut = nullptr;
     if (s.hIn) CloseHandle(s.hIn);
     if (s.hOut) CloseHandle(s.hOut);
@@ -543,6 +559,41 @@ bool EnsureStaging(unsigned int w, unsigned int h, unsigned int bpp) {
         return false;
     }
 
+    // Motion staging: float2 per pixel. Optional -- without it the engine
+    // simply does not carry its map along the motion.
+    {
+        const UINT64 mvRow = (UINT64)w * 8;
+        s.mvPitch = (mvRow + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) /
+                    D3D12_TEXTURE_DATA_PITCH_ALIGNMENT * D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
+        s.mvBytes = s.mvPitch * h;
+        D3D12_RESOURCE_DESC md = bd;
+        md.Width = s.mvBytes;
+        hipExternalMemoryHandleDesc hd{};
+        hipExternalMemoryBufferDesc gd{};
+        bool ok = SUCCEEDED(g.device->CreateCommittedResource(
+                      &hp, D3D12_HEAP_FLAG_SHARED, &md, D3D12_RESOURCE_STATE_COMMON,
+                      nullptr, IID_PPV_ARGS(&s.bufMv))) &&
+                  SUCCEEDED(g.device->CreateSharedHandle(s.bufMv.Get(), nullptr, GENERIC_ALL,
+                                                         nullptr, &s.hMv));
+        if (ok) {
+            hd.type = hipExternalMemoryHandleTypeD3D12Resource;
+            hd.handle.win32.handle = s.hMv;
+            hd.size = s.mvBytes;
+            hd.flags = hipExternalMemoryDedicated;
+            gd.offset = 0;
+            gd.size = s.mvBytes;
+            ok = s.ImportExternalMemory(&s.extMv, &hd) == hipSuccess &&
+                 s.ExternalMemoryGetMappedBuffer(&s.ptrMv, s.extMv, &gd) == hipSuccess && s.ptrMv;
+        }
+        if (!ok) {
+            LOGW("hip: motion staging unavailable; the engine will not follow motion");
+            if (s.extMv) s.DestroyExternalMemory(s.extMv);
+            s.extMv = nullptr; s.ptrMv = nullptr;
+            if (s.hMv) CloseHandle(s.hMv);
+            s.hMv = nullptr; s.bufMv.Reset(); s.mvPitch = s.mvBytes = 0;
+        }
+    }
+
     s.w = w;
     s.h = h;
     s.bpp = bpp;
@@ -773,6 +824,7 @@ static bool EngineReady() {
     s.EngineError = (const char* (*)())GetProcAddress(s.engineDll, "re_last_error");
     s.EngineDestroy = (void (*)())GetProcAddress(s.engineDll, "re_destroy");
     s.EngineSubmitFull = (int (*)(const void*, int, int, int, int, int))GetProcAddress(s.engineDll, "re_submit_full");
+    s.EngineMotion = (int (*)(const void*, int, int, int))GetProcAddress(s.engineDll, "re_motion");
     s.EnginePollFrame = (int (*)(unsigned char*, unsigned long long, int, int, int, float*))
         GetProcAddress(s.engineDll, "re_poll_frame");
     if (cfg.residentEngineFull && (!s.EngineSubmitFull || !s.EnginePollFrame)) {
@@ -816,6 +868,17 @@ bool ResidentEngineSubmit() {
     ++s.engineFrames;
     if (s.engineFrames - s.engineLastSubmit < (uint64_t)cfg.residentEngineInterval &&
         s.engineLastSubmit) return true;
+    if (cfg.residentEngineFull && s.EngineMotion && s.motionStaged && s.ptrMv) {
+        // This frame's motion, staged on the same list as the colour.
+        const int m = s.EngineMotion(s.ptrMv, (int)s.w, (int)s.h, (int)s.mvPitch);
+        if (m < 0) {
+            LOGE("hip: resident engine disabled: %s", s.EngineError());
+            s.engineState = -1;
+            return false;
+        }
+        if (m == 1 && (s.engineMotionFrames++ % 600) == 0)
+            LOGI("hip: resident engine motion %llu at %ux%u", (unsigned long long)s.engineMotionFrames, s.w, s.h);
+    }
     const int r = cfg.residentEngineFull
         ? s.EngineSubmitFull(s.ptrIn, (int)s.w, (int)s.h, (int)s.pitch, (int)s.bpp, cfg.residentEngineGain)
         : s.EngineSubmit(s.ptrIn, (int)s.w, (int)s.h, (int)s.pitch, (int)s.bpp);
@@ -10732,6 +10795,9 @@ UINT64 StagingRowPitch() { return S().pitch; }
 UINT64 StagingBytes() { return S().bytes; }
 ID3D12Resource* StagingIn() { return S().bufIn.Get(); }
 ID3D12Resource* StagingOut() { return S().bufOut.Get(); }
+ID3D12Resource* StagingMotion() { return S().bufMv.Get(); }
+UINT64 StagingMotionRowPitch() { return S().mvPitch; }
+void SetMotionStaged(bool staged) { S().motionStaged = staged; }
 bool Usable() { return S().usable; }
 bool SelfTest() { return SelfTestImpl(); }
 bool ChainTest() { return ChainTestImpl(); }
@@ -10785,6 +10851,9 @@ UINT64 HipStagingRowPitch() { return hipb::StagingRowPitch(); }
 UINT64 HipStagingBytes() { return hipb::StagingBytes(); }
 ID3D12Resource* HipStagingIn() { return hipb::StagingIn(); }
 ID3D12Resource* HipStagingOut() { return hipb::StagingOut(); }
+ID3D12Resource* HipStagingMotion() { return hipb::StagingMotion(); }
+UINT64 HipStagingMotionRowPitch() { return hipb::StagingMotionRowPitch(); }
+void HipSetMotionStaged(bool staged) { hipb::SetMotionStaged(staged); }
 bool HipUsable() { return hipb::Usable(); }
 
 }  // namespace ngx

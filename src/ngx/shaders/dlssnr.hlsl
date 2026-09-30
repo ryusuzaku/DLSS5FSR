@@ -29,7 +29,7 @@
 
 cbuffer Params : register(b0)
 {
-    uint  gMode;             // 0 encode, 1 resolve, 2 downsample
+    uint  gMode;             // 0 encode, 1 resolve, 2 downsample, 3 motion
     float gWhitePoint;
     uint  gWidth;
     uint  gHeight;
@@ -151,6 +151,21 @@ void main(uint3 id : SV_DispatchThreadID)
     if (gMode == 2)
     {
         gTarget[id.xy] = gSource.SampleLevel(gLinear, uv, 0);
+        return;
+    }
+
+    // Motion for the resident engine: the game's vector under this pixel
+    // (nearest, so no vector is blended across an edge), times NGX's MV scale
+    // (-> guide pixels), then guide pixels -> this dispatch's pixels. The
+    // NGX convention is previous = current + vector.
+    if (gMode == 3)
+    {
+        int2 texel = int2(uv * float2(gGuideWidth, gGuideHeight));
+        texel = min(texel, int2(gGuideWidth, gGuideHeight) - 1);
+        float2 mv = gSource.Load(int3(texel, 0)).xy * float2(gMvScaleX, gMvScaleY);
+        mv *= float2(gWidth, gHeight) / float2(gGuideWidth, gGuideHeight);
+        if (any(isnan(mv)) || any(isinf(mv))) mv = float2(0.0, 0.0);
+        gTarget[id.xy] = float4(mv, 0.0, 0.0);
         return;
     }
 

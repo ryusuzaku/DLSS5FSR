@@ -227,7 +227,24 @@ NVSDK_NGX_Result DoEvaluateD3D12(ID3D12GraphicsCommandList* cl,
     // frame: the model is shown the finished picture, not the one the game
     // rendered. Failure here must not fail the evaluate -- a plain resample is
     // a correct, if soft, frame.
-    if (c.nrPasses && !GpuNeuralChain(cl, output, outRect, c)) {
+    // The game's motion vectors, for the resident engine's temporal carry.
+    // Low-resolution vectors cover the render subrect; display-resolution
+    // ones (texture as wide as the output) cover the output.
+    MotionInput motion;
+    if (mv) {
+        motion.res = mv;
+        params->TryGetF(NVSDK_NGX_Parameter_MV_Scale_X, motion.scaleX);
+        params->TryGetF(NVSDK_NGX_Parameter_MV_Scale_Y, motion.scaleY);
+        const D3D12_RESOURCE_DESC md = mv->GetDesc();
+        const bool display = md.Width >= (UINT64)outRect.w;
+        motion.guideW = display ? outRect.w : colorRect.w;
+        motion.guideH = display ? outRect.h : colorRect.h;
+        if (n == 0 || (n % 3000) == 0)
+            LOGI("evaluate #%llu motion: %llux%u scale %.3f,%.3f guide %ux%u (%s resolution)", n,
+                 (unsigned long long)md.Width, md.Height, motion.scaleX, motion.scaleY,
+                 motion.guideW, motion.guideH, display ? "display" : "render");
+    }
+    if (c.nrPasses && !GpuNeuralChain(cl, output, outRect, c, mv ? &motion : nullptr)) {
         LOGW("evaluate: colour passes did not run, leaving the resample");
     }
 

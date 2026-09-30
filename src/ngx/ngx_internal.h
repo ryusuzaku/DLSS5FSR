@@ -330,6 +330,16 @@ enum DlssNrMode : unsigned int {
     NR_MODE_ENCODE = 0,
     NR_MODE_RESOLVE = 1,
     NR_MODE_DOWNSAMPLE = 2,
+    NR_MODE_MOTION = 3,  // the game's motion vectors -> float2 prev-minus-cur in dispatch pixels
+};
+
+// The game's motion vectors for the resident engine's temporal carry:
+// the texture, NGX's MV scale (units -> guide pixels) and the guide region
+// (the texture area covering the frame: render or display resolution).
+struct MotionInput {
+    ID3D12Resource* res = nullptr;
+    float scaleX = 1.0f, scaleY = 1.0f;
+    unsigned int guideW = 0, guideH = 0;
 };
 
 // The CPU mirror of cbuffer Params in shaders/dlssnr.hlsl.
@@ -496,7 +506,8 @@ bool GpuNrDispatch(ID3D12GraphicsCommandList* cl, const DlssNrConstants& c,
 // pipeline runs and changes nothing. When the backend is live, the proxy is
 // additionally staged into the shared input buffer for the next evaluate.
 bool GpuNeuralChain(ID3D12GraphicsCommandList* cl, ID3D12Resource* output,
-                    SubRect outRect, const Config& cfg);
+                    SubRect outRect, const Config& cfg,
+                    const MotionInput* motion = nullptr);
 
 // ------------------------------------------------------------- HIP backend --
 
@@ -558,6 +569,11 @@ UINT64 HipStagingRowPitch();
 UINT64 HipStagingBytes();
 ID3D12Resource* HipStagingIn();
 ID3D12Resource* HipStagingOut();
+// Motion staging (float2 per frame pixel) next to the colour staging; the
+// shim sets it staged when this frame's motion pass was recorded.
+ID3D12Resource* HipStagingMotion();
+UINT64 HipStagingMotionRowPitch();
+void HipSetMotionStaged(bool staged);
 bool HipUsable();
 
 // The one-frame-late choreography, driven from DoEvaluateD3D12:

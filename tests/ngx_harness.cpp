@@ -641,7 +641,8 @@ struct PassResult {
 static PassResult RunPass(Ngx& ngx, D3D& d, const std::string& iniDir,
                           const IniValues& v, ID3D12Resource* color,
                           ID3D12Resource* output, UINT SRC_W, UINT SRC_H,
-                          UINT DST_W, UINT DST_H, int frames) {
+                          UINT DST_W, UINT DST_H, int frames,
+                          ID3D12Resource* motion = nullptr) {
     PassResult pr;
     if (!WriteIni(iniDir, v)) return pr;
 
@@ -678,6 +679,7 @@ static PassResult RunPass(Ngx& ngx, D3D& d, const std::string& iniDir,
     ngx.AllocateParameters(&evalParams);
     evalParams->Set(NVSDK_NGX_Parameter_Color, color);
     evalParams->Set(NVSDK_NGX_Parameter_Output, output);
+    if (motion) evalParams->Set(NVSDK_NGX_Parameter_MotionVectors, motion);
     evalParams->Set(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width,
                     SRC_W);
     evalParams->Set(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height,
@@ -1489,8 +1491,13 @@ int main(int argc, char** argv) {
         engine.residentEngineFull = engineFull ? 1 : 0;
         engine.residentEngineGain = engineFull ? 1 : 0;  // public gain: a visible change
         engine.harnessFrameSleepMs = engineFull ? 40 : 25;
+        // Zero motion vectors (committed resources start zeroed): the full
+        // engine takes them through re_motion.
+        ComPtr<ID3D12Resource> mv = MakeTexture(d.device.Get(), SRC_W, SRC_H, DXGI_FORMAT_R16G16_FLOAT,
+                                                D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                                                D3D12_RESOURCE_STATE_RENDER_TARGET);  // as a game leaves it
         PassResult ep = RunPass(ngx, d, iniDir, engine, color.Get(), output.Get(),
-                                SRC_W, SRC_H, DST_W, DST_H, engineFull ? 150 : 120);
+                                SRC_W, SRC_H, DST_W, DST_H, engineFull ? 150 : 120, mv.Get());
         Check(ep.evalFailures == 0, "resident engine frames evaluate");
         if (resolve) {
             Check(MaxChannelDiff(p1.rb, ep.rb) > 2,
@@ -1539,6 +1546,9 @@ int main(int argc, char** argv) {
                                              "hip: resident engine preview 1 (") != std::string::npos,
                       engineFull ? "resident engine published a full frame" :
                                    "resident engine published a preview");
+                if (engineFull)
+                    Check(text.find("hip: resident engine motion 1 at ") != std::string::npos,
+                          "resident engine received motion vectors");
                 Check(text.find("resident engine disabled") == std::string::npos &&
                           text.find("resident engine setup failed") == std::string::npos,
                       "resident engine reported no failure");

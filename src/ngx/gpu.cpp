@@ -594,7 +594,8 @@ bool GpuNrDispatch(ID3D12GraphicsCommandList* cl, const DlssNrConstants& c,
 }
 
 bool GpuNeuralChain(ID3D12GraphicsCommandList* cl, ID3D12Resource* output,
-                    SubRect outRect, const Config& cfg) {
+                    SubRect outRect, const Config& cfg,
+                    const MotionInput* motion) {
     GpuContext& g = Gpu();
     if (!g.valid || !cl || !output) return false;
 
@@ -678,6 +679,49 @@ bool GpuNeuralChain(ID3D12GraphicsCommandList* cl, ID3D12Resource* output,
             cl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
         }
     }
+
+    // ---- stage the game's motion for the resident engine ----------------
+    // The motion pass writes prev-minus-cur in frame pixels (float2) at the
+    // staging size; the copy goes on this list next to the colour, so the
+    // next evaluate's counter check covers both.
+    bool motionStaged = false;
+    if (staged && motion && motion->res && motion->guideW && motion->guideH &&
+        !cfg.residentEngineConfig.empty() && HipStagingMotion()) {
+        PooledTexture* mvTex = GpuAcquireTexture(L"motion", DXGI_FORMAT_R32G32_FLOAT, outRect.w, outRect.h);
+        if (mvTex && SupportsTypedUav(g.device.Get(), DXGI_FORMAT_R32G32_FLOAT)) {
+            const D3D12_RESOURCE_STATES mvIn = GpuGuessIncomingState(motion->res);
+            GpuTransition(cl, motion->res, mvIn, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            GpuSetState(cl, *mvTex, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            DlssNrConstants mc = c;
+            mc.Mode = NR_MODE_MOTION;
+            mc.MvScaleX = motion->scaleX;
+            mc.MvScaleY = motion->scaleY;
+            mc.GuideWidth = motion->guideW;
+            mc.GuideHeight = motion->guideH;
+            const bool ok = GpuNrDispatch(cl, mc, motion->res, nullptr, nullptr, nullptr, nullptr,
+                                          mvTex->res.Get(), nullptr);
+            GpuTransition(cl, motion->res, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, mvIn);
+            if (ok) {
+                GpuSetState(cl, *mvTex, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                D3D12_TEXTURE_COPY_LOCATION mdst{};
+                mdst.pResource = HipStagingMotion();
+                mdst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                mdst.PlacedFootprint.Offset = 0;
+                mdst.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R32G32_FLOAT;
+                mdst.PlacedFootprint.Footprint.Width = outRect.w;
+                mdst.PlacedFootprint.Footprint.Height = outRect.h;
+                mdst.PlacedFootprint.Footprint.Depth = 1;
+                mdst.PlacedFootprint.Footprint.RowPitch = (UINT)HipStagingMotionRowPitch();
+                D3D12_TEXTURE_COPY_LOCATION msrc{};
+                msrc.pResource = mvTex->res.Get();
+                msrc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                msrc.SubresourceIndex = 0;
+                cl->CopyTextureRegion(&mdst, 0, 0, 0, &msrc, nullptr);
+                motionStaged = true;
+            }
+        }
+    }
+    HipSetMotionStaged(motionStaged);
 
     // ---- the model ------------------------------------------------------
     // Identity, for now: the proxy is both the model's input and its answer.
