@@ -1475,7 +1475,13 @@ int main(int argc, char** argv) {
     if (engineRun) {
         printf("\n-- pass 11: in-process resident engine --\n");
         IniValues engine;
-        engine.debugView = 2;
+        // DLSS5_RESIDENT_ENGINE_RESOLVE=1: the engine frame is the model
+        // texture of the normal resolve (luminance transfer, headroom kept)
+        // instead of the opaque DebugView=2 display.
+        const char* resolveEnv = getenv("DLSS5_RESIDENT_ENGINE_RESOLVE");
+        const bool resolve = resolveEnv && *resolveEnv == '1';
+        engine.debugView = resolve ? 0 : 2;
+        if (resolve) { engine.transferStrength = 1.0f; engine.colourStrength = 0.0f; }
         engine.residentEngineDll = engineDll;
         engine.residentEngineConfig = engineConfig;
         const char* fullEnv = getenv("DLSS5_RESIDENT_ENGINE_FULL");
@@ -1486,12 +1492,17 @@ int main(int argc, char** argv) {
         PassResult ep = RunPass(ngx, d, iniDir, engine, color.Get(), output.Get(),
                                 SRC_W, SRC_H, DST_W, DST_H, engineFull ? 150 : 120);
         Check(ep.evalFailures == 0, "resident engine frames evaluate");
-        Check(MaxChannelDiff(p1.rb, ep.rb) > 20,
-              "resident engine preview visibly changes the model texture");
-        bool opaque = ep.rb.pixels.size() == (size_t)DST_W * DST_H * 4;
-        for (size_t k = 0; opaque && k < (size_t)DST_W * DST_H; ++k)
-            opaque = ep.rb.pixels[k * 4 + 3] == 255;
-        Check(opaque, "resident engine preview stays opaque");
+        if (resolve) {
+            Check(MaxChannelDiff(p1.rb, ep.rb) > 2,
+                  "resident engine changes the resolved frame");
+        } else {
+            Check(MaxChannelDiff(p1.rb, ep.rb) > 20,
+                  "resident engine preview visibly changes the model texture");
+            bool opaque = ep.rb.pixels.size() == (size_t)DST_W * DST_H * 4;
+            for (size_t k = 0; opaque && k < (size_t)DST_W * DST_H; ++k)
+                opaque = ep.rb.pixels[k * 4 + 3] == 255;
+            Check(opaque, "resident engine preview stays opaque");
+        }
     }
 
     printf("\n-- shim log --\n");

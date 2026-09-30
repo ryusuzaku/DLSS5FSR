@@ -228,10 +228,10 @@ void ConfigLoad(const std::wstring& dir) {
     if (c.residentEngineInterval < 1) c.residentEngineInterval = 1;
     if (c.residentEngineGain != 0 && c.residentEngineGain != 1) c.residentEngineGain = 0;
     if (!c.residentEngineConfig.empty())
-        LOGI("config: resident engine %ls with %ls (gain=%s interval=%d %s; DebugView=2 required)",
+        LOGI("config: resident engine %ls with %ls (gain=%s interval=%d %s; DebugView=%d)",
              c.residentEngineDll.c_str(), c.residentEngineConfig.c_str(),
              c.residentEngineGain ? "public" : "native", c.residentEngineInterval,
-             c.residentEngineFull ? "full frame" : "256 centre crop");
+             c.residentEngineFull ? "full frame" : "256 centre crop", c.debugView);
     if (!c.candidateInputGpuPath.empty())
         LOGI("config: same-frame candidate GPU input tensor at %ls (requires capture path)",
              c.candidateInputGpuPath.c_str());

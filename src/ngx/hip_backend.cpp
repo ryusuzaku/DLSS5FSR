@@ -809,7 +809,9 @@ static bool EngineReady() {
 bool ResidentEngineSubmit() {
     State& s = S();
     const Config& cfg = Cfg();
-    if (cfg.residentEngineConfig.empty() || cfg.debugView != 2) return true;
+    // Any debug view: DebugView=2 shows the engine frame alone, the resolve
+    // (DebugView=0) composes it with the game's frame and restores headroom.
+    if (cfg.residentEngineConfig.empty()) return true;
     if (!s.usable || !s.ptrIn || !EngineReady()) return false;
     ++s.engineFrames;
     if (s.engineFrames - s.engineLastSubmit < (uint64_t)cfg.residentEngineInterval &&
@@ -856,7 +858,9 @@ bool CandidatePreview() {
     State& s = S();
     const Config& cfg = Cfg();
     if (cfg.candidatePreviewPath.empty() && cfg.residentEngineConfig.empty()) return true;
-    if (cfg.debugView != 2) {
+    // The fixed offline preview is a display image (DebugView=2 only); the
+    // engine's frame is the model texture for whichever view is selected.
+    if (cfg.residentEngineConfig.empty() && cfg.debugView != 2) {
         static bool warned = false;
         if (!warned) {
             warned = true;
