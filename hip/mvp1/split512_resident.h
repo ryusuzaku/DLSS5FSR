@@ -125,7 +125,7 @@ public:
             // This is a readback assertion only. No later input fixture is uploaded.
             if (!check(w.dir, "input", input, n, verify)) return false;
             // Few tokens keep the one-thread-per-output kernels; larger extents tile.
-            const bool small = tokens <= 64;
+            const bool small = tokens <= 64 && c512_resident::exact_math;  // the fast GEMMs split K instead
             if (small) {
                 C512_LAUNCH(k_split512_pre, n, input, w.matrix.data, pre.data, tokens);
             } else {

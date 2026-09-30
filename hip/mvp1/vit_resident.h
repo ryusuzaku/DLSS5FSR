@@ -66,9 +66,9 @@ public:
         for (const auto& owned : weights) {
             const auto& w = *owned;
             if (!check(w.dir, "input", input, n, verify)) return false;
-            // Few tokens keep the one-thread-per-output kernels (more parallel);
+            // Few tokens keep the one-thread-per-output kernels in exact mode (more parallel);
             // larger counts use the tiled, bit-identical forms (4-/2-part partitions).
-            const bool small = tokens <= 64;
+            const bool small = tokens <= 64 && c512_resident::exact_math;  // the fast GEMMs split K instead
             if (small) {
                 VIT_LAUNCH(k_vit_expand, 4*n, input, w.expand.data, expanded.data, hidden.data, tokens);
                 VIT_LAUNCH(k_vit_residual_projection, n, hidden.data, input, w.contract.data,

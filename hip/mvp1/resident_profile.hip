@@ -33,7 +33,7 @@ int main(int argc, char** argv) {
         const unsigned char* src = reinterpret_cast<const unsigned char*>(raw.data);
         std::vector<std::pair<const char*, std::function<bool()>>> stages = {
             {"input", [&]{ hipLaunchKernelGGL(k_candidate_input_full, dim3((W*H+255)/256), dim3(256), 0, stream,
-                                              src, net.color->data, fw, fh, pitch, bpp, W, H); return true; }},
+                                              src, net.color->data, fw, fh, pitch, bpp, W, H, fw, fh); return true; }},
             {"front C32 (stem, block0-4, down4)", [&]{ return net.front->run_from_device({net.color->data,net.color->count}); }},
             {"encoder5-8 C64", [&]{ return net.encoder8->run_from_device(net.front->c64_view()); }},
             {"down8", [&]{ return net.down8->run_from_device(net.encoder8->raw_view()); }},

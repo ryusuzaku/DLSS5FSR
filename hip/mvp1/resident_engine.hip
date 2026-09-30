@@ -35,15 +35,27 @@
 
 using namespace c512_resident;
 
-// Full-frame candidate input: the staged proxy at 1:1, edge-replicated into
-// the padded network extent, then the same sRGB decode as the 256 crop.
+// Full-frame candidate input: the staged proxy resampled to sw x sh content
+// (1:1 when that is the frame size; bilinear in sRGB otherwise, like the 256
+// crop), edge-replicated into the padded network extent, then sRGB decoded.
 __global__ void k_candidate_input_full(const unsigned char* src, float* output, int frame_w, int frame_h,
-                                       int pitch, int bpp, int width, int height) {
+                                       int pitch, int bpp, int width, int height, int sw, int sh) {
     const int pixel = (int)(blockIdx.x*blockDim.x + threadIdx.x);
     if (pixel >= width*height) return;
-    const int x = min(pixel % width, frame_w-1), y = min(pixel / width, frame_h-1);
+    const int x = min(pixel % width, sw-1), y = min(pixel / width, sh-1);
     for (int c = 0; c < 3; ++c) {
-        float srgb = candidate_proxy_channel(src, pitch, bpp, x, y, c);
+        float srgb;
+        if (sw == frame_w && sh == frame_h) {
+            srgb = candidate_proxy_channel(src, pitch, bpp, x, y, c);
+        } else {
+            float fx = fminf(fmaxf((x+0.5f)*frame_w/sw - 0.5f, 0.0f), float(frame_w-1));
+            float fy = fminf(fmaxf((y+0.5f)*frame_h/sh - 0.5f, 0.0f), float(frame_h-1));
+            int x0 = int(fx), y0 = int(fy), x1 = min(x0+1, frame_w-1), y1 = min(y0+1, frame_h-1);
+            float tx = fx - x0, ty = fy - y0;
+            float a = candidate_proxy_channel(src, pitch, bpp, x0, y0, c), b = candidate_proxy_channel(src, pitch, bpp, x1, y0, c);
+            float d = candidate_proxy_channel(src, pitch, bpp, x0, y1, c), e = candidate_proxy_channel(src, pitch, bpp, x1, y1, c);
+            srgb = (a*(1.0f-tx) + b*tx)*(1.0f-ty) + (d*(1.0f-tx) + e*tx)*ty;
+        }
         srgb = fminf(fmaxf(srgb, 0.0f), 1.0f);
         output[pixel*3+c] = srgb <= 0.04045f ? srgb/12.92f : powf((srgb+0.055f)/1.055f, 2.4f);
     }
@@ -112,8 +124,11 @@ unsigned char srgb8(float linear) { return (unsigned char)nearbyintf(srgb_encode
 //   motion=0|1     luma mode: carry the ratio map along the game's motion
 //                  vectors (re_motion) to the newest frame (default 1)
 //   motion_sign=-1 flips the vectors (games that store cur - prev)
+//   scale=S        luma mode: run the network on an S x downscale of the frame
+//                  (0.25..1) and upsample its ratio map (about S^2 the work)
 struct OutputOptions {
     int luma = 0, denoise = 0, motion = 1, motion_sign = 1;
+    float scale = 1.0f;
     float limit = 0.0f, smooth = 0.0f, sigma = 0.02f, strength = 1.0f, gate = 0.03f;
     int gain = -1;
 };
@@ -137,31 +152,56 @@ __device__ inline float srgb_encode_device(float v) {
 // Luma mode, after a network run: per frame pixel (ratio, Y_in) from the
 // network's linear output and its linearized input, optionally smoothed
 // against the previous map (gated by the input luminance change).
-__global__ void k_ratio_map(const float* linear, const float* color, const float2* previous, int previous_valid,
-                            OutputOptions o, float2* map, int frame_w, int frame_h, int W) {
+// The network's luminance ratio at network pixel (x, y) of sw x sh content
+// (row stride W); with denoise the ratio of edge-weighted neighbourhood sums.
+__device__ inline float net_ratio(const float* linear, const float* color, int x, int y, int sw, int sh, int W,
+                                  int denoise) {
+    auto lum = [&](const float* v, bool clamp) {
+        return clamp ? .2126f*fmaxf(v[0], 0.0f) + .7152f*fmaxf(v[1], 0.0f) + .0722f*fmaxf(v[2], 0.0f)
+                     : .2126f*v[0] + .7152f*v[1] + .0722f*v[2];
+    };
+    const float yin = lum(color + (size_t(y)*W + x)*3, false);
+    float sum_in = 0.0f, sum_out = 0.0f;
+    for (int dy = -denoise; dy <= denoise; ++dy)
+        for (int dx = -denoise; dx <= denoise; ++dx) {
+            int nx = min(max(x+dx, 0), sw-1), ny = min(max(y+dy, 0), sh-1);
+            float yi = lum(color + (size_t(ny)*W + nx)*3, false);
+            float yo = lum(linear + (size_t(ny)*W + nx)*3, true);
+            float d = (yi - yin) / (yin + 0.02f);
+            float wgt = denoise ? expf(-d*d*50.0f) : 1.0f;  // relative luminance difference, sigma 0.1
+            sum_in += wgt*yi; sum_out += wgt*yo;
+        }
+    return (sum_out + 1e-4f) / (sum_in + 1e-4f);
+}
+
+// Luma mode, after a network run: per frame pixel (ratio, Y_in). The ratio
+// comes from the network at its own resolution (sw x sh content, bilinear
+// up to the frame when scaled); Y_in is the frame's own linearized
+// luminance, the reference the compose gate compares the current frame to.
+// Optionally smoothed against the previous map (gated by Y_in's change).
+__global__ void k_ratio_map(const float* linear, const float* color, const unsigned char* src, int pitch, int bpp,
+                            const float2* previous, int previous_valid, OutputOptions o, float2* map,
+                            int frame_w, int frame_h, int sw, int sh, int W) {
     int i = blockIdx.x*blockDim.x + threadIdx.x;
     if (i >= frame_w*frame_h) return;
     int x = i % frame_w, y = i / frame_w;
-    const float* p = linear + (size_t(y)*W + x)*3;
-    const float* q = color + (size_t(y)*W + x)*3;
-    float yin = .2126f*q[0] + .7152f*q[1] + .0722f*q[2];
-    float yout = .2126f*fmaxf(p[0], 0.0f) + .7152f*fmaxf(p[1], 0.0f) + .0722f*fmaxf(p[2], 0.0f);
-    if (o.denoise > 0) {
-        float sum_in = 0.0f, sum_out = 0.0f;
-        for (int dy = -o.denoise; dy <= o.denoise; ++dy)
-            for (int dx = -o.denoise; dx <= o.denoise; ++dx) {
-                int nx = min(max(x+dx, 0), frame_w-1), ny = min(max(y+dy, 0), frame_h-1);
-                const float* pn = linear + (size_t(ny)*W + nx)*3;
-                const float* qn = color + (size_t(ny)*W + nx)*3;
-                float yi = .2126f*qn[0] + .7152f*qn[1] + .0722f*qn[2];
-                float yo = .2126f*fmaxf(pn[0], 0.0f) + .7152f*fmaxf(pn[1], 0.0f) + .0722f*fmaxf(pn[2], 0.0f);
-                float d = (yi - yin) / (yin + 0.02f);
-                float wgt = expf(-d*d*50.0f);  // relative luminance difference, sigma 0.1
-                sum_in += wgt*yi; sum_out += wgt*yo;
-            }
-        yout = (sum_out + 1e-4f) / (sum_in + 1e-4f) * (yin + 1e-4f) - 1e-4f;  // local gain at the centre
+    float raw[3];
+    const unsigned char* px = src + size_t(y)*pitch + size_t(x)*bpp;
+    for (int c = 0; c < 3; ++c) raw[c] = srgb_decode_device(frame_channel(px, bpp, c));
+    float yin = .2126f*raw[0] + .7152f*raw[1] + .0722f*raw[2];
+    float r;
+    if (sw == frame_w && sh == frame_h) {
+        r = net_ratio(linear, color, x, y, sw, sh, W, o.denoise);
+    } else {
+        float fx = fminf(fmaxf((x+0.5f)*sw/frame_w - 0.5f, 0.0f), float(sw-1));
+        float fy = fminf(fmaxf((y+0.5f)*sh/frame_h - 0.5f, 0.0f), float(sh-1));
+        int x0 = int(fx), y0 = int(fy), x1 = min(x0+1, sw-1), y1 = min(y0+1, sh-1);
+        float tx = fx - x0, ty = fy - y0;
+        float a = net_ratio(linear, color, x0, y0, sw, sh, W, o.denoise), b = net_ratio(linear, color, x1, y0, sw, sh, W, o.denoise);
+        float c = net_ratio(linear, color, x0, y1, sw, sh, W, o.denoise), d = net_ratio(linear, color, x1, y1, sw, sh, W, o.denoise);
+        r = (a*(1.0f-tx) + b*tx)*(1.0f-ty) + (c*(1.0f-tx) + d*tx)*ty;
     }
-    float ratio = 1.0f + o.strength*((yout + 1e-4f) / (yin + 1e-4f) - 1.0f);
+    float ratio = 1.0f + o.strength*(r - 1.0f);
     if (o.limit > 0.0f) ratio = fminf(1.0f + o.limit, fmaxf(1.0f - o.limit, ratio));
     if (previous && previous_valid && o.smooth > 0.0f) {
         float2 h = previous[i];
@@ -357,14 +397,17 @@ struct Network {
         rgb_public.reset(new Buffer(size_t(W)*H*3));
     }
 
-    void run(const unsigned char* src, int fw, int fh, int pitch, int bpp, bool crop, hipStream_t stream) {
+    // sw x sh: the network content (the frame, or its downscale); 0 = the frame.
+    void run(const unsigned char* src, int fw, int fh, int pitch, int bpp, bool crop, hipStream_t stream,
+             int sw = 0, int sh = 0) {
+        if (sw <= 0 || sh <= 0) { sw = fw; sh = fh; }
         if (crop) {
             if (W != 256 || H != 256) throw std::runtime_error("crop mode needs the 256x256 network");
             hipLaunchKernelGGL(k_candidate_input_256, dim3(256), dim3(256), 0, stream,
                                src, color->data, fw, fh, pitch, bpp);
         } else {
             hipLaunchKernelGGL(k_candidate_input_full, dim3((W*H+255)/256), dim3(256), 0, stream,
-                               src, color->data, fw, fh, pitch, bpp, W, H);
+                               src, color->data, fw, fh, pitch, bpp, W, H, sw, sh);
         }
         HIP_CHECK(hipGetLastError());
         bool ok = front->run_from_device({color->data,color->count}) &&
@@ -470,11 +513,13 @@ struct Engine {
             else if (key == "gate") options.gate = std::stof(value);
             else if (key == "denoise") options.denoise = std::stoi(value);
             else if (key == "motion" && (value == "0" || value == "1")) options.motion = value == "1";
+            else if (key == "scale") options.scale = std::stof(value);
             else if (key == "motion_sign" && (value == "1" || value == "-1")) options.motion_sign = std::stoi(value);
             else throw std::runtime_error("unknown engine option: " + line);
         }
         if (options.sigma <= 0.0f || options.gate <= 0.0f || options.smooth < 0.0f || options.smooth > 1.0f ||
-            options.limit < 0.0f || options.strength < 0.0f || options.denoise < 0 || options.denoise > 4)
+            options.limit < 0.0f || options.strength < 0.0f || options.denoise < 0 || options.denoise > 4 ||
+            options.scale < 0.25f || options.scale > 1.0f || (options.scale < 1.0f && !options.luma))
             throw std::runtime_error("engine options out of range");
         // The caller's thread may carry a stale HIP error from its own work;
         // setup checks hipGetLastError() after its first launches.
@@ -606,14 +651,20 @@ struct Engine {
 
     void run() {
         int W = 256, H = 256;
-        if (!job_crop) network_extent(frame_w, frame_h, W, H);
+        // Luma mode may run the network on a downscale of the frame (scale).
+        int sw = frame_w, sh = frame_h;
+        if (!job_crop && options.luma && options.scale < 1.0f) {
+            sw = std::max(64, int(frame_w*options.scale + 0.5f));
+            sh = std::max(64, int(frame_h*options.scale + 0.5f));
+        }
+        if (!job_crop) network_extent(sw, sh, W, H);
         if (!net || net->W != W || net->H != H) {
             net.reset();
             net.reset(new Network(config, W, H));
         }
         HIP_CHECK(hipEventRecord(start, stream));
         net->run(reinterpret_cast<const unsigned char*>(raw_input->data), frame_w, frame_h, frame_pitch,
-                 frame_bpp, job_crop, stream);
+                 frame_bpp, job_crop, stream, sw, sh);
         HIP_CHECK(hipEventRecord(stop, stream));
         size_t count = size_t(W)*H*3;
         std::vector<float> native, pub, rgb;
@@ -644,9 +695,10 @@ struct Engine {
                     if (!m || m->count < size_t(frame_w)*frame_h*2) m.reset(new Buffer(size_t(frame_w)*frame_h*2));
                 hipLaunchKernelGGL(k_ratio_map, dim3((frame_w*frame_h+255)/256), dim3(256), 0, stream,
                                    linear, net->color->data,
+                                   reinterpret_cast<const unsigned char*>(raw_input->data), frame_pitch, frame_bpp,
                                    previous_valid ? reinterpret_cast<const float2*>(maps[published]->data) : nullptr,
                                    int(previous_valid), options, reinterpret_cast<float2*>(maps[next]->data),
-                                   frame_w, frame_h, W);
+                                   frame_w, frame_h, sw, sh, W);
                 HIP_CHECK(hipGetLastError());
                 HIP_CHECK(hipStreamSynchronize(stream));
                 float elapsed = 0.0f;
