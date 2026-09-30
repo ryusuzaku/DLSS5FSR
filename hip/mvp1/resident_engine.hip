@@ -105,8 +105,12 @@ unsigned char srgb8(float linear) { return (unsigned char)nearbyintf(srgb_encode
 //                  exp(-|dY| / G) (moved content keeps the game's pixels)
 // In luma mode values at or above 1.0 (HDR, which the network only sees
 // clipped) pass through, and the ratio fades out as a channel nears 1.0.
+//   denoise=R      luma mode: the ratio of neighbourhood sums over a
+//                  (2R+1)^2 window, each neighbour weighted by how close its
+//                  input luminance is to the centre's (edge-aware; removes
+//                  the per-pixel grain of the ratio, keeps edges)
 struct OutputOptions {
-    int luma = 0;
+    int luma = 0, denoise = 0;
     float limit = 0.0f, smooth = 0.0f, sigma = 0.02f, strength = 1.0f, gate = 0.03f;
     int gain = -1;
 };
@@ -139,6 +143,21 @@ __global__ void k_ratio_map(const float* linear, const float* color, const float
     const float* q = color + (size_t(y)*W + x)*3;
     float yin = .2126f*q[0] + .7152f*q[1] + .0722f*q[2];
     float yout = .2126f*fmaxf(p[0], 0.0f) + .7152f*fmaxf(p[1], 0.0f) + .0722f*fmaxf(p[2], 0.0f);
+    if (o.denoise > 0) {
+        float sum_in = 0.0f, sum_out = 0.0f;
+        for (int dy = -o.denoise; dy <= o.denoise; ++dy)
+            for (int dx = -o.denoise; dx <= o.denoise; ++dx) {
+                int nx = min(max(x+dx, 0), frame_w-1), ny = min(max(y+dy, 0), frame_h-1);
+                const float* pn = linear + (size_t(ny)*W + nx)*3;
+                const float* qn = color + (size_t(ny)*W + nx)*3;
+                float yi = .2126f*qn[0] + .7152f*qn[1] + .0722f*qn[2];
+                float yo = .2126f*fmaxf(pn[0], 0.0f) + .7152f*fmaxf(pn[1], 0.0f) + .0722f*fmaxf(pn[2], 0.0f);
+                float d = (yi - yin) / (yin + 0.02f);
+                float wgt = expf(-d*d*50.0f);  // relative luminance difference, sigma 0.1
+                sum_in += wgt*yi; sum_out += wgt*yo;
+            }
+        yout = (sum_out + 1e-4f) / (sum_in + 1e-4f) * (yin + 1e-4f) - 1e-4f;  // local gain at the centre
+    }
     float ratio = 1.0f + o.strength*((yout + 1e-4f) / (yin + 1e-4f) - 1.0f);
     if (o.limit > 0.0f) ratio = fminf(1.0f + o.limit, fmaxf(1.0f - o.limit, ratio));
     if (previous && previous_valid && o.smooth > 0.0f) {
@@ -399,10 +418,11 @@ struct Engine {
             else if (key == "gain" && (value == "0" || value == "1")) options.gain = value == "1";
             else if (key == "strength") options.strength = std::stof(value);
             else if (key == "gate") options.gate = std::stof(value);
+            else if (key == "denoise") options.denoise = std::stoi(value);
             else throw std::runtime_error("unknown engine option: " + line);
         }
         if (options.sigma <= 0.0f || options.gate <= 0.0f || options.smooth < 0.0f || options.smooth > 1.0f ||
-            options.limit < 0.0f || options.strength < 0.0f)
+            options.limit < 0.0f || options.strength < 0.0f || options.denoise < 0 || options.denoise > 4)
             throw std::runtime_error("engine options out of range");
         // The caller's thread may carry a stale HIP error from its own work;
         // setup checks hipGetLastError() after its first launches.
