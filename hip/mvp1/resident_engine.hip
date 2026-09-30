@@ -87,6 +87,29 @@ float srgb_encode(float linear) {
 // numpy-equivalent sRGB encoding of the head's linear RGB (clip, sRGB, rint).
 unsigned char srgb8(float linear) { return (unsigned char)nearbyintf(srgb_encode(linear)*255.0f); }
 
+// Full mode: the frame's sRGB bytes (RGBA8, or RGBA16F when bpp is 8) from
+// the network's linear RGB (row stride W pixels), on the GPU. powf may
+// differ from the host's by an ulp, which can move a rare 8-bit rounding.
+__global__ void k_encode_frame(const float* linear, unsigned char* out, int frame_w, int frame_h, int W, int bpp) {
+    int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= frame_w*frame_h) return;
+    int x = i % frame_w, y = i / frame_w;
+    const float* p = linear + (size_t(y)*W + x)*3;
+    for (int c = 0; c < 4; ++c) {
+        float s = 1.0f;
+        if (c < 3) {
+            float v = fminf(fmaxf(p[c], 0.0f), 1.0f);
+            s = v <= 0.0031308f ? 12.92f*v : 1.055f*powf(v, 1.0f/2.4f) - 0.055f;
+        }
+        if (bpp == 4) {
+            out[size_t(i)*4+c] = c < 3 ? (unsigned char)nearbyintf(s*255.0f) : 255;
+        } else {
+            _Float16 h = (_Float16)s;
+            __builtin_memcpy(out + size_t(i)*8 + c*2, &h, 2);
+        }
+    }
+}
+
 // Head -> ViT logical token/channel map (tools/audit_native_vit_logical_map.py).
 std::vector<int32_t> vit_gather_map(int tokens) {
     std::vector<int32_t> map(size_t(tokens)*1024);
@@ -235,6 +258,10 @@ struct Engine {
     int job_gain = 0;
     int frame_w = 0, frame_h = 0, frame_pitch = 0, frame_bpp = 0;
     std::vector<float> host_native, host_public, host_color;
+    bool host_valid = false;                        // full mode fetches the floats on demand
+    std::unique_ptr<Buffer> encoded;                // full mode: device frame bytes
+    unsigned char* pinned = nullptr;                // full mode: host readback of the frame bytes
+    size_t pinned_bytes = 0;
     int result_w = 0, result_h = 0;                 // network extent of the latest result
     std::vector<unsigned char> frame_out;           // full mode: frame_w x frame_h x bpp
     int out_w = 0, out_h = 0, out_bpp = 0;
@@ -244,6 +271,9 @@ struct Engine {
 
     explicit Engine(const std::vector<std::string>& lines) : config(lines) {
         if (config.size() != 24) throw std::runtime_error("engine config needs 24 lines");
+        // The caller's thread may carry a stale HIP error from its own work;
+        // setup checks hipGetLastError() after its first launches.
+        (void)hipGetLastError();
         HIP_CHECK(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking));
         c512_resident::stream = stream;
         // Load weights and validate the configuration up front at 256x256.
@@ -263,7 +293,9 @@ struct Engine {
         if (stream) (void)hipStreamSynchronize(stream);
         if (start) (void)hipEventDestroy(start);
         if (stop) (void)hipEventDestroy(stop);
-        net.reset(); raw_input.reset();
+        if (pinned) (void)hipHostFree(pinned);
+        net.reset(); raw_input.reset(); encoded.reset();
+        wmma_gemm::state().clear();  // half weight copies are keyed by the freed pointers
         c512_resident::stream = nullptr;
         if (stream) (void)hipStreamDestroy(stream);
     }
@@ -324,35 +356,37 @@ struct Engine {
                  frame_bpp, job_crop, stream);
         HIP_CHECK(hipEventRecord(stop, stream));
         size_t count = size_t(W)*H*3;
-        std::vector<float> native(count), pub(count), rgb(count);
-        HIP_CHECK(hipMemcpyAsync(native.data(), net->rgb_native->data, count*sizeof(float), hipMemcpyDeviceToHost, stream));
-        HIP_CHECK(hipMemcpyAsync(pub.data(), net->rgb_public->data, count*sizeof(float), hipMemcpyDeviceToHost, stream));
-        HIP_CHECK(hipMemcpyAsync(rgb.data(), net->color->data, count*sizeof(float), hipMemcpyDeviceToHost, stream));
-        HIP_CHECK(hipStreamSynchronize(stream));
+        std::vector<float> native, pub, rgb;
+        std::vector<unsigned char> frame;
+        if (job_crop) {
+            native.resize(count); pub.resize(count); rgb.resize(count);
+            HIP_CHECK(hipMemcpyAsync(native.data(), net->rgb_native->data, count*sizeof(float), hipMemcpyDeviceToHost, stream));
+            HIP_CHECK(hipMemcpyAsync(pub.data(), net->rgb_public->data, count*sizeof(float), hipMemcpyDeviceToHost, stream));
+            HIP_CHECK(hipMemcpyAsync(rgb.data(), net->color->data, count*sizeof(float), hipMemcpyDeviceToHost, stream));
+            HIP_CHECK(hipStreamSynchronize(stream));
+        } else {
+            // Encode on the GPU and read back only the frame bytes (pinned).
+            size_t bytes = size_t(frame_w)*frame_h*frame_bpp;
+            if (!encoded || encoded->count*sizeof(float) < bytes) encoded.reset(new Buffer((bytes+3)/4));
+            if (pinned_bytes < bytes) {
+                if (pinned) HIP_CHECK(hipHostFree(pinned));
+                pinned = nullptr; pinned_bytes = 0;
+                HIP_CHECK(hipHostMalloc(reinterpret_cast<void**>(&pinned), bytes));
+                pinned_bytes = bytes;
+            }
+            auto* out = reinterpret_cast<unsigned char*>(encoded->data);
+            hipLaunchKernelGGL(k_encode_frame, dim3((frame_w*frame_h+255)/256), dim3(256), 0, stream,
+                               job_gain ? net->rgb_public->data : net->rgb_native->data, out, frame_w, frame_h, W, frame_bpp);
+            HIP_CHECK(hipGetLastError());
+            HIP_CHECK(hipMemcpyAsync(pinned, out, bytes, hipMemcpyDeviceToHost, stream));
+            HIP_CHECK(hipStreamSynchronize(stream));
+            frame.assign(pinned, pinned + bytes);
+        }
         float elapsed = 0.0f;
         HIP_CHECK(hipEventElapsedTime(&elapsed, start, stop));
-        std::vector<unsigned char> frame;
-        if (!job_crop) {
-            // Encode on the worker so the render thread only copies rows.
-            const auto& source = job_gain ? pub : native;
-            frame.resize(size_t(frame_w)*frame_h*frame_bpp);
-            for (int y = 0; y < frame_h; ++y)
-                for (int x = 0; x < frame_w; ++x) {
-                    unsigned char* dst = frame.data() + (size_t(y)*frame_w + x)*frame_bpp;
-                    const float* p = source.data() + (size_t(y)*W + x)*3;
-                    for (int c = 0; c < 4; ++c) {
-                        float s = c < 3 ? srgb_encode(p[c]) : 1.0f;
-                        if (frame_bpp == 4) {
-                            dst[c] = c < 3 ? (unsigned char)nearbyintf(s*255.0f) : 255;
-                        } else {
-                            _Float16 h = (_Float16)s;
-                            memcpy(dst + c*2, &h, 2);
-                        }
-                    }
-                }
-        }
         std::lock_guard<std::mutex> lock(mutex);
         host_native.swap(native); host_public.swap(pub); host_color.swap(rgb);
+        host_valid = job_crop;
         result_w = W; result_h = H;
         if (job_crop) {
             fresh_crop = true;
@@ -468,6 +502,21 @@ __declspec(dllexport) int re_latest_rgb(int gain, float* rgb, float* color) {
     if (!g_engine) return -1;
     std::lock_guard<std::mutex> inner(g_engine->mutex);
     if (!g_engine->completed) return 0;
+    if (!g_engine->host_valid) {
+        // Full mode keeps the floats on the device; the idle worker cannot
+        // start another run while the engine mutex is held.
+        if (g_engine->busy || g_engine->pending) return 0;
+        auto& e = *g_engine;
+        size_t count = size_t(e.result_w)*e.result_h*3;
+        e.host_native.resize(count); e.host_public.resize(count); e.host_color.resize(count);
+        try {
+            HIP_CHECK(hipMemcpyAsync(e.host_native.data(), e.net->rgb_native->data, count*sizeof(float), hipMemcpyDeviceToHost, e.stream));
+            HIP_CHECK(hipMemcpyAsync(e.host_public.data(), e.net->rgb_public->data, count*sizeof(float), hipMemcpyDeviceToHost, e.stream));
+            HIP_CHECK(hipMemcpyAsync(e.host_color.data(), e.net->color->data, count*sizeof(float), hipMemcpyDeviceToHost, e.stream));
+            HIP_CHECK(hipStreamSynchronize(e.stream));
+        } catch (const std::exception&) { return -1; }
+        e.host_valid = true;
+    }
     const auto& source = gain ? g_engine->host_public : g_engine->host_native;
     if (rgb) memcpy(rgb, source.data(), source.size()*sizeof(float));
     if (color) memcpy(color, g_engine->host_color.data(), g_engine->host_color.size()*sizeof(float));
