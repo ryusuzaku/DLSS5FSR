@@ -240,8 +240,8 @@ NVSDK_NGX_Result DoEvaluateD3D12(ID3D12GraphicsCommandList* cl,
         motion.guideW = display ? outRect.w : colorRect.w;
         motion.guideH = display ? outRect.h : colorRect.h;
         if (n == 0 || (n % 3000) == 0)
-            LOGI("evaluate #%llu motion: %llux%u scale %.3f,%.3f guide %ux%u (%s resolution)", n,
-                 (unsigned long long)md.Width, md.Height, motion.scaleX, motion.scaleY,
+            LOGI("evaluate #%llu motion: %llux%u format %u scale %.3f,%.3f guide %ux%u (%s resolution)", n,
+                 (unsigned long long)md.Width, md.Height, (unsigned)md.Format, motion.scaleX, motion.scaleY,
                  motion.guideW, motion.guideH, display ? "display" : "render");
     }
     if (c.nrPasses && !GpuNeuralChain(cl, output, outRect, c, mv ? &motion : nullptr)) {

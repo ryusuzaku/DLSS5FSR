@@ -890,7 +890,7 @@ bool ResidentEngineSubmit() {
                     sumX += fabsf(row[i]);
                 }
             }
-            LOGI("hip: resident engine motion %llu at %ux%u (middle row: max |x| %.3f max |y| %.3f mean |x| %.3f px)",
+            LOGI("hip: resident engine motion %llu at %ux%u (middle row: max |x| %.4g max |y| %.4g mean |x| %.4g px)",
                  (unsigned long long)s.engineMotionFrames, s.w, s.h, maxX, maxY, sumX / (float)s.w);
         }
     }

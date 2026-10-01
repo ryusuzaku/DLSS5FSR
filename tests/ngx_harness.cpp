@@ -299,6 +299,44 @@ static bool UploadPixels(D3D& d, ID3D12Resource* tex, const unsigned char* rgba,
     return true;
 }
 
+// A constant motion field (half x, half y per pixel) into a two-channel
+// texture, left in RENDER_TARGET as a game's motion pass leaves it.
+static bool UploadMotion(D3D& d, ID3D12Resource* tex, unsigned short hx, unsigned short hy, UINT w, UINT h) {
+    UINT64 pitch = ((UINT64)w * 4 + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) /
+                   D3D12_TEXTURE_DATA_PITCH_ALIGNMENT * D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
+    CD3DX12_HEAP_PROPERTIES up(D3D12_HEAP_TYPE_UPLOAD);
+    D3D12_RESOURCE_DESC bd = CD3DX12_RESOURCE_DESC::Buffer(pitch * h);
+    ComPtr<ID3D12Resource> staging;
+    if (FAILED(d.device->CreateCommittedResource(&up, D3D12_HEAP_FLAG_NONE, &bd,
+                                                 D3D12_RESOURCE_STATE_GENERIC_READ,
+                                                 nullptr, IID_PPV_ARGS(&staging))))
+        return false;
+    void* p = nullptr;
+    staging->Map(0, nullptr, &p);
+    for (UINT y = 0; y < h; ++y)
+        for (UINT x = 0; x < w; ++x) {
+            unsigned short* px = (unsigned short*)((unsigned char*)p + y * pitch) + x * 2;
+            px[0] = hx; px[1] = hy;
+        }
+    staging->Unmap(0, nullptr);
+    Transition(d.list.Get(), tex, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST);
+    D3D12_TEXTURE_COPY_LOCATION dst{};
+    dst.pResource = tex;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    D3D12_TEXTURE_COPY_LOCATION src{};
+    src.pResource = staging.Get();
+    src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    src.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R16G16_FLOAT;
+    src.PlacedFootprint.Footprint.Width = w;
+    src.PlacedFootprint.Footprint.Height = h;
+    src.PlacedFootprint.Footprint.Depth = 1;
+    src.PlacedFootprint.Footprint.RowPitch = (UINT)pitch;
+    d.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    Transition(d.list.Get(), tex, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    D3DSubmit(d);
+    return true;
+}
+
 // S223c: the same upload for an R16G16B16A16_FLOAT texture (8 bytes a pixel),
 // used by the HDR dump pass below.
 static bool UploadHalfPixels(D3D& d, ID3D12Resource* tex,
@@ -1491,11 +1529,13 @@ int main(int argc, char** argv) {
         engine.residentEngineFull = engineFull ? 1 : 0;
         engine.residentEngineGain = engineFull ? 1 : 0;  // public gain: a visible change
         engine.harnessFrameSleepMs = engineFull ? 40 : 25;
-        // Zero motion vectors (committed resources start zeroed): the full
-        // engine takes them through re_motion.
-        ComPtr<ID3D12Resource> mv = MakeTexture(d.device.Get(), SRC_W, SRC_H, DXGI_FORMAT_R16G16_FLOAT,
+        // A constant motion field of (2.5, -1.0) render pixels in a typeless
+        // two-channel texture (as games create them); the full engine takes
+        // it through re_motion and the log samples it in frame pixels.
+        ComPtr<ID3D12Resource> mv = MakeTexture(d.device.Get(), SRC_W, SRC_H, DXGI_FORMAT_R16G16_TYPELESS,
                                                 D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
                                                 D3D12_RESOURCE_STATE_RENDER_TARGET);  // as a game leaves it
+        if (mv) UploadMotion(d, mv.Get(), 0x4100 /* 2.5 */, 0xBC00 /* -1.0 */, SRC_W, SRC_H);
         PassResult ep = RunPass(ngx, d, iniDir, engine, color.Get(), output.Get(),
                                 SRC_W, SRC_H, DST_W, DST_H, engineFull ? 150 : 120, mv.Get());
         Check(ep.evalFailures == 0, "resident engine frames evaluate");
@@ -1547,9 +1587,14 @@ int main(int argc, char** argv) {
                                  : text.find("hip: resident engine preview 1 (") != std::string::npos,
                       engineFull ? "resident engine published a full frame" :
                                    "resident engine published a preview");
-                if (engineFull)
+                if (engineFull) {
                     Check(text.find("hip: resident engine motion 1 at ") != std::string::npos,
                           "resident engine received motion vectors");
+                    // 2.5 render px x (DST_W/SRC_W), 1.0 x (DST_H/SRC_H) in frame pixels.
+                    char want[96];
+                    snprintf(want, sizeof(want), "max |x| %.4g max |y| %.4g", 2.5 * DST_W / SRC_W, 1.0 * DST_H / SRC_H);
+                    Check(text.find(want) != std::string::npos, "motion vectors arrive in frame pixels");
+                }
                 Check(text.find("resident engine disabled") == std::string::npos &&
                           text.find("resident engine setup failed") == std::string::npos,
                       "resident engine reported no failure");
