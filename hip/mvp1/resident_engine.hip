@@ -121,13 +121,16 @@ unsigned char srgb8(float linear) { return (unsigned char)nearbyintf(srgb_encode
 //                  (2R+1)^2 window, each neighbour weighted by how close its
 //                  input luminance is to the centre's (edge-aware; removes
 //                  the per-pixel grain of the ratio, keeps edges)
-//   motion=0|1     luma mode: carry the ratio map along the game's motion
-//                  vectors (re_motion) to the newest frame (default 1)
+//   motion=auto|1|0 luma mode: carry the ratio map along the game's motion
+//                  vectors (re_motion) to the newest frame. auto (default)
+//                  detects the units (frame pixels or UV) and sign from how
+//                  well each predicts the frame from the previous one; 1
+//                  takes frame pixels with motion_sign; 0 disables.
 //   motion_sign=-1 flips the vectors (games that store cur - prev)
 //   scale=S        luma mode: run the network on an S x downscale of the frame
 //                  (0.25..1) and upsample its ratio map (about S^2 the work)
 struct OutputOptions {
-    int luma = 0, denoise = 0, motion = 1, motion_sign = 1;
+    int luma = 0, denoise = 0, motion = 2, motion_sign = 1;  // motion 2 = auto
     float scale = 1.0f;
     float limit = 0.0f, smooth = 0.0f, sigma = 0.02f, strength = 1.0f, gate = 0.03f;
     int gain = -1;
@@ -223,11 +226,13 @@ __global__ void k_negate(float* v, int n) {
     if (i < n) v[i] = -v[i];
 }
 
-__global__ void k_warp_map(const float2* src, const float2* motion, float2* dst, int w, int h) {
+__global__ void k_warp_map(const float2* src, const float2* motion, float2* dst, int w, int h,
+                           float mx, float my) {
     int i = blockIdx.x*blockDim.x + threadIdx.x;
     if (i >= w*h) return;
     int x = i % w, y = i / w;
     float2 mv = motion[i];
+    mv.x *= mx; mv.y *= my;
     float sx = x + mv.x, sy = y + mv.y;
     if (!(sx >= 0.0f && sy >= 0.0f && sx <= w-1 && sy <= h-1)) { dst[i] = make_float2(1.0f, -1.0f); return; }
     int x0 = min(int(sx), w-2 < 0 ? 0 : w-2), y0 = min(int(sy), h-2 < 0 ? 0 : h-2);
@@ -239,6 +244,35 @@ __global__ void k_warp_map(const float2* src, const float2* motion, float2* dst,
     float2 top = make_float2(a.x + (b.x-a.x)*fx, a.y + (b.y-a.y)*fx);
     float2 bottom = make_float2(c.x + (d.x-c.x)*fx, c.y + (d.y-c.y)*fx);
     dst[i] = make_float2(top.x + (bottom.x-top.x)*fy, top.y + (bottom.y-top.y)*fy);
+}
+
+// Motion convention vote: on a sparse grid, how well the previous frame
+// predicts the current one at x + m*mv for the hypotheses m = (+1,+1),
+// (-1,-1) (vectors in frame pixels), (+w,+h), (-w,-h) (vectors in UV), and
+// with no motion (index 4): luminance differences in sums[0..4], the samples
+// each hypothesis could score (inside the frame) in sums[5..9].
+__global__ void k_motion_vote(const unsigned char* cur, const unsigned char* prev, int pitch, int bpp,
+                              const float2* motion, int w, int h, float* sums) {
+    const int step = 6;
+    int gx = blockIdx.x*blockDim.x + threadIdx.x, gw = (w + step - 1)/step, gh = (h + step - 1)/step;
+    if (gx >= gw*gh) return;
+    int x = (gx % gw)*step, y = (gx / gw)*step;
+    auto lum = [&](const unsigned char* f, int px, int py) {
+        const unsigned char* p = f + size_t(py)*pitch + size_t(px)*bpp;
+        return .2126f*frame_channel(p, bpp, 0) + .7152f*frame_channel(p, bpp, 1) + .0722f*frame_channel(p, bpp, 2);
+    };
+    float2 mv = motion[size_t(y)*w + x];
+    if (!(fabsf(mv.x) + fabsf(mv.y) > 0.0f) || !isfinite(mv.x) || !isfinite(mv.y)) return;
+    const float yc = lum(cur, x, y);
+    const float ms[4][2] = {{1.0f, 1.0f}, {-1.0f, -1.0f}, {float(w), float(h)}, {-float(w), -float(h)}};
+    for (int k = 0; k < 4; ++k) {
+        int sx = int(floorf(x + mv.x*ms[k][0] + 0.5f)), sy = int(floorf(y + mv.y*ms[k][1] + 0.5f));
+        if (sx < 0 || sy < 0 || sx >= w || sy >= h) continue;
+        atomicAdd(&sums[k], fabsf(yc - lum(prev, sx, sy)));
+        atomicAdd(&sums[5+k], 1.0f);
+    }
+    atomicAdd(&sums[4], fabsf(yc - lum(prev, x, y)));
+    atomicAdd(&sums[9], 1.0f);
 }
 
 // Luma mode, every frame: the current frame with the latest ratio map.
@@ -486,6 +520,13 @@ struct Engine {
     long long warped_frame = -1;
     int warped_source = -1;            // which published generation it came from
     int published_generation = 0;
+    // motion=auto: the previous submitted frame, vote sums and the decision.
+    std::unique_ptr<Buffer> previous_frame;
+    bool previous_valid = false;
+    float* vote = nullptr;               // device: 5 error sums, 5 sample counts
+    int vote_frames = 0;
+    float motion_mx = 0.0f, motion_my = 0.0f;  // chosen scale (0 = not decided yet)
+    int motion_choice = -1;
     unsigned char* compose_pinned = nullptr;        // luma mode: host readback of the composed frame
     size_t compose_pinned_bytes = 0;
     unsigned char* pinned = nullptr;                // full mode: host readback of the frame bytes
@@ -512,7 +553,8 @@ struct Engine {
             else if (key == "strength") options.strength = std::stof(value);
             else if (key == "gate") options.gate = std::stof(value);
             else if (key == "denoise") options.denoise = std::stoi(value);
-            else if (key == "motion" && (value == "0" || value == "1")) options.motion = value == "1";
+            else if (key == "motion" && (value == "0" || value == "1" || value == "auto"))
+                options.motion = value == "auto" ? 2 : value == "1";
             else if (key == "scale") options.scale = std::stof(value);
             else if (key == "motion_sign" && (value == "1" || value == "-1")) options.motion_sign = std::stoi(value);
             else throw std::runtime_error("unknown engine option: " + line);
@@ -552,7 +594,8 @@ struct Engine {
         if (compose_pinned) (void)hipHostFree(compose_pinned);
         if (compose_stream) (void)hipStreamSynchronize(compose_stream);
         net.reset(); raw_input.reset(); encoded.reset(); maps[0].reset(); maps[1].reset();
-        current.reset(); composed.reset(); warped[0].reset(); warped[1].reset();
+        current.reset(); composed.reset(); warped[0].reset(); warped[1].reset(); previous_frame.reset();
+        if (vote) (void)hipFree(vote);
         for (auto& r : ring) r.reset();
         wmma_gemm::state().clear();  // half weight copies are keyed by the freed pointers
         c512_resident::stream = nullptr;
@@ -578,7 +621,7 @@ struct Engine {
             HIP_CHECK(hipMemcpy2DAsync(ring[slot]->data, size_t(w)*8, mv, pitch, size_t(w)*8, h,
                                        hipMemcpyDeviceToDevice, compose_stream));
             ring_frame[slot] = frame_counter;
-            if (options.motion_sign < 0) {
+            if (options.motion == 1 && options.motion_sign < 0) {
                 // Games that store prev - cur: flip on the device.
                 hipLaunchKernelGGL(k_negate, dim3((w*h*2+255)/256), dim3(256), 0, compose_stream, ring[slot]->data, w*h*2);
             }
@@ -603,7 +646,47 @@ struct Engine {
                     composed.reset(new Buffer((bytes+3)/4));
                     current_bytes = current->count*sizeof(float);
                 }
+                if (options.motion == 2) {
+                    if (!previous_frame || previous_frame->count < current->count) {
+                        previous_frame.reset(new Buffer(current->count));
+                        previous_valid = false;
+                    }
+                    if (cur_w == w && cur_h == h && cur_bpp == bpp && cur_pitch == pitch) {
+                        HIP_CHECK(hipMemcpyAsync(previous_frame->data, current->data, bytes, hipMemcpyDeviceToDevice, compose_stream));
+                        previous_valid = true;
+                    } else {
+                        previous_valid = false;
+                    }
+                }
                 HIP_CHECK(hipMemcpyAsync(current->data, staging, bytes, hipMemcpyDeviceToDevice, compose_stream));
+                // This frame's motion (re_motion came first) against the previous frame.
+                const int slot = int(frame_counter % kRing);
+                if (options.motion == 2 && previous_valid && mv_w == w && mv_h == h && ring_frame[slot] == frame_counter) {
+                    if (!vote) { HIP_CHECK(hipMalloc(&vote, 10*sizeof(float))); HIP_CHECK(hipMemsetAsync(vote, 0, 10*sizeof(float), compose_stream)); }
+                    const int samples = ((w+5)/6)*((h+5)/6);
+                    hipLaunchKernelGGL(k_motion_vote, dim3((samples+255)/256), dim3(256), 0, compose_stream,
+                                       reinterpret_cast<const unsigned char*>(current->data),
+                                       reinterpret_cast<const unsigned char*>(previous_frame->data), pitch, bpp,
+                                       reinterpret_cast<const float2*>(ring[slot]->data), w, h, vote);
+                    if (++vote_frames >= 30) {
+                        float sums[10];
+                        HIP_CHECK(hipMemcpyAsync(sums, vote, sizeof(sums), hipMemcpyDeviceToHost, compose_stream));
+                        HIP_CHECK(hipStreamSynchronize(compose_stream));
+                        HIP_CHECK(hipMemsetAsync(vote, 0, 10*sizeof(float), compose_stream));
+                        vote_frames = 0;
+                        // Mean error per hypothesis that scored at least half the samples.
+                        int best = -1;
+                        float mean[5];
+                        for (int k = 0; k < 5; ++k) mean[k] = sums[5+k] > 0.0f ? sums[k]/sums[5+k] : 1e30f;
+                        for (int k = 0; k < 4; ++k)
+                            if (sums[5+k] >= 0.5f*sums[9] && (best < 0 || mean[k] < mean[best])) best = k;
+                        // Only with real motion in the window and a clear win over no motion.
+                        if (best >= 0 && sums[9] > 100.0f && sums[4] > 1.0f && mean[best] < 0.85f*mean[4]) {
+                            const float ms[4][2] = {{1.0f, 1.0f}, {-1.0f, -1.0f}, {float(w), float(h)}, {-float(w), -float(h)}};
+                            motion_choice = best; motion_mx = ms[best][0]; motion_my = ms[best][1];
+                        }
+                    }
+                }
                 HIP_CHECK(hipStreamSynchronize(compose_stream));
             } catch (const std::exception& e) {
                 failed = true; error = e.what(); return -1;
@@ -766,7 +849,8 @@ struct Engine {
             dst_pitch < size_t(w)*bpp || out_pitch < size_t(w)*bpp) return 0;
         try {
             const float2* map = reinterpret_cast<const float2*>(maps[published]->data);
-            if (options.motion && mv_w == w && mv_h == h && map_frame[published] >= 0) {
+            const float mx = options.motion == 2 ? motion_mx : 1.0f, my = options.motion == 2 ? motion_my : 1.0f;
+            if (options.motion && (mx != 0.0f || my != 0.0f) && mv_w == w && mv_h == h && map_frame[published] >= 0) {
                 // Carry the map from its own frame (a new result) or from
                 // the last carried frame to the newest submitted frame.
                 const long long target = frame_counter - 1;
@@ -786,7 +870,7 @@ struct Engine {
                     int next = src == reinterpret_cast<const float2*>(warped[0]->data) ? 1 : 0;
                     hipLaunchKernelGGL(k_warp_map, dim3((w*h+255)/256), dim3(256), 0, compose_stream,
                                        src, reinterpret_cast<const float2*>(ring[slot]->data),
-                                       reinterpret_cast<float2*>(warped[next]->data), w, h);
+                                       reinterpret_cast<float2*>(warped[next]->data), w, h, mx, my);
                     src = reinterpret_cast<const float2*>(warped[next]->data);
                     warped_cur = next;
                 }
@@ -931,6 +1015,15 @@ __declspec(dllexport) int re_compose_device(void* dst, unsigned long long pitch,
     std::lock_guard<std::mutex> lock(g_mutex);
     if (!g_engine) return -1;
     return g_engine->compose_device(dst, size_t(pitch), width, height, bpp, device_ms);
+}
+
+// motion=auto: the detected convention, -1 not yet, 0 frame pixels, 1 frame
+// pixels negated, 2 UV, 3 UV negated.
+__declspec(dllexport) int re_motion_mode() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!g_engine) return -1;
+    std::lock_guard<std::mutex> inner(g_engine->mutex);
+    return g_engine->motion_choice;
 }
 
 __declspec(dllexport) int re_poll_frame(unsigned char* dst, unsigned long long pitch, int width, int height,

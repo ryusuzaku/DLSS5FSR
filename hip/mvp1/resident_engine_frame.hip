@@ -1,11 +1,12 @@
 // Runs one capture through the engine DLL as the shim does (submit every
 // frame, poll every frame) and writes the returned frame, so any output
 // mode (transfer=full or luma) can be inspected offline.
-// Usage: resident_engine_frame engine.dll config.txt capture.bin out.bin [pan frames]
+// Usage: resident_engine_frame engine.dll config.txt capture.bin out.bin [pan frames [px|uv sign]]
 //   pan/frames: simulate a horizontal camera pan of `pan` pixels per frame
 //   for `frames` frames (frame f shows the capture shifted by f*pan, edge
 //   clamped) with the matching motion vectors through re_motion; the
-//   output is the last frame's result.
+//   output is the last frame's result. px|uv and sign (1 or -1) choose how
+//   the vectors are reported (default px 1), to exercise motion=auto.
 // out.bin: 12-byte header (width, height, bpp as uint32) + tightly packed rows.
 #include <hip/hip_runtime.h>
 #include <windows.h>
@@ -25,11 +26,13 @@ typedef const char* (*ErrorFn)();
 typedef void (*DestroyFn)();
 
 int main(int argc, char** argv) {
-    if (argc != 5 && argc != 7) {
-        fputs("usage: resident_engine_frame engine.dll config.txt capture.bin out.bin [pan frames]\n", stderr);
+    if (argc != 5 && argc != 7 && argc != 9) {
+        fputs("usage: resident_engine_frame engine.dll config.txt capture.bin out.bin [pan frames [px|uv sign]]\n", stderr);
         return 2;
     }
-    const int pan = argc == 7 ? atoi(argv[5]) : 0, frames = argc == 7 ? atoi(argv[6]) : 1;
+    const int pan = argc >= 7 ? atoi(argv[5]) : 0, frames = argc >= 7 ? atoi(argv[6]) : 1;
+    const bool uv = argc == 9 && strcmp(argv[7], "uv") == 0;
+    const float sign = argc == 9 ? float(atoi(argv[8])) : 1.0f;
     HMODULE dll = LoadLibraryA(argv[1]);
     if (!dll) return 1;
     auto create = (CreateFn)GetProcAddress(dll, "re_create");
@@ -52,10 +55,11 @@ int main(int argc, char** argv) {
     memcpy(hdr, capture.data()+8, sizeof(hdr));
     int w = int(hdr[0]), h = int(hdr[1]), bpp = int(hdr[2]), pitch = int(hdr[3]);
     const unsigned char* pixels = capture.data()+36;
-    void *staging = nullptr, *mv = nullptr;
-    if (hipMalloc(&staging, size_t(pitch)*h) != hipSuccess || hipMalloc(&mv, size_t(w)*h*8) != hipSuccess) return 1;
+    void *staging = nullptr, *mv = nullptr, *still = nullptr;
+    if (hipMalloc(&staging, size_t(pitch)*h) != hipSuccess || hipMalloc(&mv, size_t(w)*h*8) != hipSuccess ||
+        hipMalloc(&still, size_t(w)*h*8) != hipSuccess || hipMemset(still, 0, size_t(w)*h*8) != hipSuccess) return 1;
     std::vector<float> field(size_t(w)*h*2);
-    for (size_t i = 0; i < field.size(); i += 2) { field[i] = float(pan); field[i+1] = 0.0f; }
+    for (size_t i = 0; i < field.size(); i += 2) { field[i] = sign*float(pan)/(uv ? float(w) : 1.0f); field[i+1] = 0.0f; }
     if (hipMemcpy(mv, field.data(), field.size()*4, hipMemcpyHostToDevice) != hipSuccess) return 1;
     std::vector<unsigned char> shifted(size_t(pitch)*h), frame(size_t(w)*h*bpp);
     auto stage = [&](int index) {
@@ -75,7 +79,8 @@ int main(int argc, char** argv) {
         if (!stage(index)) return 1;
         r = 0;
         for (int tries = 0; tries < 1000 && r != 1; ++tries) {
-            if (motion(mv, w, h, w*8) < 0 || submit_full(staging, w, h, pitch, bpp, 1) < 0) {
+            // The pan's motion on the frame that moved, none on repeats of it.
+            if (motion(tries == 0 ? mv : still, w, h, w*8) < 0 || submit_full(staging, w, h, pitch, bpp, 1) < 0) {
                 fprintf(stderr, "submit failed: %s\n", error()); return 1;
             }
             r = poll_frame(frame.data(), size_t(w)*bpp, w, h, bpp, &ms);
@@ -94,7 +99,9 @@ int main(int argc, char** argv) {
     fwrite(out_hdr, 4, 3, o);
     fwrite(frame.data(), 1, frame.size(), o);
     fclose(o);
-    printf("frame %dx%d bpp %d written (%.1f ms device)\n", w, h, bpp, ms);
+    typedef int (*ModeFn)();
+    auto mode = (ModeFn)GetProcAddress(dll, "re_motion_mode");
+    printf("frame %dx%d bpp %d written (%.1f ms device), motion mode %d\n", w, h, bpp, ms, mode ? mode() : -2);
     destroy();
     return 0;
 }

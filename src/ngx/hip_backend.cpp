@@ -135,6 +135,7 @@ struct State {
     int (*EngineSubmitFull)(const void*, int, int, int, int, int) = nullptr;
     int (*EngineMotion)(const void*, int, int, int) = nullptr;  // optional (re_motion)
     int (*EngineComposeDevice)(void*, unsigned long long, int, int, int, float*) = nullptr;  // optional
+    int (*EngineMotionMode)() = nullptr;  // optional (re_motion_mode)
     int (*EnginePollFrame)(unsigned char*, unsigned long long, int, int, int, float*) = nullptr;
     bool engineFrameReady = false;
     int (*EnginePoll)(int, unsigned char*, unsigned char*, float*) = nullptr;
@@ -828,6 +829,7 @@ static bool EngineReady() {
     s.EngineMotion = (int (*)(const void*, int, int, int))GetProcAddress(s.engineDll, "re_motion");
     s.EngineComposeDevice = (int (*)(void*, unsigned long long, int, int, int, float*))
         GetProcAddress(s.engineDll, "re_compose_device");
+    s.EngineMotionMode = (int (*)())GetProcAddress(s.engineDll, "re_motion_mode");
     s.EnginePollFrame = (int (*)(unsigned char*, unsigned long long, int, int, int, float*))
         GetProcAddress(s.engineDll, "re_poll_frame");
     if (cfg.residentEngineFull && (!s.EngineSubmitFull || !s.EnginePollFrame)) {
@@ -890,8 +892,11 @@ bool ResidentEngineSubmit() {
                     sumX += fabsf(row[i]);
                 }
             }
-            LOGI("hip: resident engine motion %llu at %ux%u (middle row: max |x| %.4g max |y| %.4g mean |x| %.4g px)",
-                 (unsigned long long)s.engineMotionFrames, s.w, s.h, maxX, maxY, sumX / (float)s.w);
+            const int mode = s.EngineMotionMode ? s.EngineMotionMode() : -2;
+            static const char* const kModes[] = {"undecided", "frame px", "frame px negated", "uv", "uv negated"};
+            LOGI("hip: resident engine motion %llu at %ux%u (middle row: max |x| %.4g max |y| %.4g mean |x| %.4g; detected %s)",
+                 (unsigned long long)s.engineMotionFrames, s.w, s.h, maxX, maxY, sumX / (float)s.w,
+                 mode >= -1 && mode <= 3 ? kModes[mode + 1] : "n/a");
         }
     }
     const int r = cfg.residentEngineFull
