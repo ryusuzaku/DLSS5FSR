@@ -224,7 +224,11 @@ inline bool gemm(hipStream_t stream, const float* X, int ldx, const float* W, in
 #define WMMA_LAUNCH(BT, BO, FM, FN) \
     hipLaunchKernelGGL((k_wmma_gemm<P,EPI,RESIDUAL,BT,BO,FM,FN>), dim3((O+BO-1)/BO, (T+BT-1)/BT, zdim), dim3(256), 0, \
                        stream, X, ldx, hw, K, R, ldr, S, out, out2, ldo, T, O, gx, gw, go, parts, partial)
-    if (O <= 32) WMMA_LAUNCH(128, 32, 1, 2);
+    // Few blocks with the usual tile (small token counts): 32x64 tiles give
+    // four times as many; the per-output arithmetic is the same.
+    const size_t blocks = size_t((O+bo-1)/bo)*((T+bt-1)/bt)*zdim;
+    if (O > 32 && O % 64 == 0 && blocks < 128) WMMA_LAUNCH(32, 64, 1, 1);
+    else if (O <= 32) WMMA_LAUNCH(128, 32, 1, 2);
     else if (O <= 64 || O % 128) WMMA_LAUNCH(128, 64, 2, 2);
     else WMMA_LAUNCH(64, 128, 2, 2);
 #undef WMMA_LAUNCH
