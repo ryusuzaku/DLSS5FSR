@@ -123,21 +123,21 @@ __global__ __launch_bounds__(256) void k_swin_attention(const h16* __restrict__ 
         const h16* __restrict__ wp, const float* __restrict__ attention_skip,
         float* output, float* raw_out) {
     constexpr int LX = C+8, LD = 40, LS = 72, PER = Tiles<C>::PER, HEADS = C/32;
-    __shared__ __attribute__((aligned(16))) h16 fs[64*LX];
+    // The feature stays in global memory (contiguous per window, L2
+    // resident): the products read their A fragments from there, which keeps
+    // LDS small enough for more than one workgroup per CU.
     __shared__ __attribute__((aligned(16))) h16 qs[64*LD], ks[64*LD], vs[64*LD];  // qs holds the context after scores
     __shared__ __attribute__((aligned(16))) h16 sc[64*LS];
     __shared__ float inv[128];
     const int tid = threadIdx.x, wave = tid/32, lane = tid%32;
     const int lr = lane/16*8, lc = lane%16, win = blockIdx.x;
     const h16* src = feature + size_t(win)*64*C;
-    for (int i = tid; i < 64*C; i += 256) fs[(i/C)*LX+i%C] = src[i];
-    __syncthreads();
     float acc[PER][8];
     for (int p = 0; p < PER; ++p) {
         const int rt = Tiles<C>::rt(wave, p), ct = Tiles<C>::ct(wave, p);
         for (int e = 0; e < 8; ++e) {
             int c = ct*16+lc;
-            acc[p][e] = split512_half(float(fs[(rt*16+lr+e)*LX+c])*attention_skip[c]);
+            acc[p][e] = split512_half(float(src[(rt*16+lr+e)*C+c])*attention_skip[c]);
         }
     }
     for (int head = 0; head < HEADS; ++head) {
@@ -145,7 +145,7 @@ __global__ __launch_bounds__(256) void k_swin_attention(const h16* __restrict__ 
             const int k = wave*3+j, m = k/8, rt = k%8/2, ct = k%2;
             float q[8] = {};
             for (int k0 = 0; k0 < C; k0 += 32) {
-                FC part; slice<FBc>(part, fs+rt*16*LX+k0, LX, wqkv+size_t(m*C+head*32+ct*16)*C+k0, C, 16);
+                FC part; slice<FBc>(part, src+rt*16*C+k0, C, wqkv+size_t(m*C+head*32+ct*16)*C+k0, C, 16);
                 for (int e = 0; e < 8; ++e) q[e] = split512_half(q[e]+part.x[e]);
             }
             h16* dst = m == 0 ? qs : m == 1 ? ks : vs;
