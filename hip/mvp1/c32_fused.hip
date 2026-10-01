@@ -256,6 +256,14 @@ struct C32Io {
         if (x < 0 || x >= width || y < 0 || y >= height) return -1;
         return (long long)(size_t(y)*width + x)*32 + (permute ? peer_to_native32(c) : c);
     }
+    // A token's first element (channel 0 before the permutation), or -1.
+    __device__ int base(bool hwc, int win, int t) const {
+        if (!hwc) return (win*64 + t)*32;
+        int x = (win % (pw/8))*8 + t%8 - px, y = (win / (pw/8))*8 + t/8 - py;
+        if (x < 0 || x >= width || y < 0 || y >= height) return -1;
+        return (y*width + x)*32;
+    }
+    __device__ int channel(int c) const { return permute ? peer_to_native32(c) : c; }
 };
 
 __global__ __launch_bounds__(256) void k_c32_wmma(const float* in, const float* __restrict__ dw,
@@ -271,7 +279,11 @@ __global__ __launch_bounds__(256) void k_c32_wmma(const float* in, const float* 
     const int tid = threadIdx.x, wave = tid/32, lane = tid%32;
     const int lr = lane/16*8, lc = lane%16;
     const int win = blockIdx.x;
-    auto input = [&](int t, int c) { long long a = io.at(io.in_hwc, win, t, c); return a < 0 ? 0.0f : in[a]; };
+    // Token addresses once per window (the mapping costs integer divisions).
+    __shared__ int in_base[64], out_base[64];
+    if (tid < 64) { in_base[tid] = io.base(io.in_hwc, win, tid); out_base[tid] = io.base(io.out_hwc, win, tid); }
+    __syncthreads();
+    auto input = [&](int t, int c) { int b = in_base[t]; return b < 0 ? 0.0f : in[b + io.channel(c)]; };
     const float *g1 = dw+16385, *g2 = dw+16417, *bias = dw+12288;
     _Float16* sc = H+4096;
 #ifdef C32F_PROF
@@ -281,7 +293,19 @@ __global__ __launch_bounds__(256) void k_c32_wmma(const float* in, const float* 
 #endif
     C32F_MARK(0);
 
-    for (int i = tid; i < 64*32; i += 256) Q[i] = split512_to_half(h70_f(input(i/32, i%32)));
+    {   // 8 channels of one token per thread (two float4 loads in channel order).
+        const int t = tid/4, c0 = tid%4*8, b = in_base[t];
+        float v[8];
+        if (b < 0) {
+            for (int j = 0; j < 8; ++j) v[j] = 0.0f;
+        } else if (!io.permute) {
+            float4 lo = *reinterpret_cast<const float4*>(in + b + c0), hi = *reinterpret_cast<const float4*>(in + b + c0 + 4);
+            v[0] = lo.x; v[1] = lo.y; v[2] = lo.z; v[3] = lo.w; v[4] = hi.x; v[5] = hi.y; v[6] = hi.z; v[7] = hi.w;
+        } else {
+            for (int j = 0; j < 8; ++j) v[j] = in[b + peer_to_native32(c0+j)];
+        }
+        for (int j = 0; j < 8; ++j) Q[t*32 + c0+j] = split512_to_half(h70_f(v[j]));
+    }
     __syncthreads();
     C32F_MARK(1);
     {   // Expand (K=32) and gate: tiles 4x8, wave -> row tile, 4 column tiles.
@@ -415,8 +439,8 @@ __global__ __launch_bounds__(256) void k_c32_wmma(const float* in, const float* 
             int r = rt*16+lr+e, col = ct*16+lc;
             float residual = c32f_h(ffn[e]*g2[col]);
             float body = split512_half_sum(c.x[e], residual);
-            long long a = io.at(io.out_hwc, win, r, col);
-            if (a < 0) continue;
+            if (out_base[r] < 0) continue;
+            int a = out_base[r] + io.channel(col);
             if (raw_out) raw_out[a] = body;
             if (quant_out) quant_out[a] = h70_f(body);
         }
