@@ -39,8 +39,51 @@ using namespace c512_resident;
 // Full-frame candidate input: the staged proxy resampled to sw x sh content
 // (1:1 when that is the frame size; bilinear in sRGB otherwise, like the 256
 // crop), edge-replicated into the padded network extent, then sRGB decoded.
+// tone=K (luma mode): the network is shown the frame through auto exposure
+// (K / log-average luminance, tone[2]) and the ACES fit, i.e. a display-like
+// picture instead of the game's flat pre-tonemap one; k_ratio_map maps its
+// answer back through the exact inverse. tone: sums (log Y, count), the
+// applied exposure, valid, the smoothed log2 exposure. The applied exposure
+// moves in 1/32-stop steps and only past a deadband: the network answers even
+// last-bit input changes with visible grain changes, so a still scene must
+// keep a bit-identical input.
+__device__ inline float tone_aces(float x) {
+    return fminf(fmaxf(x*(2.51f*x + 0.03f) / (x*(2.43f*x + 0.59f) + 0.14f), 0.0f), 1.0f);
+}
+__device__ inline float tone_aces_inverse(float y) {
+    y = fminf(fmaxf(y, 0.0f), 0.98f);
+    return (-0.59f*y + 0.03f - sqrtf(-1.0127f*y*y + 1.3702f*y + 0.0009f)) / (2.0f*(2.43f*y - 2.51f));
+}
+__global__ void k_tone_measure(const unsigned char* src, int pitch, int bpp, int w, int h, float* tone) {
+    const int step = 4, gw = (w + step - 1)/step, gh = (h + step - 1)/step;
+    int i = blockIdx.x*blockDim.x + threadIdx.x;
+    float sum = 0.0f, count = 0.0f;
+    if (i < gw*gh) {
+        int x = (i % gw)*step, y = (i / gw)*step;
+        float l[3];
+        for (int c = 0; c < 3; ++c) {
+            float s = fminf(fmaxf(candidate_proxy_channel(src, pitch, bpp, x, y, c), 0.0f), 1.0f);
+            l[c] = s <= 0.04045f ? s/12.92f : powf((s+0.055f)/1.055f, 2.4f);
+        }
+        sum = logf(.2126f*l[0] + .7152f*l[1] + .0722f*l[2] + 1e-4f); count = 1.0f;
+    }
+    for (int o = 16; o; o >>= 1) { sum += __shfl_xor(sum, o); count += __shfl_xor(count, o); }
+    if ((threadIdx.x & 31) == 0 && count > 0.0f) { atomicAdd(&tone[0], sum); atomicAdd(&tone[1], count); }
+}
+__global__ void k_tone_update(float* tone, float key) {
+    if (tone[1] > 0.0f) {
+        const float target = fminf(fmaxf(log2f(key) - tone[0] / tone[1] * 1.44269504f, -6.0f), 6.0f);
+        tone[4] = tone[3] > 0.0f ? tone[4] + (target - tone[4])*0.25f : target;  // smoothed over runs
+        const float applied = tone[3] > 0.0f ? log2f(tone[2]) : 1e9f;
+        if (fabsf(tone[4] - applied) > 1.5f/32.0f) tone[2] = exp2f(rintf(tone[4]*32.0f) / 32.0f);
+        tone[3] = 1.0f;
+    }
+    tone[0] = 0.0f; tone[1] = 0.0f;
+}
+
 __global__ void k_candidate_input_full(const unsigned char* src, float* output, int frame_w, int frame_h,
-                                       int pitch, int bpp, int width, int height, int sw, int sh) {
+                                       int pitch, int bpp, int width, int height, int sw, int sh,
+                                       const float* tone = nullptr) {
     const int pixel = (int)(blockIdx.x*blockDim.x + threadIdx.x);
     if (pixel >= width*height) return;
     const int x = min(pixel % width, sw-1), y = min(pixel / width, sh-1);
@@ -58,7 +101,8 @@ __global__ void k_candidate_input_full(const unsigned char* src, float* output, 
             srgb = (a*(1.0f-tx) + b*tx)*(1.0f-ty) + (d*(1.0f-tx) + e*tx)*ty;
         }
         srgb = fminf(fmaxf(srgb, 0.0f), 1.0f);
-        output[pixel*3+c] = srgb <= 0.04045f ? srgb/12.92f : powf((srgb+0.055f)/1.055f, 2.4f);
+        float linear = srgb <= 0.04045f ? srgb/12.92f : powf((srgb+0.055f)/1.055f, 2.4f);
+        output[pixel*3+c] = tone ? tone_aces(linear*tone[2]) : linear;
     }
 }
 
@@ -133,6 +177,7 @@ unsigned char srgb8(float linear) { return (unsigned char)nearbyintf(srgb_encode
 struct OutputOptions {
     int luma = 0, denoise = 0, motion = 2, motion_sign = 1;  // motion 2 = auto
     int compact = 0;  // extent=compact: smallest multiple-of-64 extent (fast path only)
+    float tone = 0.0f;  // tone=K: luma mode network input through auto exposure (key K) + ACES
     float scale = 1.0f;
     float limit = 0.0f, smooth = 0.0f, sigma = 0.02f, strength = 1.0f, gate = 0.03f;
     int gain = -1;
@@ -186,7 +231,7 @@ __device__ inline float net_ratio(const float* linear, const float* color, int x
 // Optionally smoothed against the previous map (gated by Y_in's change).
 __global__ void k_ratio_map(const float* linear, const float* color, const unsigned char* src, int pitch, int bpp,
                             const float2* previous, int previous_valid, OutputOptions o, float2* map,
-                            int frame_w, int frame_h, int sw, int sh, int W) {
+                            int frame_w, int frame_h, int sw, int sh, int W, const float* tone = nullptr) {
     int i = blockIdx.x*blockDim.x + threadIdx.x;
     if (i >= frame_w*frame_h) return;
     int x = i % frame_w, y = i / frame_w;
@@ -205,6 +250,12 @@ __global__ void k_ratio_map(const float* linear, const float* color, const unsig
         float a = net_ratio(linear, color, x0, y0, sw, sh, W, o.denoise), b = net_ratio(linear, color, x1, y0, sw, sh, W, o.denoise);
         float c = net_ratio(linear, color, x0, y1, sw, sh, W, o.denoise), d = net_ratio(linear, color, x1, y1, sw, sh, W, o.denoise);
         r = (a*(1.0f-tx) + b*tx)*(1.0f-ty) + (c*(1.0f-tx) + d*tx)*ty;
+    }
+    if (tone && yin > 1e-5f) {
+        // The network's ratio is on the toned picture: carry it back to the
+        // frame's own light through the inverse curve (luminance).
+        const float e = tone[2], t = tone_aces(yin*e);
+        r = tone_aces_inverse(t*r) / e / yin;
     }
     float ratio = 1.0f + o.strength*(r - 1.0f);
     if (o.limit > 0.0f) ratio = fminf(1.0f + o.limit, fmaxf(1.0f - o.limit, ratio));
@@ -457,7 +508,7 @@ struct Network {
 
     // sw x sh: the network content (the frame, or its downscale); 0 = the frame.
     void run(const unsigned char* src, int fw, int fh, int pitch, int bpp, bool crop, hipStream_t stream,
-             int sw = 0, int sh = 0) {
+             int sw = 0, int sh = 0, const float* tone = nullptr) {
         if (sw <= 0 || sh <= 0) { sw = fw; sh = fh; }
         if (crop) {
             if (W != 256 || H != 256) throw std::runtime_error("crop mode needs the 256x256 network");
@@ -465,7 +516,7 @@ struct Network {
                                src, color->data, fw, fh, pitch, bpp);
         } else {
             hipLaunchKernelGGL(k_candidate_input_full, dim3((W*H+255)/256), dim3(256), 0, stream,
-                               src, color->data, fw, fh, pitch, bpp, W, H, sw, sh);
+                               src, color->data, fw, fh, pitch, bpp, W, H, sw, sh, tone);
         }
         HIP_CHECK(hipGetLastError());
         bool ok = front->run_from_device({color->data,color->count}) &&
@@ -565,6 +616,7 @@ struct Engine {
     int out_w = 0, out_h = 0, out_bpp = 0;
     float last_ms = 0.0f;
     unsigned long long completed = 0;
+    std::unique_ptr<Buffer> tone_state;  // tone=K: log-luminance sums, applied exposure, valid, smoothed log2
     std::string error;
 
     explicit Engine(const std::vector<std::string>& lines) : config(lines) {
@@ -586,12 +638,14 @@ struct Engine {
                 options.motion = value == "auto" ? 2 : value == "1";
             else if (key == "scale") options.scale = std::stof(value);
             else if (key == "extent" && (value == "compact" || value == "legacy")) options.compact = value == "compact";
+            else if (key == "tone") options.tone = std::stof(value);
             else if (key == "motion_sign" && (value == "1" || value == "-1")) options.motion_sign = std::stoi(value);
             else throw std::runtime_error("unknown engine option: " + line);
         }
         if (options.sigma <= 0.0f || options.gate <= 0.0f || options.smooth < 0.0f || options.smooth > 1.0f ||
             options.limit < 0.0f || options.strength < 0.0f || options.denoise < 0 || options.denoise > 4 ||
-            options.scale < 0.25f || options.scale > 1.0f || (options.scale < 1.0f && !options.luma))
+            options.scale < 0.25f || options.scale > 1.0f || (options.scale < 1.0f && !options.luma) ||
+            options.tone < 0.0f || options.tone > 1.0f || (options.tone > 0.0f && !options.luma))
             throw std::runtime_error("engine options out of range");
         // The caller's thread may carry a stale HIP error from its own work;
         // setup checks hipGetLastError() after its first launches.
@@ -777,9 +831,23 @@ struct Engine {
             net.reset();
             net.reset(new Network(config, W, H));
         }
+        const float* tone = nullptr;
+        if (!job_crop && options.luma && options.tone > 0.0f) {
+            if (!tone_state) {
+                tone_state.reset(new Buffer(5));
+                HIP_CHECK(hipMemsetAsync(tone_state->data, 0, 5*sizeof(float), stream));
+            }
+            const int samples = ((frame_w+3)/4)*((frame_h+3)/4);
+            hipLaunchKernelGGL(k_tone_measure, dim3((samples+255)/256), dim3(256), 0, stream,
+                               reinterpret_cast<const unsigned char*>(raw_input->data), frame_pitch, frame_bpp,
+                               frame_w, frame_h, tone_state->data);
+            hipLaunchKernelGGL(k_tone_update, dim3(1), dim3(1), 0, stream, tone_state->data, options.tone);
+            HIP_CHECK(hipGetLastError());
+            tone = tone_state->data;
+        }
         HIP_CHECK(hipEventRecord(start, stream));
         net->run(reinterpret_cast<const unsigned char*>(raw_input->data), frame_w, frame_h, frame_pitch,
-                 frame_bpp, job_crop, stream, sw, sh);
+                 frame_bpp, job_crop, stream, sw, sh, tone);
         HIP_CHECK(hipEventRecord(stop, stream));
         size_t count = size_t(W)*H*3;
         std::vector<float> native, pub, rgb;
@@ -815,7 +883,7 @@ struct Engine {
                                        ? reinterpret_cast<const float2*>(history[history_cur]->data)
                                        : reinterpret_cast<const float2*>(maps[published]->data),
                                    int(previous_valid), options, reinterpret_cast<float2*>(maps[next]->data),
-                                   frame_w, frame_h, sw, sh, W);
+                                   frame_w, frame_h, sw, sh, W, tone);
                 HIP_CHECK(hipGetLastError());
                 HIP_CHECK(hipStreamSynchronize(stream));
                 float elapsed = 0.0f;

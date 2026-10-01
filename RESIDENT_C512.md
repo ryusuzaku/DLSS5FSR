@@ -784,3 +784,14 @@ the engine writes the full frame (the input's alpha is always kept):
   512x320 instead of 512x512: 6.6 instead of 8.0 ms network time. The
   result differs from the padded extent about as much as from a larger
   real context, since the ViT's global attention sees the whole extent.
+- `tone=K` (luma mode) shows the network the frame through auto exposure
+  (K / the frame's log-average luminance, smoothed over runs and applied in
+  1/32-stop steps past a deadband, so a still scene keeps a bit-identical
+  input) and the ACES fit, instead of the flat pre-tonemap proxy; the ratio
+  is carried back to the frame's light through the curve's inverse. Use it
+  with a shim `WhitePoint` above the scene's highlights (Cyberpunk: 8; at
+  1.0, 39-64% of captured pixels had a clipped channel, so the network saw
+  flat white) and scale `gate`/`sigma` with the white point, since they are
+  absolute luminance differences in the proxy. On a capture re-encoded for
+  WhitePoint 8, the edit without `tone` is blotchy mottling on walls and
+  glass; with `tone=0.18` it is clean definition.
