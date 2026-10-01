@@ -59,3 +59,127 @@ __global__ __launch_bounds__(256) void k_vit_attention_wmma(const float* __restr
         output[size_t(q0+q)*1024+head*32+c] = split512_fp8(split512_half(acc[e]*split512_half(1.0f/den[q])));
     }
 }
+
+// Fast fused ViT attention: from the raw qkv projection to the FP8 output in
+// one launch (replaces k_vit_qkv_normalize, k_vit_scores, k_vit_exponents and
+// k_vit_attention_wmma). Grid (tokens/64 query tiles, 32 heads); keys are
+// walked in chunks of 64 in the reference's own structure: the chunk
+// denominator (vit_denominator order) is half-accumulated across chunks and
+// the numerator's 32-key slices are half-accumulated in key order, so no
+// running-max rescaling is needed (the exponent transform is clamped). Scores
+// and the numerator are WMMA products of FP8 operands (exact products, fp32
+// sums inside a 32-product slice).
+__device__ inline float vit_inverse_norm(const float* raw) {
+    float ordered[32];
+    for (int j = 0; j < 32; ++j) ordered[j] = raw[vit_qkv_inverse_order(j)];
+    float parts[16];
+    for (int j = 0; j < 16; ++j)
+        parts[j] = split512_half_sum(ordered[j]*ordered[j], split512_half(ordered[j+16]*ordered[j+16]));
+    for (int j = 0; j < 8; ++j) parts[j] = split512_half(parts[2*j]+parts[2*j+1]);
+    for (int width = 4; width; width /= 2)
+        for (int j = 0; j < width; ++j) parts[j] = split512_half(parts[j]+parts[j+width]);
+    return split512_half(1.0f/sqrtf(fmaxf(parts[0], .00006198883056640625f)));
+}
+
+__global__ __launch_bounds__(256) void k_vit_attention_fused(const float* __restrict__ projected,
+                                                             const float* __restrict__ scales,
+                                                             float* output, int tokens) {
+    using namespace rocwmma;
+    using h16 = float16_t;
+    constexpr int LD = 40, LS = 72;
+    __shared__ __attribute__((aligned(16))) h16 qs[64*LD], ks[64*LD], vs[64*LD];
+    __shared__ __attribute__((aligned(16))) h16 ps[64*LS];  // exponents, then fp8(exponents)
+    __shared__ float den[64];
+    const int head = blockIdx.y, q0 = blockIdx.x*64;
+    const int tid = threadIdx.x, wave = tid/32, lane = tid%32;
+    const int lr = lane/16*8, lc = lane%16;
+    // Q rows: normalized, scaled (5.65625, then the head scale), FP8.
+    if (tid < 64) {
+        float raw[32];
+        const float* src = projected + size_t(q0+tid)*3072 + head*32;
+        for (int c = 0; c < 32; ++c) raw[c] = src[c];
+        const float inv = vit_inverse_norm(raw), scale = split512_half(scales[head]);
+        for (int c = 0; c < 32; ++c) {
+            float v = split512_half(split512_half(split512_half(raw[c]*inv)*5.65625f)*scale);
+            qs[tid*LD+c] = split512_to_half(split512_fp8(v));
+        }
+    }
+    float d = 0.0f;           // tid < 64: this query's running denominator
+    float acc[8] = {};        // numerator tile (rt = wave/2, ct = wave%2)
+    for (int k0 = 0; k0 < tokens; k0 += 64) {
+        if (tid < 64) {        // K row: normalized, FP8
+            float raw[32];
+            const float* src = projected + size_t(k0+tid)*3072 + 1024 + head*32;
+            for (int c = 0; c < 32; ++c) raw[c] = src[c];
+            const float inv = vit_inverse_norm(raw);
+            for (int c = 0; c < 32; ++c) ks[tid*LD+c] = split512_to_half(split512_fp8(split512_half(raw[c]*inv)));
+        } else if (tid < 128) {  // V row: FP8
+            const float* src = projected + size_t(k0+tid-64)*3072 + 2048 + head*32;
+            for (int c = 0; c < 32; ++c) vs[(tid-64)*LD+c] = split512_to_half(split512_fp8(src[c]));
+        }
+        __syncthreads();
+        {   // Scores (raw sum, half) and the exponent transform: 16 tiles, 2 per wave.
+            const int rt = wave%4;
+            fragment<matrix_a,16,16,16,h16,row_major> a0, a1;
+            load_matrix_sync(a0, qs + rt*16*LD, LD);
+            load_matrix_sync(a1, qs + rt*16*LD + 16, LD);
+            for (int j = 0; j < 2; ++j) {
+                const int ct = wave/4*2+j;
+                fragment<matrix_b,16,16,16,h16,col_major> b0, b1;
+                fragment<accumulator,16,16,16,float> s;
+                load_matrix_sync(b0, ks + ct*16*LD, LD);
+                load_matrix_sync(b1, ks + ct*16*LD + 16, LD);
+                fill_fragment(s, 0.0f);
+                mma_sync(s, a0, b0, s);
+                mma_sync(s, a1, b1, s);
+                for (int e = 0; e < 8; ++e) {
+                    float score = split512_half(s.x[e]);
+                    float affine = fminf(1.9775390625f, fmaxf(1.439453125f, split512_half(score*.08953857421875f+1.708984375f)));
+                    _Float16 hc = split512_to_half(affine);
+                    unsigned short bits; __builtin_memcpy(&bits, &hc, 2);
+                    bits = (unsigned short)((unsigned(bits)<<4)+0x4000u);
+                    __builtin_memcpy(&hc, &bits, 2);
+                    ps[(rt*16+lr+e)*LS + ct*16+lc] = hc;
+                }
+            }
+        }
+        __syncthreads();
+        if (tid < 64) {        // this chunk's denominator, the reference order
+            float e[64];
+            for (int k = 0; k < 64; ++k) e[k] = float(ps[tid*LS+k]);
+            float part = vit_denominator(e);
+            d = k0 ? split512_half(d+part) : part;
+        }
+        __syncthreads();
+        for (int i = tid; i < 64*64; i += 256) {
+            h16* p = ps + (i/64)*LS + i%64;
+            *p = split512_to_half(split512_fp8(float(*p)));
+        }
+        __syncthreads();
+        {   // Numerator: the chunk's two 32-key slices, in key order.
+            const int rt = wave/2, ct = wave%2;
+            for (int s0 = 0; s0 < 64; s0 += 32) {
+                fragment<matrix_a,16,16,16,h16,row_major> a0, a1;
+                fragment<matrix_b,16,16,16,h16,row_major> b0, b1;
+                fragment<accumulator,16,16,16,float> part;
+                load_matrix_sync(a0, ps + rt*16*LS + s0, LS);
+                load_matrix_sync(a1, ps + rt*16*LS + s0 + 16, LS);
+                load_matrix_sync(b0, vs + s0*LD + ct*16, LD);
+                load_matrix_sync(b1, vs + (s0+16)*LD + ct*16, LD);
+                fill_fragment(part, 0.0f);
+                mma_sync(part, a0, b0, part);
+                mma_sync(part, a1, b1, part);
+                const bool first = k0 == 0 && s0 == 0;
+                for (int e = 0; e < 8; ++e) acc[e] = split512_half(first ? part.x[e] : acc[e]+part.x[e]);
+            }
+        }
+        __syncthreads();
+    }
+    if (tid < 64) den[tid] = d;
+    __syncthreads();
+    const int rt = wave/2, ct = wave%2;
+    for (int e = 0; e < 8; ++e) {
+        int q = rt*16+lr+e, c = ct*16+lc;
+        output[size_t(q0+q)*1024+head*32+c] = split512_fp8(split512_half(acc[e]*split512_half(1.0f/den[q])));
+    }
+}

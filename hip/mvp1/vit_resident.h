@@ -83,14 +83,19 @@ public:
                     projected.data, nullptr, 3072, tokens, 3072, 1, 0, 0, 0, 2);
                 HIP_CHECK(hipGetLastError());
             }
-            VIT_LAUNCH(k_vit_qkv_normalize, 3*n, projected.data, w.scales.data, qkv.data, tokens);
-            VIT_LAUNCH(k_vit_scores, sn, qkv.data, scores.data, tokens);
-            VIT_LAUNCH(k_vit_exponents, sn, scores.data, exponents.data, int(sn));
-            if (tokens % 64 == 0 && !c512_resident::exact_math && !verify) {
-                hipLaunchKernelGGL(k_vit_attention_wmma, dim3(tokens/64, 32), dim3(256), 0, c512_resident::stream,
-                                   qkv.data, exponents.data, attention.data, tokens);
+            const bool fused = tokens % 64 == 0 && !c512_resident::exact_math && !verify;
+            if (fused) {
+                // Normalize, scores, exponents and attention in one launch.
+                hipLaunchKernelGGL(k_vit_attention_fused, dim3(tokens/64, 32), dim3(256), 0, c512_resident::stream,
+                                   projected.data, w.scales.data, attention.data, tokens);
                 HIP_CHECK(hipGetLastError());
-                if (c512_resident::launch_hook) c512_resident::launch_hook("k_vit_attention_wmma");
+                if (c512_resident::launch_hook) c512_resident::launch_hook("k_vit_attention_fused");
+            } else {
+                VIT_LAUNCH(k_vit_qkv_normalize, 3*n, projected.data, w.scales.data, qkv.data, tokens);
+                VIT_LAUNCH(k_vit_scores, sn, qkv.data, scores.data, tokens);
+                VIT_LAUNCH(k_vit_exponents, sn, scores.data, exponents.data, int(sn));
+            }
+            if (fused) {
             } else if (tokens % 64 == 0) {
                 VIT_LAUNCH(k_vit_attention_chunks, n, qkv.data, exponents.data, attention.data, tokens);
             } else {
