@@ -758,6 +758,12 @@ the engine writes the full frame (the input's alpha is always kept):
 - `limit=L` clamps the luminance ratio to [1-L, 1+L].
 - `smooth=A` and `sigma=S` blend the ratio with the previous frame's,
   gated by exp(-|Y_in - Y_in_prev| / S), against frame-to-frame shimmer.
+  With motion vectors the previous map is first carried along them to the
+  new map's frame, so the blend meets the same content while the camera
+  moves (without, only still content was smoothed). On a captured frame
+  panned 3-10 px per frame, the frame-to-frame change of the applied ratio
+  fell from 38-50% of the edit to 24-27% (A=0.5), 11-13% (A=0.75) and
+  7-8% (A=0.85); higher A answers new detail more slowly.
 - In luma mode the network produces a per-pixel ratio map; every frame
   the engine applies the latest map to the newest submitted frame
   (`k_compose`), so the image is never an old frame. Where the current

@@ -14,7 +14,9 @@
 //   game frame n, as the shim does (its prepare runs before frame n's list),
 //   and also writes out.bin.map: the engine's carried ratio map
 //   (re_compose_map_device, RGBA16F) after the last frame, for checking what
-//   the shim's map resolve makes of it on frame n.
+//   the shim's map resolve makes of it on frame n. RE_DUMP_PREFIX=P writes
+//   every game-cadence frame's output to P_NNN.bin (same format as out.bin),
+//   for measuring frame-to-frame stability.
 // out.bin: 12-byte header (width, height, bpp as uint32) + tightly packed rows.
 #include <hip/hip_runtime.h>
 #include <windows.h>
@@ -110,6 +112,16 @@ int main(int argc, char** argv) {
             r = poll_frame(frame.data(), size_t(w)*bpp, w, h, bpp, &ms);
             if (r < 0) { fprintf(stderr, "poll failed: %s\n", error()); return 1; }
             landed += r == 1;
+            if (const char* prefix = getenv("RE_DUMP_PREFIX")) {
+                char name[1024];
+                snprintf(name, sizeof(name), "%s_%03d.bin", prefix, index);
+                if (FILE* d = fopen(name, "wb")) {
+                    unsigned int dump_hdr[3] = {unsigned(w), unsigned(h), unsigned(bpp)};
+                    fwrite(dump_hdr, 4, 3, d);
+                    fwrite(frame.data(), 1, frame.size(), d);
+                    fclose(d);
+                }
+            }
         }
         printf("game cadence: %d moving frames, %d held, %d composed, shim lag %d\n", frames, hold, landed, lag);
         typedef int (*ComposeMapFn)(void*, unsigned long long, int, int, float*);

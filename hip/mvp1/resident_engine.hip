@@ -538,6 +538,11 @@ struct Engine {
     long long frame_counter = 0;       // the next luma submit's frame number
     long long job_frame = -1;          // frame of the job being computed
     long long map_frame[2] = {-1, -1}; // frame each ratio map was computed on
+    // smooth: the published map carried to the job's frame along the motion
+    // (history[0]; history[1] is the ping-pong scratch), so the new map blends
+    // with the same content rather than whatever was at its pixel before.
+    std::unique_ptr<Buffer> history[2];
+    int history_cur = -1;              // which holds the job's previous map, -1 none
     // The published map carried to the newest frame.
     std::unique_ptr<Buffer> warped[2];
     int warped_cur = 0;
@@ -728,6 +733,8 @@ struct Engine {
             }
             HIP_CHECK(hipMemcpyAsync(raw_input->data, staging, bytes, hipMemcpyDeviceToDevice, stream));
             HIP_CHECK(hipStreamSynchronize(stream));
+            history_cur = -1;
+            if (!crop && options.luma && options.smooth > 0.0f) carry_history(w, h);
         } catch (const std::exception& e) {
             failed = true; error = e.what(); return -1;
         }
@@ -804,7 +811,9 @@ struct Engine {
                 hipLaunchKernelGGL(k_ratio_map, dim3((frame_w*frame_h+255)/256), dim3(256), 0, stream,
                                    linear, net->color->data,
                                    reinterpret_cast<const unsigned char*>(raw_input->data), frame_pitch, frame_bpp,
-                                   previous_valid ? reinterpret_cast<const float2*>(maps[published]->data) : nullptr,
+                                   !previous_valid ? nullptr : history_cur >= 0
+                                       ? reinterpret_cast<const float2*>(history[history_cur]->data)
+                                       : reinterpret_cast<const float2*>(maps[published]->data),
                                    int(previous_valid), options, reinterpret_cast<float2*>(maps[next]->data),
                                    frame_w, frame_h, sw, sh, W);
                 HIP_CHECK(hipGetLastError());
@@ -869,6 +878,34 @@ struct Engine {
     // composed into device memory `out` (rows of out_pitch bytes) on the
     // high-priority compose stream; returns once it is written. The caller
     // holds the mutex. 1 composed, 0 nothing yet, -1 error.
+    // smooth: the published map carried from its frame to job_frame into
+    // history[history_cur] (caller holds the mutex, the worker is idle). Without
+    // motion (off, undecided or lost on the way) it stays the plain previous map.
+    void carry_history(int w, int h) {
+        if (published < 0 || map_w != w || map_h != h || map_frame[published] < 0) return;
+        const float mx = options.motion == 2 ? motion_mx : 1.0f, my = options.motion == 2 ? motion_my : 1.0f;
+        if (!options.motion || (mx == 0.0f && my == 0.0f) || mv_w != w || mv_h != h) return;
+        const long long from = map_frame[published];
+        if (from >= job_frame) return;  // already on the job's frame: the plain map is right
+        for (auto& b : history)
+            if (!b || b->count < size_t(w)*h*2) b.reset(new Buffer(size_t(w)*h*2));
+        const float2* src = reinterpret_cast<const float2*>(maps[published]->data);
+        int cur = -1;
+        for (long long f = from + 1; f <= job_frame; ++f) {
+            int slot = int(f % kRing);
+            if (ring_frame[slot] != f) return;  // motion lost: keep the plain previous map
+            int next = cur == 0 ? 1 : 0;
+            hipLaunchKernelGGL(k_warp_map, dim3((w*h+255)/256), dim3(256), 0, compose_stream,
+                               src, reinterpret_cast<const float2*>(ring[slot]->data),
+                               reinterpret_cast<float2*>(history[next]->data), w, h, mx, my);
+            src = reinterpret_cast<const float2*>(history[next]->data);
+            cur = next;
+        }
+        HIP_CHECK(hipGetLastError());
+        HIP_CHECK(hipStreamSynchronize(compose_stream));
+        history_cur = cur;
+    }
+
     // map_only: write the carried map (k_map_out, RGBA16F) instead of composing.
     int compose_into(unsigned char* out, size_t out_pitch, int w, int h, int bpp, size_t dst_pitch,
                      bool map_only = false) {
