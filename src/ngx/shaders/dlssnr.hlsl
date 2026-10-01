@@ -22,7 +22,7 @@
 //   * The compare modes (side by side, wipe) are kept. They cost nothing and
 //     they are the only way to eyeball this on hardware before there is a model.
 //
-//   * t3 (motion) and t4 (previous edit) are declared and bound but not read.
+//   * t3 (motion) is read by the map-mode resolve; t4 (previous edit) is declared and bound but not read.
 //     The reference binds them for the same reason: temporal accumulation of the
 //     edit is designed but not implemented, and leaving the slots in the table
 //     means adding it later does not change the root signature.
@@ -47,8 +47,8 @@ cbuffer Params : register(b0)
     float gCompareZoom;      // side by side: 1 fits the frame, 2 fills the half
     uint  gCompareSwap;      // put the edited frame on the other side
     uint  gProxyMode;        // proxy curve: 0 soft knee, 1 hybrid, 2 scale+encode
-    uint  gPad1;
-    uint  gPad2;
+    uint  gMapMode;          // resolve: the model texture is a ratio map (ratio, Y_in), not a picture
+    float gMapInvGate;       // resolve, map mode: 1 / the luminance gate
 };
 
 // Colours outside the AP1 gamut are impossible on any display and read as sparkle where a bright
@@ -277,6 +277,35 @@ void main(uint3 id : SV_DispatchThreadID)
     // Nothing was encoded on the way in, so nothing is decoded here either.
     float3 proxy = gPassthrough != 0 ? proxySample.rgb : SrgbToLinear(proxySample.rgb);
     float3 model = gPassthrough != 0 ? modelSample.rgb : SrgbToLinear(modelSample.rgb);
+
+    // Map mode: the engine's ratio map (ratio, Y_in), computed on the frame the engine was last
+    // handed -- one or two frames before this one, since the game's list for this frame has not run
+    // when the engine is called. Dividing a picture of that older frame by this frame's proxy put
+    // every moving edge where it used to be: a pale ghost, one or two frames of motion behind. Here
+    // the map is read where this pixel was on the engine's frame (gMvScale already holds the lag),
+    // and gated on how well the luminance it was computed on matches this frame's, so whatever the
+    // carry cannot place fades to no edit instead of ghosting. The white fade and the untouched
+    // values at or above white are the engine's own compose rules.
+    if (gMapMode != 0)
+    {
+        const float2 size = float2(gWidth, gHeight);
+        const int2 at = min(int2(cmpUv * size), int2(size) - 1);
+        float2 mv = gMotion.Load(int3(at, 0)).xy * float2(gMvScaleX, gMvScaleY);
+        if (any(isnan(mv)) || any(isinf(mv))) mv = float2(0.0, 0.0);
+        const float2 mapUv = cmpUv + mv / size;
+        const float2 m = gModel.SampleLevel(gLinear, mapUv, 0).xy;
+        const bool inside = all(mapUv >= 0.0) && all(mapUv <= 1.0);
+        const float peak = max(proxySample.r, max(proxySample.g, proxySample.b));
+        const float fade = saturate((1.0 - peak) / 0.05);
+        float weight = 0.0;
+        if (inside && m.y >= 0.0)
+            weight = fade * exp(-abs(dot(proxy, kLuma) - m.y) * gMapInvGate);
+        float r = 1.0 + (m.x - 1.0) * weight;
+        if (isnan(r) || isinf(r)) r = 1.0;
+        model = float3(proxySample.r >= 1.0 ? proxy.r : proxy.r * r,
+                       proxySample.g >= 1.0 ? proxy.g : proxy.g * r,
+                       proxySample.b >= 1.0 ? proxy.b : proxy.b * r);
+    }
     float4 originalSample = gCompareMode == 1 ? gOriginal.SampleLevel(gLinear, cmpUv, 0)
                                               : gOriginal.Load(int3(id.xy, 0));
 

@@ -1512,6 +1512,7 @@ int main(int argc, char** argv) {
     const char* engineConfig = getenv("DLSS5_RESIDENT_ENGINE_CONFIG");
     const bool engineRun = engineDll && *engineDll && engineConfig && *engineConfig;
     bool engineFull = false;
+    bool engineMap = false;
     if (engineRun) {
         printf("\n-- pass 11: in-process resident engine --\n");
         IniValues engine;
@@ -1536,10 +1537,55 @@ int main(int argc, char** argv) {
                                                 D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
                                                 D3D12_RESOURCE_STATE_RENDER_TARGET);  // as a game leaves it
         if (mv) UploadMotion(d, mv.Get(), 0x4100 /* 2.5 */, 0xBC00 /* -1.0 */, SRC_W, SRC_H);
-        PassResult ep = RunPass(ngx, d, iniDir, engine, color.Get(), output.Get(),
+        // DLSS5_RESIDENT_ENGINE_F16=1 (with FULL and RESOLVE, and a luma
+        // config): RGBA16F colour and output as Cyberpunk hands them, so a
+        // luma engine returns its ratio map and the resolve carries and gates
+        // it (map mode). Checked against an identity run on the same frame.
+        const char* f16Env = getenv("DLSS5_RESIDENT_ENGINE_F16");
+        engineMap = engineFull && resolve && f16Env && *f16Env == '1';
+        ComPtr<ID3D12Resource> color16, output16;
+        if (engineMap) {
+            color16 = MakeTexture(d.device.Get(), SRC_W, SRC_H, DXGI_FORMAT_R16G16B16A16_FLOAT,
+                                  D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_COMMON);
+            output16 = MakeTexture(d.device.Get(), DST_W, DST_H, DXGI_FORMAT_R16G16B16A16_FLOAT,
+                                   D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            Check(color16 && output16, "map pass: f16 colour + output textures created");
+            if (color16 && output16) {
+                // Gradients with 8-pixel tiles: edges and texture for the network.
+                std::vector<unsigned short> src16((size_t)SRC_W * SRC_H * 4);
+                auto half = [](float v) {
+                    unsigned int b; memcpy(&b, &v, 4);
+                    int e = int((b >> 23) & 255) - 127 + 15;
+                    unsigned int m = (b >> 13) & 1023;
+                    return (unsigned short)(v <= 0.0f || e <= 0 ? 0 : ((e << 10) | m));
+                };
+                for (UINT y = 0; y < SRC_H; ++y)
+                    for (UINT x = 0; x < SRC_W; ++x) {
+                        unsigned short* q = src16.data() + ((size_t)y * SRC_W + x) * 4;
+                        const float tile = ((x / 8 + y / 8) & 1) ? 0.15f : 0.0f;
+                        q[0] = half(0.1f + 0.6f * x / SRC_W + tile);
+                        q[1] = half(0.1f + 0.6f * y / SRC_H + tile);
+                        q[2] = half(0.3f + tile);
+                        q[3] = 0x3C00;
+                    }
+                Check(UploadHalfPixels(d, color16.Get(), src16.data(), SRC_W, SRC_H), "map pass: f16 frame uploaded");
+                Transition(d.list.Get(), color16.Get(), D3D12_RESOURCE_STATE_COMMON,
+                           D3D12_RESOURCE_STATE_RENDER_TARGET);
+                D3DSubmit(d);
+            }
+        }
+        ID3D12Resource* engineColor = engineMap ? color16.Get() : color.Get();
+        ID3D12Resource* engineOutput = engineMap ? output16.Get() : output.Get();
+        PassResult ep = RunPass(ngx, d, iniDir, engine, engineColor, engineOutput,
                                 SRC_W, SRC_H, DST_W, DST_H, engineFull ? 150 : 120, mv.Get());
         Check(ep.evalFailures == 0, "resident engine frames evaluate");
-        if (resolve) {
+        if (engineMap) {
+            IniValues identity = engine;
+            identity.residentEngineConfig.clear();
+            PassResult ip = RunPass(ngx, d, iniDir, identity, engineColor, engineOutput,
+                                    SRC_W, SRC_H, DST_W, DST_H, 20, mv.Get());
+            Check(MaxChannelDiff(ip.rb, ep.rb) > 2, "the ratio map changes the resolved f16 frame");
+        } else if (resolve) {
             Check(MaxChannelDiff(p1.rb, ep.rb) > 2,
                   "resident engine changes the resolved frame");
         } else {
@@ -1583,10 +1629,18 @@ int main(int argc, char** argv) {
                 Check(text.find("hip: resident engine ready in ") != std::string::npos,
                       "resident engine loaded in process");
                 Check(engineFull ? (text.find("hip: resident engine frame 1 at ") != std::string::npos ||
-                                    text.find("hip: resident engine composed frame 1 at ") != std::string::npos)
+                                    text.find("hip: resident engine composed frame 1 at ") != std::string::npos ||
+                                    text.find("hip: resident engine map 1 at ") != std::string::npos)
                                  : text.find("hip: resident engine preview 1 (") != std::string::npos,
                       engineFull ? "resident engine published a full frame" :
                                    "resident engine published a preview");
+                if (engineMap) {
+                    Check(text.find("hip: resident engine map 1 at ") != std::string::npos,
+                          "luma engine hands the resolve its ratio map");
+                    Check(text.find("nr: map resolve: lag ") != std::string::npos &&
+                              text.find("motion bound") != std::string::npos,
+                          "map resolve carries along this frame's motion");
+                }
                 if (engineFull) {
                     Check(text.find("hip: resident engine motion 1 at ") != std::string::npos,
                           "resident engine received motion vectors");
@@ -2266,7 +2320,7 @@ int main(int argc, char** argv) {
             Check(inits == 1 + 8 + 2 + 1 + ((previewEnv && *previewEnv) ? 1 : 0) +
                       ((getenv("DLSS5_CANDIDATE_PREVIEW_SWAP") &&
                         *getenv("DLSS5_CANDIDATE_PREVIEW_SWAP")) ? 1 : 0) +
-                      ((captureEnv && *captureEnv) ? 1 : 0) + (engineRun ? 1 : 0),
+                      ((captureEnv && *captureEnv) ? 1 : 0) + (engineRun ? 1 : 0) + (engineMap ? 1 : 0),
                   "every pass initialised the shim");
             Check(hipReady >= 1, "the HIP model ran at least once");
             Check(hipDegraded == 0, "no degradation to the identity model");

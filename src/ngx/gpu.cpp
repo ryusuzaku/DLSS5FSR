@@ -689,6 +689,7 @@ bool GpuNeuralChain(ID3D12GraphicsCommandList* cl, ID3D12Resource* output,
     // staging size; the copy goes on this list next to the colour, so the
     // next evaluate's counter check covers both.
     bool motionStaged = false;
+    PooledTexture* motionTex = nullptr;  // this frame's motion (frame pixels per unit), for a map resolve
     if (staged && motion && motion->res && motion->guideW && motion->guideH &&
         !cfg.residentEngineConfig.empty() && HipStagingMotion()) {
         PooledTexture* mvTex = GpuAcquireTexture(L"motion", DXGI_FORMAT_R32G32_FLOAT, outRect.w, outRect.h);
@@ -722,6 +723,7 @@ bool GpuNeuralChain(ID3D12GraphicsCommandList* cl, ID3D12Resource* output,
                 msrc.SubresourceIndex = 0;
                 cl->CopyTextureRegion(&mdst, 0, 0, 0, &msrc, nullptr);
                 motionStaged = true;
+                motionTex = mvTex;
             }
         }
     }
@@ -795,9 +797,31 @@ bool GpuNeuralChain(ID3D12GraphicsCommandList* cl, ID3D12Resource* output,
                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
     c.Mode = NR_MODE_RESOLVE;
+    // A ratio map from the engine was computed on the staged frame, one or two
+    // frames before this one: the resolve samples it where this frame's pixel
+    // was then (lag x this frame's motion) and gates it on luminance here.
+    ID3D12Resource* motionSrv = nullptr;
+    if (hipModel && g.hipMapMode && model == hipModel->res.Get()) {
+        const uint64_t lag = g.hipEvaluate > g.hipStagingFrame ? g.hipEvaluate - g.hipStagingFrame : 0;
+        const float carry = (float)(lag < 3 ? lag : 3);
+        c.Pad1 = 1;
+        float invGate = g.hipMapParams[2];
+        memcpy(&c.Pad2, &invGate, sizeof(float));
+        c.MvScaleX = c.MvScaleY = 0.0f;
+        if (motionTex) {
+            GpuSetState(cl, *motionTex, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            motionSrv = motionTex->res.Get();
+            c.MvScaleX = g.hipMapParams[0] * carry;
+            c.MvScaleY = g.hipMapParams[1] * carry;
+        }
+        static unsigned long long mapLog = 0;
+        if ((mapLog++ % 600) == 0)
+            LOGI("nr: map resolve: lag %llu frame(s), carry scale %g,%g, motion %s",
+                 (unsigned long long)lag, c.MvScaleX, c.MvScaleY, motionSrv ? "bound" : "missing");
+    }
     // `keep` as the second UAV would make it both an input and an output of
     // the same dispatch, so the stand-in is left to fall back to the target.
-    if (!GpuNrDispatch(cl, c, proxy->res.Get(), model, keep->res.Get(), nullptr,
+    if (!GpuNrDispatch(cl, c, proxy->res.Get(), model, keep->res.Get(), motionSrv,
                        nullptr, output, nullptr)) {
         LOGE("nr: resolve dispatch failed");
         return false;
@@ -873,6 +897,7 @@ bool GpuHipFrameReady() { return Gpu().hipFrameReady; }
 
 bool GpuPrepareHipModel(uint64_t n, const Config& cfg) {
     GpuContext& g = Gpu();
+    g.hipEvaluate = n;  // the resolve carries a ratio map from hipStagingFrame to here
 
     // S187: DO NOT CLEAR THIS HERE. It was `g.hipFrameReady = false;` and that
     // single line is why the model texture has never been bound: the prepare
@@ -1072,6 +1097,8 @@ bool GpuPrepareHipModel(uint64_t n, const Config& cfg) {
     // prepare #n writes slot n&1, frame n's resolve binds that slot, and this
     // code only reuses slot n&1 again at #(n+2) -- by then the gate has proven
     // list n, that slot's only reader, executed.
+    float mapParams[4] = {};
+    const bool mapMode = HipLumaMap(mapParams);
     const unsigned int parity = (unsigned int)(n & 1);
     PooledTexture* m =
         GpuAcquireTexture(HipModelTag(parity), g.hipFmt, g.hipW, g.hipH);
@@ -1120,6 +1147,11 @@ bool GpuPrepareHipModel(uint64_t n, const Config& cfg) {
     // names it.
     g.hipModelParity = parity;
     g.hipFrameReady = true;
+    // The staging the engine just read is the newest frame whose list ran:
+    // the counter's (Cyberpunk keeps one list in flight, so usually n-2).
+    g.hipMapMode = mapMode;
+    for (int i = 0; i < 4; ++i) g.hipMapParams[i] = mapParams[i];
+    g.hipStagingFrame = counter;
     return true;
 }
 

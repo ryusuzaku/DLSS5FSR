@@ -180,6 +180,10 @@ struct Config {
     // 1: run the whole frame at its padded network extent and write it back
     // at full size; 0: the 256x256 centre-crop preview.
     bool residentEngineFull = false;
+    // Luma engines: hand the resolve the engine's ratio map (carried along this
+    // frame's motion and gated on its luminance there) instead of a frame
+    // composed on the older frame the engine saw. 0 restores the composed frame.
+    bool residentEngineMap = true;
 
     // Scene value the game's tonemapper calls white. Everything the encode
     // does is relative to it, and getting it wrong is not a subtle error: the
@@ -370,6 +374,7 @@ struct DlssNrConstants {
     // reversible roll above), 2 scale-and-encode only -- the default, and the
     // one the model should be shown. See the encode block in dlssnr.hlsl.
     unsigned int ProxyMode = 2;
+    // Resolve: 1 when the model texture is the engine's ratio map (Pad2 = 1/gate as float bits).
     unsigned int Pad1 = 0, Pad2 = 0;
 };
 // Must match the shader's `dcl_constantbuffer CB0[5]`. A mismatch here is
@@ -433,6 +438,15 @@ struct GpuContext {
     // the list that is still in flight never reads a texture we rewrite. The
     // gate's n-2 tolerance depends on this -- see GpuPrepareHipModel.
     unsigned int hipModelParity = 0;
+
+    // The model texture holds the engine's ratio map (RGBA16F ratio, Y_in)
+    // rather than a picture: the resolve carries it from the staged frame
+    // (hipStagingFrame) to the evaluate it runs in (hipEvaluate) along that
+    // frame's motion and gates it there. hipMapParams: motion -> frame pixels
+    // (x, y), 1/gate, luma flag (re_luma_map_params).
+    bool hipMapMode = false;
+    float hipMapParams[4] = {};
+    uint64_t hipEvaluate = 0, hipStagingFrame = 0;
 
     // Held by unique_ptr so a pointer to a pooled texture stays valid when the
     // pool grows. GpuNeuralChain holds `proxy` across the acquisition of
@@ -564,6 +578,9 @@ bool HipC32blkBlockTest();  // connected C=32 block (S170)  // one-shot CONNECTE
 void HipFeBlockView();  // level-2 cached-block view into sharedOut (§34)
 bool HipFeBlockStaged();  // level-3 staged-window run, real pixels (§34)
 bool HipCandidatePreview();  // opt-in model-texture bridge, DebugView=2 only
+// Whether the last HipCandidatePreview wrote the engine's ratio map (see
+// GpuContext::hipMapMode); params as re_luma_map_params.
+bool HipLumaMap(float params[4]);
 bool HipCandidateInputCapture();  // one-shot or triggered-repeat staged-proxy capture
 UINT64 HipStagingRowPitch();
 UINT64 HipStagingBytes();

@@ -1,12 +1,20 @@
 // Runs one capture through the engine DLL as the shim does (submit every
 // frame, poll every frame) and writes the returned frame, so any output
 // mode (transfer=full or luma) can be inspected offline.
-// Usage: resident_engine_frame engine.dll config.txt capture.bin out.bin [pan frames [px|uv sign]]
+// Usage: resident_engine_frame engine.dll config.txt capture.bin out.bin [pan frames [px|uv sign [hold]]]
 //   pan/frames: simulate a horizontal camera pan of `pan` pixels per frame
 //   for `frames` frames (frame f shows the capture shifted by f*pan, edge
 //   clamped) with the matching motion vectors through re_motion; the
 //   output is the last frame's result. px|uv and sign (1 or -1) choose how
 //   the vectors are reported (default px 1), to exercise motion=auto.
+//   hold (game cadence): the camera moves on every 16 ms frame (RE_FRAME_MS) whether or not
+//   a network result landed, as in game, then holds still for `hold` frames
+//   (0: none). Comparing hold 0 with a long hold shows the motion carry's
+//   error at the final position. RE_SHIM_LAG=L hands the engine frame n-L at
+//   game frame n, as the shim does (its prepare runs before frame n's list),
+//   and also writes out.bin.map: the engine's carried ratio map
+//   (re_compose_map_device, RGBA16F) after the last frame, for checking what
+//   the shim's map resolve makes of it on frame n.
 // out.bin: 12-byte header (width, height, bpp as uint32) + tightly packed rows.
 #include <hip/hip_runtime.h>
 #include <windows.h>
@@ -26,13 +34,14 @@ typedef const char* (*ErrorFn)();
 typedef void (*DestroyFn)();
 
 int main(int argc, char** argv) {
-    if (argc != 5 && argc != 7 && argc != 9) {
-        fputs("usage: resident_engine_frame engine.dll config.txt capture.bin out.bin [pan frames [px|uv sign]]\n", stderr);
+    if (argc != 5 && argc != 7 && argc != 9 && argc != 10) {
+        fputs("usage: resident_engine_frame engine.dll config.txt capture.bin out.bin [pan frames [px|uv sign [hold]]]\n", stderr);
         return 2;
     }
     const int pan = argc >= 7 ? atoi(argv[5]) : 0, frames = argc >= 7 ? atoi(argv[6]) : 1;
-    const bool uv = argc == 9 && strcmp(argv[7], "uv") == 0;
-    const float sign = argc == 9 ? float(atoi(argv[8])) : 1.0f;
+    const bool uv = argc >= 9 && strcmp(argv[7], "uv") == 0;
+    const float sign = argc >= 9 ? float(atoi(argv[8])) : 1.0f;
+    const int hold = argc == 10 ? atoi(argv[9]) : -1;  // -1: wait for results (no game cadence)
     HMODULE dll = LoadLibraryA(argv[1]);
     if (!dll) return 1;
     auto create = (CreateFn)GetProcAddress(dll, "re_create");
@@ -73,9 +82,58 @@ int main(int argc, char** argv) {
     };
     int r = 0;
     float ms = 0.0f;
+    if (hold >= 0) {
+        // Warm up on the first position until a result lands (decides motion=auto too).
+        if (!stage(0)) return 1;
+        for (int tries = 0; tries < 1000 && r != 1; ++tries) {
+            if (motion(still, w, h, w*8) < 0 || submit_full(staging, w, h, pitch, bpp, 1) < 0) return 1;
+            r = poll_frame(frame.data(), size_t(w)*bpp, w, h, bpp, &ms);
+            std::this_thread::sleep_for(std::chrono::milliseconds(16));
+        }
+        // RE_FRAME_MS: the game frame period (default 16); shorter than the
+        // network time leaves the map several frames stale, as under load.
+        const char* env = getenv("RE_FRAME_MS");
+        const int period = env ? atoi(env) : 16;
+        const char* lag_env = getenv("RE_SHIM_LAG");
+        const int lag = lag_env ? atoi(lag_env) : 0;
+        int landed = 0, staged = 0;
+        for (int index = 1; index < frames + hold; ++index) {
+            int k = index - lag;
+            k = k < 0 ? 0 : (k > frames-1 ? frames-1 : k);
+            const bool moving = k != staged;
+            if (moving && !stage(k)) return 1;
+            staged = k;
+            if (motion(moving ? mv : still, w, h, w*8) < 0 || submit_full(staging, w, h, pitch, bpp, 1) < 0) {
+                fprintf(stderr, "submit failed: %s\n", error()); return 1;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(period));
+            r = poll_frame(frame.data(), size_t(w)*bpp, w, h, bpp, &ms);
+            if (r < 0) { fprintf(stderr, "poll failed: %s\n", error()); return 1; }
+            landed += r == 1;
+        }
+        printf("game cadence: %d moving frames, %d held, %d composed, shim lag %d\n", frames, hold, landed, lag);
+        typedef int (*ComposeMapFn)(void*, unsigned long long, int, int, float*);
+        auto compose_map = (ComposeMapFn)GetProcAddress(dll, "re_compose_map_device");
+        if (lag > 0 && compose_map && bpp == 8) {
+            void* device_map = nullptr;
+            std::vector<unsigned char> map(size_t(w)*h*8);
+            if (hipMalloc(&device_map, map.size()) != hipSuccess ||
+                compose_map(device_map, (unsigned long long)w*8, w, h, nullptr) != 1 ||
+                hipMemcpy(map.data(), device_map, map.size(), hipMemcpyDeviceToHost) != hipSuccess) {
+                fprintf(stderr, "map compose failed: %s\n", error()); return 1;
+            }
+            FILE* m = fopen((std::string(argv[4]) + ".map").c_str(), "wb");
+            if (!m) return 1;
+            unsigned int map_hdr[3] = {unsigned(w), unsigned(h), 8u};
+            fwrite(map_hdr, 4, 3, m);
+            fwrite(map.data(), 1, map.size(), m);
+            fclose(m);
+            (void)hipFree(device_map);
+        }
+    }
     // With a pan, each frame waits for the network so the result is several
     // frames stale when it lands (as in game); the last frame's output is kept.
-    for (int index = 0; index < frames; ++index) {
+    for (int index = 0; hold < 0 && index < frames; ++index) {
         if (!stage(index)) return 1;
         r = 0;
         for (int tries = 0; tries < 1000 && r != 1; ++tries) {

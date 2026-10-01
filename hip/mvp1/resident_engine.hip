@@ -313,6 +313,19 @@ __global__ void k_compose(const unsigned char* src, int pitch, int bpp, const fl
     }
 }
 
+// Luma mode, map output (re_compose_map_device): the carried map as RGBA16F
+// (ratio, Y_in, 0, 1) for a consumer that applies it to a later frame itself
+// (the shim's resolve, which runs on frame n while the engine has seen n-1
+// or n-2). Y_in < 0 marks pixels without an edit.
+__global__ void k_map_out(const float2* map, unsigned char* out, size_t out_pitch, int w, int h) {
+    int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= w*h) return;
+    int x = i % w, y = i / w;
+    float2 m = map[i];
+    const _Float16 v[4] = {(_Float16)m.x, (_Float16)m.y, (_Float16)0.0f, (_Float16)1.0f};
+    __builtin_memcpy(out + size_t(y)*out_pitch + size_t(x)*8, v, 8);
+}
+
 // Full mode (transfer=full): the frame (RGBA8, or RGBA16F when bpp is 8)
 // from the network's linear RGB (row stride W pixels), on the GPU; alpha is
 // the input's. powf may differ from the host's by an ulp, which can move a
@@ -856,7 +869,9 @@ struct Engine {
     // composed into device memory `out` (rows of out_pitch bytes) on the
     // high-priority compose stream; returns once it is written. The caller
     // holds the mutex. 1 composed, 0 nothing yet, -1 error.
-    int compose_into(unsigned char* out, size_t out_pitch, int w, int h, int bpp, size_t dst_pitch) {
+    // map_only: write the carried map (k_map_out, RGBA16F) instead of composing.
+    int compose_into(unsigned char* out, size_t out_pitch, int w, int h, int bpp, size_t dst_pitch,
+                     bool map_only = false) {
         if (!out || published < 0 || map_w != w || map_h != h || cur_w != w || cur_h != h || cur_bpp != bpp ||
             dst_pitch < size_t(w)*bpp || out_pitch < size_t(w)*bpp) return 0;
         try {
@@ -896,9 +911,13 @@ struct Engine {
                     warped_cur = 0; warped_frame = target; warped_source = published_generation;
                 }
             }
-            hipLaunchKernelGGL(k_compose, dim3((w*h+255)/256), dim3(256), 0, compose_stream,
-                               reinterpret_cast<const unsigned char*>(current->data), cur_pitch, bpp,
-                               map, options, out, out_pitch, w, h);
+            if (map_only)
+                hipLaunchKernelGGL(k_map_out, dim3((w*h+255)/256), dim3(256), 0, compose_stream,
+                                   map, out, out_pitch, w, h);
+            else
+                hipLaunchKernelGGL(k_compose, dim3((w*h+255)/256), dim3(256), 0, compose_stream,
+                                   reinterpret_cast<const unsigned char*>(current->data), cur_pitch, bpp,
+                                   map, options, out, out_pitch, w, h);
             HIP_CHECK(hipGetLastError());
             HIP_CHECK(hipStreamSynchronize(compose_stream));
         } catch (const std::exception& e) {
@@ -907,11 +926,11 @@ struct Engine {
         return 1;
     }
 
-    int compose_device(void* dst, size_t pitch, int w, int h, int bpp, float* device_ms) {
+    int compose_device(void* dst, size_t pitch, int w, int h, int bpp, float* device_ms, bool map_only = false) {
         std::lock_guard<std::mutex> lock(mutex);
         if (failed) return -1;
-        if (!options.luma) return 0;
-        int r = compose_into(reinterpret_cast<unsigned char*>(dst), pitch, w, h, bpp, pitch);
+        if (!options.luma || (map_only && bpp != 8)) return 0;
+        int r = compose_into(reinterpret_cast<unsigned char*>(dst), pitch, w, h, bpp, pitch, map_only);
         if (r == 1 && device_ms) *device_ms = last_ms;
         return r;
     }
@@ -1027,6 +1046,33 @@ __declspec(dllexport) int re_compose_device(void* dst, unsigned long long pitch,
     std::lock_guard<std::mutex> lock(g_mutex);
     if (!g_engine) return -1;
     return g_engine->compose_device(dst, size_t(pitch), width, height, bpp, device_ms);
+}
+
+// Luma mode: the carried ratio map instead of a composed frame, RGBA16F
+// (bpp must be 8) of (ratio, Y_in, 0, 1), Y_in < 0 = no edit. The map sits on
+// the newest submitted frame; re_luma_map_params says how to carry it further
+// and gate it. Returns 1 written, 0 nothing yet or not luma mode, -1 error.
+__declspec(dllexport) int re_compose_map_device(void* dst, unsigned long long pitch, int width, int height,
+                                                float* device_ms) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!g_engine) return -1;
+    return g_engine->compose_device(dst, size_t(pitch), width, height, 8, device_ms, true);
+}
+
+// For a map consumer: params[0..1] scale the staged motion vectors to frame
+// pixels (prev = cur + mv*scale; 0 when motion is off or not detected yet),
+// params[2] = 1/gate, params[3] = 1 in luma mode. Returns 1, or -1.
+__declspec(dllexport) int re_luma_map_params(float* params) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!g_engine || !params) return -1;
+    auto& e = *g_engine;
+    std::lock_guard<std::mutex> inner(e.mutex);
+    const bool on = e.options.motion != 0;
+    params[0] = !on ? 0.0f : e.options.motion == 2 ? e.motion_mx : float(e.options.motion_sign);
+    params[1] = !on ? 0.0f : e.options.motion == 2 ? e.motion_my : float(e.options.motion_sign);
+    params[2] = 1.0f / e.options.gate;
+    params[3] = e.options.luma ? 1.0f : 0.0f;
+    return 1;
 }
 
 // motion=auto: the detected convention, -1 not yet, 0 frame pixels, 1 frame

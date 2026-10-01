@@ -136,6 +136,10 @@ struct State {
     int (*EngineMotion)(const void*, int, int, int) = nullptr;  // optional (re_motion)
     int (*EngineComposeDevice)(void*, unsigned long long, int, int, int, float*) = nullptr;  // optional
     int (*EngineMotionMode)() = nullptr;  // optional (re_motion_mode)
+    int (*EngineComposeMap)(void*, unsigned long long, int, int, float*) = nullptr;  // optional
+    int (*EngineMapParams)(float*) = nullptr;  // optional (re_luma_map_params)
+    bool mapActive = false;  // the last preview wrote the ratio map, not a frame
+    float mapParams[4] = {};
     int (*EnginePollFrame)(unsigned char*, unsigned long long, int, int, int, float*) = nullptr;
     bool engineFrameReady = false;
     int (*EnginePoll)(int, unsigned char*, unsigned char*, float*) = nullptr;
@@ -830,6 +834,9 @@ static bool EngineReady() {
     s.EngineComposeDevice = (int (*)(void*, unsigned long long, int, int, int, float*))
         GetProcAddress(s.engineDll, "re_compose_device");
     s.EngineMotionMode = (int (*)())GetProcAddress(s.engineDll, "re_motion_mode");
+    s.EngineComposeMap = (int (*)(void*, unsigned long long, int, int, float*))
+        GetProcAddress(s.engineDll, "re_compose_map_device");
+    s.EngineMapParams = (int (*)(float*))GetProcAddress(s.engineDll, "re_luma_map_params");
     s.EnginePollFrame = (int (*)(unsigned char*, unsigned long long, int, int, int, float*))
         GetProcAddress(s.engineDll, "re_poll_frame");
     if (cfg.residentEngineFull && (!s.EngineSubmitFull || !s.EnginePollFrame)) {
@@ -969,6 +976,26 @@ bool CandidatePreview() {
             s.engineFrameReady = false;
         }
         float deviceMs = 0.0f;
+        s.mapActive = false;
+        if (cfg.residentEngineMap && s.EngineComposeMap && s.EngineMapParams && s.bpp == 8) {
+            // Luma mode: the ratio map itself; the resolve applies it to its own frame.
+            const int c = s.EngineComposeMap(s.ptrOut, (unsigned long long)s.pitch, (int)s.w, (int)s.h, &deviceMs);
+            if (c < 0) {
+                LOGE("hip: resident engine disabled: %s", s.EngineError());
+                s.engineState = -1;
+                return false;
+            }
+            if (c == 1 && s.EngineMapParams(s.mapParams) == 1 && s.mapParams[3] > 0.0f) {
+                s.mapActive = true;
+                if ((s.enginePreviews++ % 120) == 0)
+                    LOGI("hip: resident engine map %llu at %ux%u (%llu frames, %llu submissions, %.3f ms device;"
+                         " motion scale %g,%g, gate 1/%g)",
+                         (unsigned long long)s.enginePreviews, s.w, s.h, (unsigned long long)s.engineFrames,
+                         (unsigned long long)s.engineSubmits, deviceMs, s.mapParams[0], s.mapParams[1],
+                         s.mapParams[2]);
+                return true;  // ptrOut holds the map
+            }
+        }
         if (s.EngineComposeDevice) {
             // Composed straight into the model staging on the engine's
             // high-priority stream: no host round trip on the render thread.
@@ -10836,6 +10863,10 @@ ID3D12Resource* StagingOut() { return S().bufOut.Get(); }
 ID3D12Resource* StagingMotion() { return S().bufMv.Get(); }
 UINT64 StagingMotionRowPitch() { return S().mvPitch; }
 void SetMotionStaged(bool staged) { S().motionStaged = staged; }
+bool LumaMap(float params[4]) {
+    for (int i = 0; i < 4; ++i) params[i] = S().mapParams[i];
+    return S().mapActive;
+}
 bool Usable() { return S().usable; }
 bool SelfTest() { return SelfTestImpl(); }
 bool ChainTest() { return ChainTestImpl(); }
@@ -10883,6 +10914,7 @@ bool HipC32blkBlockTest() { return hipb::C32blkBlockTestImpl(); }
 void HipFeBlockView() { hipb::FeBlockView(); }
 bool HipFeBlockStaged() { return hipb::FeBlockStaged(); }
 bool HipCandidatePreview() { return hipb::CandidatePreview(); }
+bool HipLumaMap(float params[4]) { return hipb::LumaMap(params); }
 bool HipResidentEngineSubmit() { return hipb::ResidentEngineSubmit(); }
 bool HipCandidateInputCapture() { return hipb::CandidateInputCapture(); }
 UINT64 HipStagingRowPitch() { return hipb::StagingRowPitch(); }
