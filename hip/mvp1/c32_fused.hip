@@ -270,9 +270,10 @@ __global__ __launch_bounds__(256) void k_c32_wmma(const float* in, const float* 
                                                   const _Float16* __restrict__ hw, float scale,
                                                   float* raw_out, float* quant_out, C32Io io) {
     using namespace c32w;
-    // H: FP8 hidden; after the FFN F(ffn) at [0,2048) then F(context) there,
-    // probabilities at [4096,8192). Q: F(input) at [0,2048), then qkv.
-    __shared__ _Float16 H[8192];
+    // LDS kept small for occupancy (about 21 KB). H: one 64-column chunk of
+    // the FP8 hidden, then F(ffn) at [0,2048), then the probabilities.
+    // Q: F(input) at [0,2048), then qkv, then F(context) in Q's columns.
+    __shared__ _Float16 H[4096];
     __shared__ _Float16 Q[64*96];
     __shared__ float inv[128];
     __shared__ float den[64];
@@ -285,7 +286,7 @@ __global__ __launch_bounds__(256) void k_c32_wmma(const float* in, const float* 
     __syncthreads();
     auto input = [&](int t, int c) { int b = in_base[t]; return b < 0 ? 0.0f : in[b + io.channel(c)]; };
     const float *g1 = dw+16385, *g2 = dw+16417, *bias = dw+12288;
-    _Float16* sc = H+4096;
+    _Float16* sc = H;
 #ifdef C32F_PROF
     __shared__ unsigned long long marks[16];
     if (tid < 16) marks[tid] = 0;
@@ -308,41 +309,44 @@ __global__ __launch_bounds__(256) void k_c32_wmma(const float* in, const float* 
     }
     __syncthreads();
     C32F_MARK(1);
-    {   // Expand (K=32) and gate: tiles 4x8, wave -> row tile, 4 column tiles.
-        const int rt = wave%4;
-        for (int j = 0; j < 4; ++j) {
-            const int ct = wave/4*4+j;
-            FC c; slice<FBc>(c, Q+rt*16*32, 32, hw+ct*16*32, 32, 16);
-            for (int e = 0; e < 8; ++e) {
-                float a = c32f_h(c.x[e]);
-                float gate = fminf(4.0f, fmaxf(-4.0f, a));
-                float inner = c32f_h(fabsf(gate)*(-0.055908203125f)+0.447265625f);
-                float poly = c32f_h(gate*inner+0.89453125f);
-                H[(rt*16+lr+e)*128+ct*16+lc] = split512_to_half(h70_f(c32f_h(a*poly)));
-            }
-        }
-    }
-    __syncthreads();
-    C32F_MARK(2);
     // FFN output (half), kept in registers: the projection tile of this wave
     // (rt = wave/2, ct = wave%2) covers the same outputs in the same lanes.
     float ffn[8];
-    {   // FFN contract (K=128, four slices) with residual: tiles 4x2.
+    for (int e = 0; e < 8; ++e) {
+        int r = wave/2*16+lr+e, c = wave%2*16+lc;
+        ffn[e] = c32f_h(input(r, c)*g1[c]);
+    }
+    // The hidden in two 64-column chunks, each followed by its two FFN
+    // slices (K order is unchanged: slices 0, 1, then 2, 3).
+    for (int h = 0; h < 2; ++h) {
+        {   // Expand (K=32) and gate: 16 tiles of this chunk, 2 per wave.
+            const int rt = wave%4;
+            for (int j = 0; j < 2; ++j) {
+                const int ct = wave/4*2+j;
+                FC c; slice<FBc>(c, Q+rt*16*32, 32, hw+(4*h+ct)*16*32, 32, 16);
+                for (int e = 0; e < 8; ++e) {
+                    float a = c32f_h(c.x[e]);
+                    float gate = fminf(4.0f, fmaxf(-4.0f, a));
+                    float inner = c32f_h(fabsf(gate)*(-0.055908203125f)+0.447265625f);
+                    float poly = c32f_h(gate*inner+0.89453125f);
+                    H[(rt*16+lr+e)*64+ct*16+lc] = split512_to_half(h70_f(c32f_h(a*poly)));
+                }
+            }
+        }
+        __syncthreads();
+        C32F_MARK(2);
+        {   // FFN contract slices 2h and 2h+1 with the residual already in ffn.
+            const int rt = wave/2, ct = wave%2;
+            for (int s = 0; s < 2; ++s) {
+                FC part; slice<FBc>(part, H+rt*16*64+s*32, 64, hw+4096+ct*16*128+(2*h+s)*32, 128, 16);
+                for (int e = 0; e < 8; ++e) ffn[e] = c32f_h(ffn[e]+part.x[e]);
+            }
+        }
+        __syncthreads();  // other waves read this hidden chunk until here
+    }
+    {
         const int rt = wave/2, ct = wave%2;
-        float* acc = ffn;
-        for (int e = 0; e < 8; ++e) {
-            int r = rt*16+lr+e, c = ct*16+lc;
-            acc[e] = c32f_h(input(r, c)*g1[c]);
-        }
-        for (int k0 = 0; k0 < 128; k0 += 32) {
-            FC part; slice<FBc>(part, H+rt*16*128+k0, 128, hw+4096+ct*16*128+k0, 128, 16);
-            for (int e = 0; e < 8; ++e) acc[e] = c32f_h(acc[e]+part.x[e]);
-        }
-        __syncthreads();  // other waves read H (hidden) until here
-        for (int e = 0; e < 8; ++e) {
-            int at = (rt*16+lr+e)*32+ct*16+lc;
-            H[at] = split512_to_half(h70_f(acc[e]));
-        }
+        for (int e = 0; e < 8; ++e) H[(rt*16+lr+e)*32+ct*16+lc] = split512_to_half(h70_f(ffn[e]));
     }
     __syncthreads();
     C32F_MARK(4);
@@ -421,20 +425,20 @@ __global__ __launch_bounds__(256) void k_c32_wmma(const float* in, const float* 
     }
     __syncthreads();
     C32F_MARK(11);
-    {   // Context (two 32-key slices) -> F(context) in H[0,2048): tiles 4x2.
+    {   // Context (two 32-key slices) -> F(context) in Q's columns: tiles 4x2.
         const int rt = wave/2, ct = wave%2;
         float acc[8] = {};
         for (int k0 = 0; k0 < 64; k0 += 32) {
             FC part; slice<FBr>(part, sc+rt*16*64+k0, 64, Q+64+k0*96+ct*16, 96, 16*96);
             for (int e = 0; e < 8; ++e) acc[e] = c32f_h(acc[e]+part.x[e]);
         }
-        for (int e = 0; e < 8; ++e) H[(rt*16+lr+e)*32+ct*16+lc] = split512_to_half(h70_f(acc[e]));
+        for (int e = 0; e < 8; ++e) Q[(rt*16+lr+e)*96+ct*16+lc] = split512_to_half(h70_f(acc[e]));
     }
     __syncthreads();
     C32F_MARK(12);
     {   // Projection: double-precision residual add, single half rounding.
         const int rt = wave/2, ct = wave%2;
-        FC c; slice<FBc>(c, H+rt*16*32, 32, hw+11264+ct*16*32, 32, 16);
+        FC c; slice<FBc>(c, Q+rt*16*96, 96, hw+11264+ct*16*32, 32, 16);
         for (int e = 0; e < 8; ++e) {
             int r = rt*16+lr+e, col = ct*16+lc;
             float residual = c32f_h(ffn[e]*g2[col]);
