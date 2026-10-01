@@ -55,8 +55,11 @@ __global__ __launch_bounds__(256) void k_wmma_gemm(
     using namespace rocwmma;
     constexpr int WR = BT/16/FM, WC = BO/16/FN;
     static_assert(WR*WC == 8, "8 waves per block");
-    __shared__ __attribute__((aligned(16))) h16 xs[BT*LDS_LD];
-    __shared__ __attribute__((aligned(16))) h16 ws[BO*LDS_LD];
+    // Double-buffered slices: slice k+1 is fetched into registers while
+    // slice k is multiplied, then stored to the other buffer.
+    __shared__ __attribute__((aligned(16))) h16 xs[2][BT*LDS_LD];
+    __shared__ __attribute__((aligned(16))) h16 ws[2][BO*LDS_LD];
+    constexpr int XN = (BT*KS + 255)/256, WN = (BO*(KS/8) + 255)/256;
     const int tid = threadIdx.x, wave = tid/32, lane = tid%32;
     const int lr = lane/16*8, lc = lane%16;
     const int t0 = blockIdx.y*BT, o0 = blockIdx.x*BO;
@@ -79,23 +82,47 @@ __global__ __launch_bounds__(256) void k_wmma_gemm(
                     else acc[i][j][e] = P::half(product);
                 }
             }
+    float xr[XN];
+    uint4 wr[WN];
+    auto fetch = [&](int k0) {
+        for (int j = 0; j < XN; ++j) {
+            int i = tid + j*256;
+            if (i < BT*KS) {
+                int row = i / KS, col = i % KS, t = t0+row;
+                xr[j] = t < T ? P::load(X[size_t(t)*ldx+k0+col]) : 0.0f;
+            }
+        }
+        for (int j = 0; j < WN; ++j) {
+            int v = tid + j*256;
+            wr[j] = uint4{0,0,0,0};
+            if (v < BO*(KS/8)) {
+                int row = v / (KS/8), piece = v % (KS/8), o = o0+row;
+                if (o < O) wr[j] = *reinterpret_cast<const uint4*>(W + size_t(o)*K + k0 + piece*8);
+            }
+        }
+    };
+    auto stash = [&](int b) {
+        for (int j = 0; j < XN; ++j) {
+            int i = tid + j*256;
+            if (i < BT*KS) xs[b][(i/KS)*LDS_LD + i%KS] = split512_to_half(xr[j]);
+        }
+        for (int j = 0; j < WN; ++j) {
+            int v = tid + j*256;
+            if (v < BO*(KS/8)) *reinterpret_cast<uint4*>(ws[b] + (v/(KS/8))*LDS_LD + (v%(KS/8))*8) = wr[j];
+        }
+    };
+    fetch(kbegin);
+    stash(0);
+    __syncthreads();
+    int cur = 0;
     for (int k0 = kbegin; k0 < kend; k0 += KS) {
-        for (int i = tid; i < BT*KS; i += 256) {
-            int row = i / KS, col = i % KS, t = t0+row;
-            xs[row*LDS_LD+col] = split512_to_half(t < T ? P::load(X[size_t(t)*ldx+k0+col]) : 0.0f);
-        }
-        for (int v = tid; v < BO*(KS/8); v += 256) {
-            int row = v / (KS/8), part = v % (KS/8), o = o0+row;
-            uint4 value = {0,0,0,0};
-            if (o < O) value = *reinterpret_cast<const uint4*>(W + size_t(o)*K + k0 + part*8);
-            *reinterpret_cast<uint4*>(ws + row*LDS_LD + part*8) = value;
-        }
-        __syncthreads();
+        const bool more = k0+KS < kend;
+        if (more) fetch(k0+KS);  // in flight while this slice is multiplied
         fragment<matrix_a,16,16,16,h16,row_major> a[2][FM];
         fragment<matrix_b,16,16,16,h16,col_major> b[2][FN];
         for (int h = 0; h < 2; ++h) {
-            for (int i = 0; i < FM; ++i) load_matrix_sync(a[h][i], xs + (wt-t0+i*16)*LDS_LD + h*16, LDS_LD);
-            for (int j = 0; j < FN; ++j) load_matrix_sync(b[h][j], ws + (wo-o0+j*16)*LDS_LD + h*16, LDS_LD);
+            for (int i = 0; i < FM; ++i) load_matrix_sync(a[h][i], xs[cur] + (wt-t0+i*16)*LDS_LD + h*16, LDS_LD);
+            for (int j = 0; j < FN; ++j) load_matrix_sync(b[h][j], ws[cur] + (wo-o0+j*16)*LDS_LD + h*16, LDS_LD);
         }
         for (int i = 0; i < FM; ++i)
             for (int j = 0; j < FN; ++j) {
@@ -114,7 +141,9 @@ __global__ __launch_bounds__(256) void k_wmma_gemm(
                         acc[i][j][e] = 0.0f;
                     }
         }
+        if (more) stash(cur ^ 1);
         __syncthreads();
+        cur ^= 1;
     }
     for (int i = 0; i < FM; ++i)
         for (int j = 0; j < FN; ++j)

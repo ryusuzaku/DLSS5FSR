@@ -10,9 +10,22 @@
 // bias [head][64][64], context [token][C]. Needs split512_attention.hip and
 // rocwmma (tiled_gemm.hip) first.
 
+// Where window tokens live: window order (hwc = 0, row win*64 + t), or an
+// HWC image (qkv rows y*width + x, context written there) through a shifted
+// 8x8 partition, padding tokens reading zero qkv (what the gather produced)
+// and not written. Extents above 4 only (no wrap-around).
+struct WindowIo {
+    int hwc = 0, width = 0, height = 0, px = 0, py = 0, pw = 0;
+    __device__ long long row(int win, int t) const {
+        if (!hwc) return (long long)win*64 + t;
+        int x = (win % (pw/8))*8 + t%8 - px, y = (win / (pw/8))*8 + t/8 - py;
+        return x >= 0 && x < width && y >= 0 && y < height ? (long long)y*width + x : -1;
+    }
+};
+
 __global__ __launch_bounds__(256) void k_split512_attention_wmma(
         const float* __restrict__ qkv, const float* __restrict__ scales, const float* __restrict__ bias,
-        float* context, int channels) {
+        float* context, int channels, WindowIo io) {
     using namespace rocwmma;
     using h16 = float16_t;
     constexpr int LD = 40, LS = 72;  // padded LDS rows (halves)
@@ -22,12 +35,12 @@ __global__ __launch_bounds__(256) void k_split512_attention_wmma(
     const int win = blockIdx.x, head = blockIdx.y;
     const int tid = threadIdx.x, wave = tid/32, lane = tid%32;
     const int lr = lane/16*8, lc = lane%16;
-    const size_t row0 = size_t(win)*64;
     // Raw qkv is half-valued (RAW GEMM epilogue), so half storage is exact.
     for (int i = tid; i < 3*64*32; i += 256) {
         int m = i/2048, t = i/32%64, c = i%32;
         h16* dst = m == 0 ? qs : m == 1 ? ks : vs;
-        dst[t*LD+c] = split512_to_half(qkv[(row0+t)*3*channels + m*channels + head*32 + c]);
+        long long r = io.row(win, t);
+        dst[t*LD+c] = split512_to_half(r < 0 ? 0.0f : qkv[r*3*channels + m*channels + head*32 + c]);
     }
     __syncthreads();
     if (tid < 128) {
@@ -119,7 +132,8 @@ __global__ __launch_bounds__(256) void k_split512_attention_wmma(
         }
         for (int e = 0; e < 8; ++e) {
             int q = rt*16+lr+e, c = ct*16+lc;
-            context[(row0+q)*channels + head*32 + c] = split512_fp8(acc[e]);
+            long long r = io.row(win, q);
+            if (r >= 0) context[r*channels + head*32 + c] = split512_fp8(acc[e]);
         }
     }
 }
@@ -127,11 +141,13 @@ __global__ __launch_bounds__(256) void k_split512_attention_wmma(
 namespace c512_resident {
 // Launches the fused attention unless exact_math; false means "run the
 // reference kernels". tokens: whole 64-token windows in window order.
+// io (optional): qkv and context in HWC order instead (tokens = the padded
+// window token count, which sets the grid).
 inline bool fused_attention(const float* qkv, const float* scales, const float* bias,
-                            float* context, int tokens, int channels) {
+                            float* context, int tokens, int channels, const WindowIo* io = nullptr) {
     if (exact_math || tokens % 64 || channels % 32) return false;
     hipLaunchKernelGGL(k_split512_attention_wmma, dim3(tokens/64, channels/32), dim3(256), 0, stream,
-                       qkv, scales, bias, context, channels);
+                       qkv, scales, bias, context, channels, io ? *io : WindowIo());
     HIP_CHECK(hipGetLastError());
     if (launch_hook) launch_hook("k_split512_attention_wmma");
     return true;

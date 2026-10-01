@@ -129,11 +129,12 @@ public:
             if (small) {
                 C512_LAUNCH(k_split512_pre, n, input, w.matrix.data, pre.data, tokens);
             } else {
-                tiled::gemm<tiled::Split,tiled::RAW,false>(c512_resident::stream, input, 512, w.matrix.data, 512, nullptr, 0, nullptr,
-                    pre.data, nullptr, 512, tokens, 512);
+                // FP8 epilogue = k_split512_quant of the raw product (kept for checks).
+                tiled::gemm<tiled::Split,tiled::FP8,false>(c512_resident::stream, input, 512, w.matrix.data, 512, nullptr, 0, nullptr,
+                    mixed.data, verify ? pre.data : nullptr, 512, tokens, 512);
             }
             if (!check(w.dir, "expected", pre.data, n, verify)) return false;
-            C512_LAUNCH(k_split512_quant, n, pre.data, mixed.data, int(n));
+            if (small) C512_LAUNCH(k_split512_quant, n, pre.data, mixed.data, int(n));
             // Eight groups: 64 -> 256 expand with gate, 256 -> 64 contract.
             if (small) {
                 C512_LAUNCH(k_split512_expand, size_t(tokens)*2048, mixed.data, w.expand.data, hidden.data, tokens);
@@ -154,6 +155,22 @@ public:
                     w.skip.data, feature.data, nullptr, 512, tokens, 512);
             }
             if (!check(w.dir, "feature", feature.data, n, verify)) return false;
+            if (!verify && !small && !c512_resident::exact_math && width > 4 && height > 4) {
+                // qkv on the HWC tokens; the fused attention gathers its
+                // windows (zero rows for padding) and writes the context to
+                // HWC: no gather or scatter pass.
+                tiled::gemm<tiled::Split,tiled::RAW,false>(c512_resident::stream, feature.data, 512, w.qkv.data, 512, nullptr, 0, nullptr,
+                    qkv.data, nullptr, 1536, tokens, 1536);
+                WindowIo io;
+                io.hwc = 1; io.width = width; io.height = height; io.px = px; io.py = py;
+                io.pw = ((width+px+7)/8)*8;
+                c512_resident::fused_attention(qkv.data, w.scales.data, w.bias.data, crop.data, wt, 512, &io);
+                tiled::gemm<tiled::Split,tiled::FP8,true>(c512_resident::stream, crop.data, 512, w.final.data, 512, feature.data, 512,
+                    w.final_skip.data, output, raw_output.data, 512, tokens, 512);
+                HIP_CHECK(hipGetLastError());
+                std::swap(input, output);
+                continue;
+            }
             C512_LAUNCH(k_split512_window_gather, wn, feature.data, window.data, width, height, w.shift);
             if (!check(w.dir, "feature_window", window.data, wn, verify)) return false;
             if (small) {
