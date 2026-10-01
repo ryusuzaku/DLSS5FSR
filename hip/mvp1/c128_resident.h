@@ -29,7 +29,7 @@ inline bool check(const std::string& dir, const char* name, const float* device,
 
 class Prefix {
     static int checked(int w, int h) {
-        if (w <= 0 || h <= 0 || w % 8 || h % 8) throw std::invalid_argument("block56 input must be a positive multiple of 8");
+        if (w <= 0 || h <= 0 || w % 4 || h % 4) throw std::invalid_argument("block56 input must be a positive multiple of 4");
         return w;
     }
     int width, height;
@@ -177,7 +177,7 @@ public:
 // Encoder14 raw body -> rounded 2x2 pool -> FP8 C256 projection.
 class Downsample {
     static int checked(int w,int h) {
-        if (w <= 0 || h <= 0 || w % 16 || h % 16) throw std::invalid_argument("downsample14 extent must be a positive multiple of 16");
+        if (w <= 0 || h <= 0 || w % 2 || h % 2) throw std::invalid_argument("downsample14 extent must be a positive multiple of 2");
         return w;
     }
     int width,height;

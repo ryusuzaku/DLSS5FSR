@@ -11,8 +11,8 @@ using c512_resident::IndexMap;
 using c512_resident::traffic;
 
 class Entry {
-    static int checked_width(int width, int height) {
-        if (width <= 0 || height <= 0 || (width*height) % 16)
+    static int checked_width(int width, int height, bool mapped = false) {
+        if (width <= 0 || height <= 0 || (!mapped && (width*height) % 16))
             throw std::invalid_argument("resident decoder39 needs a token count that is a multiple of 16");
         return width;
     }
@@ -39,7 +39,7 @@ public:
         main(n), projected(size_t(tokens)*512), output(skip_n) {}
     // Weights from the fixture, inverse map computed for this extent.
     Entry(int w, int h, const std::string& fixture, const std::vector<int32_t>& inverse_map) :
-        width(checked_width(w, h)), height(h), tokens(width*height), n(size_t(tokens)*1024),
+        width(checked_width(w, h, true)), height(h), tokens(width*height), n(size_t(tokens)*1024),
         skip_n(size_t(tokens)*4*512), dir(fixture), inverse(inverse_map),
         weights(dir, "weights", 512*1024), scale(dir, "scale", 512),
         main(n), projected(size_t(tokens)*512), output(skip_n) {

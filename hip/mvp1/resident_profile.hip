@@ -1,5 +1,5 @@
 // Per-stage GPU timing of the resident network at a chosen extent.
-// Usage: resident_profile config.txt capture.bin [repeats]
+// Usage: resident_profile config.txt capture.bin [repeats] [compact]
 // Compiles the engine's own Network so the measured code is the shipped code.
 #include "resident_engine.hip"
 #include <cstdio>
@@ -23,7 +23,7 @@ int main(int argc, char** argv) {
         memcpy(f, bytes.data()+8, sizeof(f));
         int fw = int(f[0]), fh = int(f[1]), bpp = int(f[2]), pitch = int(f[3]);
         int W = 0, H = 0;
-        network_extent(fw, fh, W, H);
+        network_extent(fw, fh, W, H, argc > 4 && std::string(argv[4]) == "compact");
         hipStream_t stream;
         HIP_CHECK(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking));
         c512_resident::stream = stream;
@@ -45,8 +45,8 @@ int main(int argc, char** argv) {
             {"gather", [&]{ auto head = net.chain->head_view();
                 hipLaunchKernelGGL(k_vit_bridge_gather, dim3((net.hn+255)/256), dim3(256), 0, stream,
                                    head.data, net.map->data, net.bridge->data, int(net.hn)); return true; }},
-            {"ViT31-38", [&]{ return net.vit->run_from_device({net.bridge->data,net.hn}); }},
-            {"decoder39 entry", [&]{ return net.entry->run_from_device(net.vit->final_view(), net.chain->final_view()); }},
+            {"ViT31-38", [&]{ return net.vit->run_from_device({net.bridge->data,net.bridge->count}); }},
+            {"decoder39 entry", [&]{ return net.entry->run_from_device({net.vit->final_view().data,net.hn}, net.chain->final_view()); }},
             {"decoder40-47 C512", [&]{ return net.decoder->run_from_device(net.entry->final_view()); }},
             {"prefix48", [&]{ return net.prefix48->run_from_device(net.decoder->final_view(), net.encoder22->final_view()); }},
             {"decoder48-55 C256", [&]{ return net.c256->run_from_device(net.prefix48->final_view()); }},

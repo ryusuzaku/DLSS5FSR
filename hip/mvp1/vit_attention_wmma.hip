@@ -68,7 +68,9 @@ __global__ __launch_bounds__(256) void k_vit_attention_wmma(const float* __restr
 // the numerator's 32-key slices are half-accumulated in key order, so no
 // running-max rescaling is needed (the exponent transform is clamped). Scores
 // and the numerator are WMMA products of FP8 operands (exact products, fp32
-// sums inside a 32-product slice).
+// sums inside a 32-product slice). Keys at or after `valid` (padding tokens
+// of an extent whose token count is not a multiple of 64) get a zero
+// exponent: they drop out of the denominator and the numerator.
 __device__ inline float vit_inverse_norm(const float* raw) {
     float ordered[32];
     for (int j = 0; j < 32; ++j) ordered[j] = raw[vit_qkv_inverse_order(j)];
@@ -83,7 +85,7 @@ __device__ inline float vit_inverse_norm(const float* raw) {
 
 __global__ __launch_bounds__(256) void k_vit_attention_fused(const float* __restrict__ projected,
                                                              const float* __restrict__ scales,
-                                                             float* output, int tokens) {
+                                                             float* output, int tokens, int valid) {
     using namespace rocwmma;
     using h16 = float16_t;
     constexpr int LD = 40, LS = 72;
@@ -139,6 +141,7 @@ __global__ __launch_bounds__(256) void k_vit_attention_fused(const float* __rest
                     unsigned short bits; __builtin_memcpy(&bits, &hc, 2);
                     bits = (unsigned short)((unsigned(bits)<<4)+0x4000u);
                     __builtin_memcpy(&hc, &bits, 2);
+                    if (k0+ct*16+lc >= valid) hc = _Float16(0.0f);
                     ps[(rt*16+lr+e)*LS + ct*16+lc] = hc;
                 }
             }

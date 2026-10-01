@@ -31,7 +31,7 @@ class Chain {
             throw std::invalid_argument("resident ViT requires 16 or a multiple of 64 tokens and eight blocks");
         return tokens;
     }
-    int tokens;
+    int tokens, valid;  // valid < tokens: padding tokens, masked as keys (fast path only)
     size_t n, sn;
     Buffer ping, pong, expanded, hidden, contract, projected, qkv, scores, exponents, attention;
     std::vector<std::unique_ptr<Weights>> weights;
@@ -46,8 +46,9 @@ class Chain {
 
 public:
     size_t comparisons = 0;
-    Chain(int count, const std::vector<std::string>& blocks) :
-        tokens(checked_tokens(count, blocks.size())), n(size_t(tokens)*1024),
+    Chain(int count, const std::vector<std::string>& blocks, int valid_tokens = 0) :
+        tokens(checked_tokens(count, blocks.size())), valid(valid_tokens > 0 ? valid_tokens : count),
+        n(size_t(tokens)*1024),
         sn(size_t(32)*tokens*tokens), ping(n), pong(n), expanded(4*n), hidden(4*n),
         contract(n), projected(3*n), qkv(3*n), scores(sn), exponents(sn), attention(n) {
         for (const auto& dir : blocks) weights.emplace_back(new Weights(dir));
@@ -84,10 +85,11 @@ public:
                 HIP_CHECK(hipGetLastError());
             }
             const bool fused = tokens % 64 == 0 && !c512_resident::exact_math && !verify;
+            if (valid < tokens && !fused) return false;  // only the fused attention masks padding
             if (fused) {
                 // Normalize, scores, exponents and attention in one launch.
                 hipLaunchKernelGGL(k_vit_attention_fused, dim3(tokens/64, 32), dim3(256), 0, c512_resident::stream,
-                                   projected.data, w.scales.data, attention.data, tokens);
+                                   projected.data, w.scales.data, attention.data, tokens, valid);
                 HIP_CHECK(hipGetLastError());
                 if (c512_resident::launch_hook) c512_resident::launch_hook("k_vit_attention_fused");
             } else {

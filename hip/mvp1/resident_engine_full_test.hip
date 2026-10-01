@@ -82,12 +82,14 @@ int main(int argc, char** argv) {
     float ms = 0;
     if (submit(device, cut, cut, cut*bpp, bpp) != 1 ||
         wait([&] { return poll(0, rgba8.data(), rgba16.data(), &ms); }) != 1 ||
-        latest(0, crop_native.data(), crop_color.data()) != 1 || latest(1, crop_public.data(), nullptr) != 1) {
+        wait([&] { return latest(0, crop_native.data(), crop_color.data()); }) != 1 ||
+        wait([&] { return latest(1, crop_public.data(), nullptr); }) != 1) {
         fprintf(stderr, "crop run failed: %s\n", error()); return 1;
     }
     if (submit_full(device, cut, cut, cut*bpp, bpp, 0) != 1 ||
         wait([&] { return poll_frame(frame.data(), size_t(cut)*bpp, cut, cut, bpp, &ms); }) != 1 ||
-        latest(0, full_native.data(), full_color.data()) != 1 || latest(1, full_public.data(), nullptr) != 1) {
+        wait([&] { return latest(0, full_native.data(), full_color.data()); }) != 1 ||
+        wait([&] { return latest(1, full_public.data(), nullptr); }) != 1) {
         fprintf(stderr, "full 256 run failed: %s\n", error()); return 1;
     }
     for (auto item : {std::make_pair("colour", std::make_pair(&crop_color, &full_color)),
@@ -115,7 +117,7 @@ int main(int argc, char** argv) {
     int ew = 0, eh = 0;
     extent(&ew, &eh);
     std::vector<float> rgb(size_t(ew)*eh*3);
-    latest(0, rgb.data(), nullptr);
+    wait([&] { return latest(0, rgb.data(), nullptr); });
     size_t nonfinite = 0;
     double mean = 0;
     for (float v : rgb) { if (!std::isfinite(v)) ++nonfinite; else mean += v; }

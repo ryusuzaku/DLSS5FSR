@@ -769,3 +769,12 @@ the engine writes the full frame (the input's alpha is always kept):
   the frame by well under one 8-bit level; the public gain (1.0) carries
   the network's full change.
 
+- `extent=compact` (fast path only) runs the network at the frame (or its
+  `scale` downscale) rounded up to multiples of 64 instead of the smallest
+  extent whose ViT token count is 16 or a multiple of 64. The ViT is then
+  padded to a multiple of 64 tokens whose keys get a zero exponent, so they
+  drop out of every softmax (the frame is byte-identical whatever the
+  padding tokens hold). In Cyberpunk at `scale=0.5` (496x310) this is
+  512x320 instead of 512x512: 6.6 instead of 8.0 ms network time. The
+  result differs from the padded extent about as much as from a larger
+  real context, since the ViT's global attention sees the whole extent.

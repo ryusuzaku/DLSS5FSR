@@ -5,7 +5,8 @@
 //   crop mode (re_submit/re_poll): the validated 256x256 centre-crop preview.
 //   full mode (re_submit_full/re_poll_frame): the whole frame, edge-padded to
 //   the smallest network extent (multiples of 64 whose ViT token count is 16
-//   or a multiple of 64), written back at the frame's own size and format.
+//   or a multiple of 64; with extent=compact any multiple of 64, the ViT then
+//   padded with masked tokens), written back at the frame's own size and format.
 // Arithmetic is the resident path validated by the harness and server checks.
 // Failures throw inside the engine and are reported through re_last_error;
 // nothing here may exit the process.
@@ -131,6 +132,7 @@ unsigned char srgb8(float linear) { return (unsigned char)nearbyintf(srgb_encode
 //                  (0.25..1) and upsample its ratio map (about S^2 the work)
 struct OutputOptions {
     int luma = 0, denoise = 0, motion = 2, motion_sign = 1;  // motion 2 = auto
+    int compact = 0;  // extent=compact: smallest multiple-of-64 extent (fast path only)
     float scale = 1.0f;
     float limit = 0.0f, smooth = 0.0f, sigma = 0.02f, strength = 1.0f, gate = 0.03f;
     int gain = -1;
@@ -338,8 +340,10 @@ __global__ void k_encode_frame(const float* linear, const unsigned char* src, in
 // Head -> ViT logical token/channel map (tools/audit_native_vit_logical_map.py).
 std::vector<int32_t> vit_gather_map(int tokens) {
     std::vector<int32_t> map(size_t(tokens)*1024);
+    // Tokens past the last whole group of 16 (compact extents) keep raster
+    // order: the ViT has no positional terms, so only the channel map matters.
     for (int t = 0; t < tokens; ++t) {
-        int raster = (t & ~15) | ((t & 1) << 3) | ((t & 14) >> 1);
+        int raster = t < tokens/16*16 ? (t & ~15) | ((t & 1) << 3) | ((t & 14) >> 1) : t;
         for (int c = 0; c < 1024; ++c) {
             int channel = (c & ~31) | ((c & 1) << 1) | ((c & 2) >> 1) | ((c & 4) << 2) | ((c & 24) >> 1);
             map[size_t(t)*1024+c] = raster*1024 + channel;
@@ -348,9 +352,11 @@ std::vector<int32_t> vit_gather_map(int tokens) {
     return map;
 }
 
-// Smallest padded extent the resident network supports for a frame.
-void network_extent(int frame_w, int frame_h, int& width, int& height) {
+// Smallest padded extent the resident network supports for a frame. Compact
+// (fast path only): the frame rounded up to multiples of 64.
+void network_extent(int frame_w, int frame_h, int& width, int& height, bool compact = false) {
     int w0 = (frame_w+63)/64*64, h0 = (frame_h+63)/64*64;
+    if (compact && !c512_resident::exact_math) { width = w0; height = h0; return; }
     long long best = -1;
     for (int w = w0; w <= w0+512; w += 64)
         for (int h = h0; h <= h0+512; h += 64) {
@@ -364,7 +370,7 @@ void network_extent(int frame_w, int frame_h, int& width, int& height) {
 
 // All resident components for one network extent (RGB width x height).
 struct Network {
-    int W, H, width, height, tokens;
+    int W, H, width, height, tokens, vit_tokens;  // vit_tokens: tokens padded to a multiple of 64
     size_t n, hn;
     std::unique_ptr<front_resident::FrontEnd> front;
     std::unique_ptr<c64_resident::Chain> encoder8;
@@ -399,7 +405,10 @@ struct Network {
     // width/height lines are ignored, weights come from the listed fixtures.
     Network(const std::vector<std::string>& a, int rgb_w, int rgb_h) :
         W(rgb_w), H(rgb_h), width(rgb_w/32), height(rgb_h/32), tokens((rgb_w/64)*(rgb_h/64)),
+        vit_tokens(tokens == 16 || tokens % 64 == 0 ? tokens : (tokens+63)/64*64),
         n(size_t(width)*height*512), hn(size_t(tokens)*1024) {
+        if (vit_tokens != tokens && c512_resident::exact_math)
+            throw std::runtime_error("exact mode needs a ViT token count of 16 or a multiple of 64");
         const int cap = 65536;  // C32 body rows per chunk above this
         front.reset(new front_resident::FrontEnd(W,H,a[23],cap));
         encoder8.reset(new c64_resident::Chain(width*8,height*8,blocks(a[21],4),true));
@@ -413,8 +422,10 @@ struct Network {
         std::vector<int32_t> inverse(gather.size());
         for (size_t i = 0; i < gather.size(); ++i) inverse[size_t(gather[i])] = int32_t(i);
         map.reset(new IndexMap(gather));
-        bridge.reset(new Buffer(hn));
-        vit.reset(new vit_resident::Chain(tokens,folders(a[5],8)));
+        // Padding tokens stay zero (the gather writes only the real ones).
+        bridge.reset(new Buffer(size_t(vit_tokens)*1024));
+        HIP_CHECK(hipMemset(bridge->data, 0, bridge->count*sizeof(float)));
+        vit.reset(new vit_resident::Chain(vit_tokens,folders(a[5],8),tokens));
         entry.reset(new decoder39_resident::Entry(width/2,height/2,a[6],inverse));
         decoder.reset(new Chain(width,height,blocks(a[7],8)));
         prefix48.reset(new c256_resident::Prefix(width,height,a[8]));
@@ -454,8 +465,8 @@ struct Network {
             hipLaunchKernelGGL(k_vit_bridge_gather, dim3((hn+255)/256), dim3(256), 0, stream,
                                head.data, map->data, bridge->data, int(hn));
             HIP_CHECK(hipGetLastError());
-            ok = vit->run_from_device({bridge->data,hn}) &&
-                entry->run_from_device(vit->final_view(), chain->final_view()) &&
+            ok = vit->run_from_device({bridge->data,bridge->count}) &&
+                entry->run_from_device({vit->final_view().data,hn}, chain->final_view()) &&
                 decoder->run_from_device(entry->final_view()) &&
                 prefix48->run_from_device(decoder->final_view(), encoder22->final_view()) &&
                 c256->run_from_device(prefix48->final_view()) &&
@@ -556,6 +567,7 @@ struct Engine {
             else if (key == "motion" && (value == "0" || value == "1" || value == "auto"))
                 options.motion = value == "auto" ? 2 : value == "1";
             else if (key == "scale") options.scale = std::stof(value);
+            else if (key == "extent" && (value == "compact" || value == "legacy")) options.compact = value == "compact";
             else if (key == "motion_sign" && (value == "1" || value == "-1")) options.motion_sign = std::stoi(value);
             else throw std::runtime_error("unknown engine option: " + line);
         }
@@ -740,7 +752,7 @@ struct Engine {
             sw = std::max(64, int(frame_w*options.scale + 0.5f));
             sh = std::max(64, int(frame_h*options.scale + 0.5f));
         }
-        if (!job_crop) network_extent(sw, sh, W, H);
+        if (!job_crop) network_extent(sw, sh, W, H, options.compact);
         if (!net || net->W != W || net->H != H) {
             net.reset();
             net.reset(new Network(config, W, H));
