@@ -251,6 +251,101 @@ __global__ __launch_bounds__(256) void k_swin_attention(const h16* __restrict__ 
     }
 }
 
+// The FFN in three exact stages for levels with few windows (one fused
+// block per window leaves most of the GPU idle there). Every output keeps
+// its own K order; only the work is spread over more blocks.
+//   k_swin_hidden: grid (window, 128-column chunk): w1 + gate -> FP8 hidden (global)
+//   k_swin_w2:     grid (window, 64-column group): middle = FP8(sum of HID/32 slices)
+//   k_swin_w3:     grid (window, 64-column group): w3 with the gathered skip -> feature
+template<int C>
+__global__ __launch_bounds__(256) void k_swin_hidden(const float* __restrict__ input, Geometry g,
+        const h16* __restrict__ w1, h16* __restrict__ hidden) {
+    constexpr int LX = C+8, HID = 4*C;
+    __shared__ __attribute__((aligned(16))) h16 xs[64*LX];
+    const int tid = threadIdx.x, wave = tid/32, lane = tid%32;
+    const int lr = lane/16*8, lc = lane%16, win = blockIdx.x, h0 = blockIdx.y*128;
+    for (int i = tid; i < 64*C; i += 256) {
+        int t = i/C, c = i%C, x, y;
+        xs[t*LX+c] = split512_to_half(g.pixel(win, t, x, y) ? input[(size_t(y)*g.width+x)*C+c] : 0.0f);
+    }
+    __syncthreads();
+    const int rt = wave%4;
+    for (int j = 0; j < 4; ++j) {
+        const int ct = wave/4*4+j;
+        float acc[8] = {};
+        for (int k0 = 0; k0 < C; k0 += 32) {
+            FC part; slice<FBc>(part, xs+rt*16*LX+k0, LX, w1+size_t(h0+ct*16)*C+k0, C, 16);
+            for (int e = 0; e < 8; ++e) acc[e] = split512_half(acc[e]+part.x[e]);
+        }
+        for (int e = 0; e < 8; ++e) {
+            float a = acc[e];
+            float gate = fminf(4.0f, fmaxf(-4.0f, a));
+            float inner = split512_half(fabsf(gate)*(-0.055908203125f)+0.447265625f);
+            float poly = split512_half(gate*inner+0.89453125f);
+            hidden[(size_t(win)*64+rt*16+lr+e)*HID + h0+ct*16+lc] = split512_to_half(split512_fp8(split512_half(a*poly)));
+        }
+    }
+}
+
+template<int C>
+__global__ __launch_bounds__(256) void k_swin_w2(const h16* __restrict__ hidden, const h16* __restrict__ w2,
+                                                 h16* __restrict__ middle) {
+    constexpr int HID = 4*C;
+    const int tid = threadIdx.x, wave = tid/32, lane = tid%32;
+    const int lr = lane/16*8, lc = lane%16, win = blockIdx.x, o0 = blockIdx.y*64;
+    // 64 rows x 64 columns: 16 tiles, 2 per wave (row tile wave%4, column tiles).
+    const int rt = wave%4;
+    const h16* a = hidden + size_t(win)*64*HID;
+    for (int j = 0; j < 2; ++j) {
+        const int ct = wave/4*2+j;
+        float acc[8] = {};
+        for (int k0 = 0; k0 < HID; k0 += 32) {
+            FC part; slice<FBc>(part, a+rt*16*HID+k0, HID, w2+size_t(o0+ct*16)*HID+k0, HID, 16);
+            for (int e = 0; e < 8; ++e) acc[e] = split512_half(acc[e]+part.x[e]);
+        }
+        for (int e = 0; e < 8; ++e)
+            middle[(size_t(win)*64+rt*16+lr+e)*C + o0+ct*16+lc] = split512_to_half(split512_fp8(acc[e]));
+    }
+}
+
+template<int C>
+__global__ __launch_bounds__(256) void k_swin_w3(const float* __restrict__ input, Geometry g,
+        const h16* __restrict__ middle, const h16* __restrict__ w3, const float* __restrict__ skip,
+        h16* __restrict__ feature) {
+    const int tid = threadIdx.x, wave = tid/32, lane = tid%32;
+    const int lr = lane/16*8, lc = lane%16, win = blockIdx.x, o0 = blockIdx.y*64;
+    const int rt = wave%4;
+    const h16* a = middle + size_t(win)*64*C;
+    for (int j = 0; j < 2; ++j) {
+        const int ct = wave/4*2+j;
+        float acc[8];
+        for (int e = 0; e < 8; ++e) {
+            int t = rt*16+lr+e, c = o0+ct*16+lc, x, y;
+            float v = g.pixel(win, t, x, y) ? input[(size_t(y)*g.width+x)*C+c] : 0.0f;
+            acc[e] = split512_half(v*skip[c]);
+        }
+        for (int k0 = 0; k0 < C; k0 += 32) {
+            FC part; slice<FBc>(part, a+rt*16*C+k0, C, w3+size_t(o0+ct*16)*C+k0, C, 16);
+            for (int e = 0; e < 8; ++e) acc[e] = split512_half(acc[e]+part.x[e]);
+        }
+        for (int e = 0; e < 8; ++e)
+            feature[(size_t(win)*64+rt*16+lr+e)*C + o0+ct*16+lc] = split512_to_half(split512_fp8(acc[e]));
+    }
+}
+
+// Scratch for the split FFN (hidden, then middle), grown on demand.
+inline h16* ffn_scratch(size_t halves) {
+    static h16* data = nullptr;
+    static size_t capacity = 0;
+    if (capacity < halves) {
+        if (data) HIP_CHECK(hipFree(data));
+        data = nullptr; capacity = 0;
+        HIP_CHECK(hipMalloc(&data, halves*sizeof(h16)));
+        capacity = halves;
+    }
+    return data;
+}
+
 struct Block { const float *w1, *w2, *w3, *skip, *qkv, *scales, *bias, *projection, *attention_skip; };
 
 // One fused block unless exact_math; scratch holds 64*C halves per window.
@@ -265,8 +360,20 @@ inline bool run(const float* input, float* output, float* raw_out, int width, in
     int ph = ((height+g.py+7)/8)*8, windows = (g.pw/8)*(ph/8);
     auto half = [&](const float* W, size_t n) { return wmma_gemm::half_weights(s, W, n); };
     auto* feature = reinterpret_cast<h16*>(scratch);
-    hipLaunchKernelGGL(k_swin_ffn<C>, dim3(windows), dim3(256), 0, s, input, g,
-                       half(w.w1, size_t(4*C)*C), half(w.w2, size_t(C)*4*C), half(w.w3, size_t(C)*C), w.skip, feature);
+    if (windows < 128 && C >= 64) {
+        // Few windows: the FFN as three wider launches (see k_swin_hidden).
+        h16* hidden = ffn_scratch(size_t(windows)*64*(4*C + C));
+        h16* middle = hidden + size_t(windows)*64*4*C;
+        hipLaunchKernelGGL(k_swin_hidden<C>, dim3(windows, 4*C/128), dim3(256), 0, s, input, g,
+                           half(w.w1, size_t(4*C)*C), hidden);
+        hipLaunchKernelGGL(k_swin_w2<C>, dim3(windows, C/64), dim3(256), 0, s, hidden,
+                           half(w.w2, size_t(C)*4*C), middle);
+        hipLaunchKernelGGL(k_swin_w3<C>, dim3(windows, C/64), dim3(256), 0, s, input, g, middle,
+                           half(w.w3, size_t(C)*C), w.skip, feature);
+    } else {
+        hipLaunchKernelGGL(k_swin_ffn<C>, dim3(windows), dim3(256), 0, s, input, g,
+                           half(w.w1, size_t(4*C)*C), half(w.w2, size_t(C)*4*C), half(w.w3, size_t(C)*C), w.skip, feature);
+    }
     HIP_CHECK(hipGetLastError());
     if (c512_resident::launch_hook) c512_resident::launch_hook(C == 64 ? "k_swin_ffn<64>" : C == 128 ? "k_swin_ffn<128>" : "k_swin_ffn<256>");
     hipLaunchKernelGGL(k_swin_attention<C>, dim3(windows), dim3(256), 0, s, feature, g,
