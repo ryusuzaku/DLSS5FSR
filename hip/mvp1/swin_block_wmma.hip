@@ -117,11 +117,11 @@ __global__ __launch_bounds__(256) void k_swin_ffn(const float* __restrict__ inpu
     }
 }
 
-template<int C>
+template<int C, bool SPLIT>
 __global__ __launch_bounds__(256) void k_swin_attention(const h16* __restrict__ feature, Geometry g,
         const h16* __restrict__ wqkv, const float* __restrict__ scales, const float* __restrict__ bias,
         const h16* __restrict__ wp, const float* __restrict__ attention_skip,
-        float* output, float* raw_out) {
+        float* output, float* raw_out, float* partial) {
     constexpr int LX = C+8, LD = 40, LS = 72, PER = Tiles<C>::PER, HEADS = C/32;
     // The feature stays in global memory (contiguous per window, L2
     // resident): the products read their A fragments from there, which keeps
@@ -140,7 +140,10 @@ __global__ __launch_bounds__(256) void k_swin_attention(const h16* __restrict__ 
             acc[p][e] = split512_half(float(src[(rt*16+lr+e)*C+c])*attention_skip[c]);
         }
     }
-    for (int head = 0; head < HEADS; ++head) {
+    // SPLIT: one head per block (blockIdx.y); the block writes its
+    // projection slice (fp32, before the half boundary) for k_swin_combine.
+    const int head0 = SPLIT ? blockIdx.y : 0, head1 = SPLIT ? head0 + 1 : HEADS;
+    for (int head = head0; head < head1; ++head) {
         for (int j = 0; j < 3; ++j) {  // qkv of this head: 24 tiles, 3 per wave
             const int k = wave*3+j, m = k/8, rt = k%8/2, ct = k%2;
             float q[8] = {};
@@ -235,10 +238,16 @@ __global__ __launch_bounds__(256) void k_swin_attention(const h16* __restrict__ 
         for (int p = 0; p < PER; ++p) {  // projection K slice `head`
             const int rt = Tiles<C>::rt(wave, p), ct = Tiles<C>::ct(wave, p);
             FC part; slice<FBc>(part, qs+rt*16*LD, LD, wp+size_t(ct*16)*C+head*32, C, 16);
-            for (int e = 0; e < 8; ++e) acc[p][e] = split512_half(acc[p][e]+part.x[e]);
+            if constexpr (SPLIT) {
+                float* dst = partial + ((size_t(win)*HEADS + head)*64)*C;
+                for (int e = 0; e < 8; ++e) dst[size_t(rt*16+lr+e)*C + ct*16+lc] = part.x[e];
+            } else {
+                for (int e = 0; e < 8; ++e) acc[p][e] = split512_half(acc[p][e]+part.x[e]);
+            }
         }
         __syncthreads();
     }
+    if constexpr (SPLIT) return;
     for (int p = 0; p < PER; ++p) {
         const int rt = Tiles<C>::rt(wave, p), ct = Tiles<C>::ct(wave, p);
         for (int e = 0; e < 8; ++e) {
@@ -346,6 +355,38 @@ inline h16* ffn_scratch(size_t halves) {
     return data;
 }
 
+// Head-split projection: acc = half(feature * skip), then each head's slice
+// in head order (the order of the fused kernel), FP8 output and raw, HWC.
+template<int C>
+__global__ void k_swin_combine(const h16* __restrict__ feature, const float* __restrict__ partial,
+                               const float* __restrict__ attention_skip, Geometry g, int windows,
+                               float* output, float* raw_out) {
+    constexpr int HEADS = C/32;
+    size_t i = blockIdx.x*(size_t)blockDim.x + threadIdx.x;
+    if (i >= size_t(windows)*64*C) return;
+    int c = int(i % C), t = int(i / C % 64), win = int(i / C / 64), x, y;
+    if (!g.pixel(win, t, x, y)) return;
+    float acc = split512_half(float(feature[i])*attention_skip[c]);
+    for (int h = 0; h < HEADS; ++h)
+        acc = split512_half(acc + partial[((size_t(win)*HEADS + h)*64 + t)*C + c]);
+    size_t at = (size_t(y)*g.width + x)*C + c;
+    output[at] = split512_fp8(acc);
+    if (raw_out) raw_out[at] = acc;
+}
+
+// Head-split scratch (fp32 projection slices), grown on demand.
+inline float* head_partials(size_t count) {
+    static float* data = nullptr;
+    static size_t capacity = 0;
+    if (capacity < count) {
+        if (data) HIP_CHECK(hipFree(data));
+        data = nullptr; capacity = 0;
+        HIP_CHECK(hipMalloc(&data, count*sizeof(float)));
+        capacity = count;
+    }
+    return data;
+}
+
 struct Block { const float *w1, *w2, *w3, *skip, *qkv, *scales, *bias, *projection, *attention_skip; };
 
 // One fused block unless exact_math; scratch holds 64*C halves per window.
@@ -376,10 +417,25 @@ inline bool run(const float* input, float* output, float* raw_out, int width, in
     }
     HIP_CHECK(hipGetLastError());
     if (c512_resident::launch_hook) c512_resident::launch_hook(C == 64 ? "k_swin_ffn<64>" : C == 128 ? "k_swin_ffn<128>" : "k_swin_ffn<256>");
-    hipLaunchKernelGGL(k_swin_attention<C>, dim3(windows), dim3(256), 0, s, feature, g,
-                       half(w.qkv, size_t(3*C)*C), w.scales, w.bias, half(w.projection, size_t(C)*C),
-                       w.attention_skip, output, raw_out);
+    // Few windows leave most of the GPU idle while each block walks its heads:
+    // then each (window, head) is its own block and a combine pass follows.
+    const bool split = windows < 128 && C > 32;
+    float* partial = split ? head_partials(size_t(windows)*64*C*(C/32)) : nullptr;
+    if (split)
+        hipLaunchKernelGGL((k_swin_attention<C, true>), dim3(windows, C/32), dim3(256), 0, s, feature, g,
+                           half(w.qkv, size_t(3*C)*C), w.scales, w.bias, half(w.projection, size_t(C)*C),
+                           w.attention_skip, output, raw_out, partial);
+    else
+        hipLaunchKernelGGL((k_swin_attention<C, false>), dim3(windows), dim3(256), 0, s, feature, g,
+                           half(w.qkv, size_t(3*C)*C), w.scales, w.bias, half(w.projection, size_t(C)*C),
+                           w.attention_skip, output, raw_out, nullptr);
     HIP_CHECK(hipGetLastError());
+    if (split) {
+        size_t n = size_t(windows)*64*C;
+        hipLaunchKernelGGL(k_swin_combine<C>, dim3((n+255)/256), dim3(256), 0, s, feature, partial,
+                           w.attention_skip, g, windows, output, raw_out);
+        HIP_CHECK(hipGetLastError());
+    }
     if (c512_resident::launch_hook) c512_resident::launch_hook(C == 64 ? "k_swin_attention<64>" : C == 128 ? "k_swin_attention<128>" : "k_swin_attention<256>");
     return true;
 }
