@@ -490,10 +490,33 @@ void Shutdown() {
 
 // --------------------------------------------------------------- staging ---
 
+// A size whose staging failed is retried only every kStagingRetry calls
+// (in game a 605x378 feature failed 219 frames in a row, each one dropping
+// and re-creating the buffers and logging), and its errors are logged with
+// their HRESULT a few times only.
+static unsigned int g_failW = 0, g_failH = 0, g_failBpp = 0, g_failSkip = 0, g_failLogs = 0;
+static constexpr unsigned int kStagingRetry = 120;
+
+static bool StagingFailed(unsigned int w, unsigned int h, unsigned int bpp, const char* what, HRESULT hr) {
+    if (g_failW != w || g_failH != h || g_failBpp != bpp) g_failLogs = 0;
+    g_failW = w; g_failH = h; g_failBpp = bpp; g_failSkip = kStagingRetry;
+    if (g_failLogs < 3) {
+        LOGE("hip: staging %ux%u x %ubpp: %s failed (hr 0x%08lX); retrying every %u frames", w, h, bpp, what,
+             (unsigned long)hr, kStagingRetry);
+        ++g_failLogs;
+    }
+    DropStaging();
+    return false;
+}
+
 bool EnsureStaging(unsigned int w, unsigned int h, unsigned int bpp) {
     State& s = S();
     if (!s.usable) return false;
     if (s.w == w && s.h == h && s.bpp == bpp && s.bufIn && s.bufOut) return true;
+    if (g_failSkip && g_failW == w && g_failH == h && g_failBpp == bpp) {
+        --g_failSkip;
+        return false;
+    }
 
     DropStaging();
 
@@ -517,25 +540,20 @@ bool EnsureStaging(unsigned int w, unsigned int h, unsigned int bpp) {
     bd.SampleDesc = {1, 0};
     bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
 
-    if (FAILED(g.device->CreateCommittedResource(
-            &hp, D3D12_HEAP_FLAG_SHARED, &bd, D3D12_RESOURCE_STATE_COMMON,
-            nullptr, IID_PPV_ARGS(&s.bufIn))) ||
-        FAILED(g.device->CreateCommittedResource(
-            &hp, D3D12_HEAP_FLAG_SHARED, &bd, D3D12_RESOURCE_STATE_COMMON,
-            nullptr, IID_PPV_ARGS(&s.bufOut)))) {
-        LOGE("hip: shared staging buffers (%llu bytes) failed", (unsigned long long)s.bytes);
-        DropStaging();
-        return false;
-    }
+    HRESULT hr = g.device->CreateCommittedResource(
+        &hp, D3D12_HEAP_FLAG_SHARED, &bd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&s.bufIn));
+    if (SUCCEEDED(hr))
+        hr = g.device->CreateCommittedResource(
+            &hp, D3D12_HEAP_FLAG_SHARED, &bd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&s.bufOut));
+    if (FAILED(hr)) return StagingFailed(w, h, bpp, "shared buffers", hr);
 
     // GENERIC_ALL or the call is E_INVALIDARG -- the debug layer insists.
-    if (FAILED(g.device->CreateSharedHandle(s.bufIn.Get(), nullptr, GENERIC_ALL,
-                                            nullptr, &s.hIn)) ||
-        FAILED(g.device->CreateSharedHandle(s.bufOut.Get(), nullptr, GENERIC_ALL,
-                                            nullptr, &s.hOut))) {
-        LOGE("hip: staging CreateSharedHandle failed");
-        DropStaging();
-        return false;
+    hr = g.device->CreateSharedHandle(s.bufIn.Get(), nullptr, GENERIC_ALL, nullptr, &s.hIn);
+    if (SUCCEEDED(hr)) hr = g.device->CreateSharedHandle(s.bufOut.Get(), nullptr, GENERIC_ALL, nullptr, &s.hOut);
+    if (FAILED(hr)) {
+        HRESULT removed = g.device->GetDeviceRemovedReason();
+        if (FAILED(removed)) LOGE("hip: device removed (0x%08lX)", (unsigned long)removed);
+        return StagingFailed(w, h, bpp, "CreateSharedHandle", hr);
     }
 
     auto import = [&](HANDLE handle, ComPtr<ID3D12Resource>& res,
@@ -560,10 +578,9 @@ bool EnsureStaging(unsigned int w, unsigned int h, unsigned int bpp) {
         return true;
     };
     if (!import(s.hIn, s.bufIn, s.extIn, s.ptrIn) ||
-        !import(s.hOut, s.bufOut, s.extOut, s.ptrOut)) {
-        DropStaging();
-        return false;
-    }
+        !import(s.hOut, s.bufOut, s.extOut, s.ptrOut))
+        return StagingFailed(w, h, bpp, "HIP import", E_FAIL);
+    g_failSkip = 0; g_failLogs = 0;
 
     // Motion staging: float2 per pixel. Optional -- without it the engine
     // simply does not carry its map along the motion.
