@@ -34,6 +34,15 @@ using Microsoft::WRL::ComPtr;
 
 namespace ngx {
 
+// The NR controls the caller (OptiScaler's DLSS-NR overlay) passes with each
+// evaluate; the resident engine takes them when its config says
+// external_controls=1. generation counts changes.
+struct NrControls {
+    float intensity = 1.0f, style = 0.0f, structure = 1.0f, tone = 0.0f, skin = -1.0f, mask = 0.0f;
+    unsigned int generation = 0;
+};
+NrControls& NrControlValues();
+
 // ---------------------------------------------------------------- logging --
 
 enum LogLevel { L_ERROR = 0, L_WARN = 1, L_INFO = 2, L_DEBUG = 3 };

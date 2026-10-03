@@ -186,6 +186,7 @@ struct OutputOptions {
     float tone = 0.0f;  // tone=K: luma mode network input through auto exposure (key K) + ACES
     float controls[5] = {0, 0, 0, 0, 0};  // controls=a,b,c,d,e: stem features 10..14
     int encoded = 0;      // encoded=1: feed the network display-encoded colour, as the original
+    int external = 0;     // external_controls=1: controls and strength follow re_controls
     float temporal = 0.0f;  // temporal=S: the original's history recurrence, S x its blend scale
     int tone_inverse = 1;  // tone: map the ratio back through the inverse curve (0: use it as it is)
     int history_clamp = 2;  // history guard: 0 none, 1 neighbourhood clamp, 2 reject where the input changed
@@ -781,6 +782,7 @@ struct Engine {
             else if (key == "extent" && (value == "compact" || value == "legacy")) options.compact = value == "compact";
             else if (key == "tone") options.tone = std::stof(value);
             else if (key == "encoded") options.encoded = std::stoi(value);
+            else if (key == "external_controls") options.external = std::stoi(value);
             else if (key == "temporal") options.temporal = std::stof(value);
             else if (key == "history_clamp") options.history_clamp = std::stoi(value);
             else if (key == "reject") options.reject = std::stof(value);
@@ -1006,7 +1008,12 @@ struct Engine {
             HIP_CHECK(hipGetLastError());
             tone = tone_state->data;
         }
-        for (int k = 0; k < 5; ++k) net->front->controls.v[k] = job_crop ? 0.0f : options.controls[k];
+        float job_strength;
+        {
+            std::lock_guard<std::mutex> lock(mutex);  // set_controls may change them
+            for (int k = 0; k < 5; ++k) net->front->controls.v[k] = job_crop ? 0.0f : options.controls[k];
+            job_strength = options.strength;
+        }
         const bool temporal = !job_crop && options.luma && options.temporal > 0.0f;
         bool use_history = false, hin_ok = false;
         if (temporal) {
@@ -1096,7 +1103,7 @@ struct Engine {
                                    !previous_valid ? nullptr : history_cur >= 0
                                        ? reinterpret_cast<const float2*>(history[history_cur]->data)
                                        : reinterpret_cast<const float2*>(maps[published]->data),
-                                   int(previous_valid), options, reinterpret_cast<float2*>(maps[next]->data),
+                                   int(previous_valid), job_options(job_strength), reinterpret_cast<float2*>(maps[next]->data),
                                    frame_w, frame_h, sw, sh, W, tone);
                 HIP_CHECK(hipGetLastError());
                 HIP_CHECK(hipStreamSynchronize(stream));
@@ -1186,6 +1193,28 @@ struct Engine {
         HIP_CHECK(hipGetLastError());
         HIP_CHECK(hipStreamSynchronize(compose_stream));
         history_cur = cur;
+    }
+
+    // external_controls: the original's mapping of its controls onto the stem
+    // features (peer DLSSNR-AMD patch_push) without the automatic mask, which
+    // we cannot compute: style/128, tone, structure, skin -1, background -1.
+    // Intensity becomes the luma strength.
+    OutputOptions job_options(float strength) const {
+        OutputOptions o = options;
+        o.strength = strength;
+        return o;
+    }
+    int set_controls(const float* v) {
+        if (!options.external) return 0;
+        std::lock_guard<std::mutex> lock(mutex);
+        const float style = fminf(fmaxf(v[1], 0.0f), 2.0f);
+        options.controls[0] = style / 128.0f;
+        options.controls[1] = fminf(fmaxf(v[3], 0.0f), 2.0f);
+        options.controls[2] = fminf(fmaxf(v[2], 0.0f), 2.0f);
+        options.controls[3] = -1.0f;
+        options.controls[4] = -1.0f;
+        options.strength = fminf(fmaxf(v[0], 0.0f), 2.0f);
+        return 1;
     }
 
     // temporal: where each pixel of job_frame was on hist_frame, chaining the
@@ -1354,6 +1383,15 @@ __declspec(dllexport) int re_create(const char* config_path) {
 }
 
 // Crop mode. 1 accepted, 0 busy (try again later), -1 failed/disabled.
+// The caller's NR controls: intensity, style (0..2), local structure, local
+// tone, skin structure, automatic mask (as OptiScaler's DLSS-NR passes them).
+// Returns 1 applied, 0 ignored (external_controls=0), -1 no engine.
+__declspec(dllexport) int re_controls(const float* v, int n) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!g_engine || !v || n < 6) return -1;
+    return g_engine->set_controls(v);
+}
+
 __declspec(dllexport) int re_submit(const void* staging, int width, int height, int pitch, int bpp) {
     std::lock_guard<std::mutex> lock(g_mutex);
     if (!g_engine) return -1;

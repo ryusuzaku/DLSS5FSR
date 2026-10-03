@@ -281,6 +281,11 @@ void SetModuleDir(const std::wstring& dir) { g_moduleDir = dir; }
 
 // ------------------------------------------------------- exported surface --
 
+NrControls& NrControlValues() {
+    static NrControls values;
+    return values;
+}
+
 }  // namespace ngx
 
 using namespace ngx;
@@ -722,8 +727,20 @@ int dlssnr_call_evaluate(ID3D12GraphicsCommandList* cmd, void* feature,
     p->Set(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width, width);
     p->Set(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height, height);
     (void)guideWidth; (void)guideHeight; (void)depthInverted; (void)reset;
-    (void)intensity; (void)style; (void)localStructure; (void)localTone;
-    (void)skinStructure; (void)useAutoMask; (void)mvScaleX; (void)mvScaleY;
+    (void)mvScaleX; (void)mvScaleY;
+    {
+        NrControls& c = NrControlValues();
+        const float v[6] = {intensity, (float)style, localStructure, localTone, skinStructure, (float)useAutoMask};
+        float* cur[6] = {&c.intensity, &c.style, &c.structure, &c.tone, &c.skin, &c.mask};
+        bool changed = false;
+        for (int i = 0; i < 6; ++i)
+            if (*cur[i] != v[i]) { *cur[i] = v[i]; changed = true; }
+        if (changed || !c.generation) {
+            ++c.generation;
+            LOGI("dlssnr: controls intensity %.3f style %d structure %.3f tone %.3f skin %.3f automask %d",
+                 intensity, style, localStructure, localTone, skinStructure, useAutoMask);
+        }
+    }
     return (int)DoEvaluateD3D12(cmd, (const NVSDK_NGX_Handle*)feature, p);
 }
 

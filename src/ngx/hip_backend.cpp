@@ -138,6 +138,8 @@ struct State {
     int (*EngineMotionMode)() = nullptr;  // optional (re_motion_mode)
     int (*EngineComposeMap)(void*, unsigned long long, int, int, float*) = nullptr;  // optional
     int (*EngineMapParams)(float*) = nullptr;  // optional (re_luma_map_params)
+    int (*EngineControls)(const float*, int) = nullptr;  // optional (re_controls)
+    unsigned int engineControlsGeneration = 0;
     bool mapActive = false;  // the last preview wrote the ratio map, not a frame
     float mapParams[4] = {};
     int (*EnginePollFrame)(unsigned char*, unsigned long long, int, int, int, float*) = nullptr;
@@ -854,6 +856,8 @@ static bool EngineReady() {
     s.EngineComposeMap = (int (*)(void*, unsigned long long, int, int, float*))
         GetProcAddress(s.engineDll, "re_compose_map_device");
     s.EngineMapParams = (int (*)(float*))GetProcAddress(s.engineDll, "re_luma_map_params");
+    s.EngineControls = (int (*)(const float*, int))GetProcAddress(s.engineDll, "re_controls");
+    s.engineControlsGeneration = 0;
     s.EnginePollFrame = (int (*)(unsigned char*, unsigned long long, int, int, int, float*))
         GetProcAddress(s.engineDll, "re_poll_frame");
     if (cfg.residentEngineFull && (!s.EngineSubmitFull || !s.EnginePollFrame)) {
@@ -921,6 +925,16 @@ bool ResidentEngineSubmit() {
             LOGI("hip: resident engine motion %llu at %ux%u (middle row: max |x| %.4g max |y| %.4g mean |x| %.4g; detected %s)",
                  (unsigned long long)s.engineMotionFrames, s.w, s.h, maxX, maxY, sumX / (float)s.w,
                  mode >= -1 && mode <= 3 ? kModes[mode + 1] : "n/a");
+        }
+    }
+    if (s.EngineControls) {
+        const NrControls& c = NrControlValues();
+        if (c.generation && c.generation != s.engineControlsGeneration) {
+            const float v[6] = {c.intensity, c.style, c.structure, c.tone, c.skin, c.mask};
+            const int used = s.EngineControls(v, 6);
+            if (used >= 0 && !s.engineControlsGeneration)
+                LOGI("hip: resident engine %s the caller's NR controls", used ? "follows" : "ignores (external_controls=0)");
+            s.engineControlsGeneration = c.generation;
         }
     }
     const int r = cfg.residentEngineFull

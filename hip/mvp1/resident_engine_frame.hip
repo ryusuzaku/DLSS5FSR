@@ -104,6 +104,14 @@ int main(int argc, char** argv) {
             }
         return hipMemcpy(staging, shifted.data(), shifted.size(), hipMemcpyHostToDevice) == hipSuccess;
     };
+    // RE_CONTROLS=intensity,style,structure,tone,skin,mask: re_controls before
+    // the first submit, as the shim passes OptiScaler's NR sliders.
+    if (const char* ctl = getenv("RE_CONTROLS")) {
+        float v[6];
+        auto set_controls = (int (*)(const float*, int))GetProcAddress(dll, "re_controls");
+        if (!set_controls || sscanf(ctl, "%f,%f,%f,%f,%f,%f", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) != 6) return 1;
+        printf("re_controls: %d\n", set_controls(v, 6));
+    }
     int r = 0;
     float ms = 0.0f;
     if (hold >= 0) {

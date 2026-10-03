@@ -848,3 +848,12 @@ the engine writes the full frame (the input's alpha is always kept):
   edit elsewhere by 3% (0.032 vs 0.017, "breathing"); 1.0 does not (0.019).
   Game config: controls=0,1,0.3,-1,-1 (edit a smooth lighting field: sign
   glow on walls, lit ground brighter, glass no longer clipped dark).
+- `external_controls=1`: the engine takes the NR controls OptiScaler's
+  DLSS-NR overlay passes with every evaluate (shim `dlssnr_call_evaluate` ->
+  `re_controls`): Style -> f10 = style/128, LocalTone -> f11, LocalStructure
+  -> f12, skin/background -1 (no automatic mask), Intensity -> luma
+  strength. The `controls=` line is the fallback until the first values
+  arrive; the shim logs every change (`dlssnr: controls ...`). Checked with
+  resident_engine_frame `RE_CONTROLS=1,0,0.3,1,-1,0`: byte-identical to
+  `controls=0,1,0.3,-1,-1 strength=1`. OptiScaler.ini [DlssNr] holds the
+  starting values (Style, Intensity, LocalStructure, LocalTone).
