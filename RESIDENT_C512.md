@@ -805,3 +805,20 @@ the engine writes the full frame (the input's alpha is always kept):
   grain. With `0,0,1,-1,-1` at gain=0 the edit is clean and structured
   (ratio p1 0.82 / p99 1.27 on the 496x310 crop); on the luma path the
   structural edit doubles and grain/structure falls from 0.88 to 0.56.
+- `encoded=1` (luma mode) feeds the network display-encoded colour (sRGB, or
+  the sRGB of the `tone` curve), which is what the original is given (peer
+  DLSSNR-AMD `ColourFrame`: "SDR encoded RGB ... do not apply a transfer
+  function"); we had fed linear light. The ratio map decodes both sides.
+- `temporal=S` (luma mode) is the original's recurrence: the previous
+  network image, carried to the job's frame along the motion chain
+  (`history_coords`, Catmull-Rom), is stem features 7..9; the head's fourth
+  output (coefficient row 6, `coeff_history.f32` beside `coeff.f32`, from
+  `tools/head70_weights.py`) gives w = sigmoid(row . features) x 0.7397 x S
+  and the image becomes lerp(image, history, w), the next history. The stem
+  noise then follows the original's per-run seed (PCG + Box-Muller of x, y,
+  seed; seed 0 is bit-identical to the captured tile, checked), reset to 0
+  whenever there is no history. On the WhitePoint-8 stand-in with the game
+  config: pan shimmer 0.0034 -> 0.0022 (temporal) with a stronger edit;
+  with encoded+temporal the edit is 1.6x and settles (frame 50 -> 79
+  structure 0.0925 -> 0.0931); a still frame keeps ~1% residual flicker
+  from the moving noise.

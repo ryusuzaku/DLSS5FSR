@@ -28,8 +28,12 @@ __device__ inline bool front_window_pixel(int token, int width, int height, int 
 // and background features (peer DLSSNR-AMD image_input.glsl); the fixtures
 // were captured with all five zero, which stays the default.
 struct FrontControls { float v[5]; };
+// history (optional, rgb's layout): features 7..9 become the previous output
+// carried to this frame, as in the original's temporal pre block; a negative
+// first channel marks a pixel without history (it keeps the current colour).
 __global__ void k_front_stem(const float* rgb, const float* noise, const float* stem,
-                             float* tokens, int width, int height, FrontControls controls = {}) {
+                             float* tokens, int width, int height, FrontControls controls = {},
+                             const float* history = nullptr) {
     int id = blockIdx.x*blockDim.x+threadIdx.x;
     if (id >= width*height*32) return;
     int token = id/32, c = id%32, x, y;
@@ -44,10 +48,39 @@ __global__ void k_front_stem(const float* rgb, const float* noise, const float* 
         float v = h70_h(centered*.125f);
         f[4+k] = v; f[7+k] = v;
     }
+    if (history) {
+        const float* q = history + (size_t(y)*width+x)*3;
+        if (q[0] >= 0.0f)
+            for (int k = 0; k < 3; ++k) f[7+k] = h70_h(h70_h(h70_h(q[k])-.5f)*.125f);
+    }
     for (int k = 10; k < 15; ++k) f[k] = h70_h(controls.v[k-10]);
     float part = 0.0f;
     for (int k = 0; k < 15; ++k) part += f[k]*stem[k*32+c];
     tokens[id] = h70_h(part);
+}
+
+// The original's pre-block noise (peer DLSSNR-AMD image_noise.glsl): PCG +
+// Box-Muller of (x, y, seed). Seed 0 reproduces the captured 256x256 tile.
+__device__ inline unsigned front_pcg(unsigned v) {
+    v = (v >> ((v >> 28) + 4u)) ^ v;
+    return v * 0x108EF2D9u;
+}
+__device__ inline float front_uniform(unsigned stream) {
+    const unsigned t = front_pcg(stream);
+    return float(((t >> 30) ^ (t >> 8)) + 1u) * 5.9604644775390625e-08f;
+}
+__global__ void k_front_noise(float* noise, int width, int height, unsigned seed) {
+    int i = blockIdx.x*blockDim.x+threadIdx.x;
+    if (i >= width*height) return;
+    const unsigned x = unsigned(i % width), y = unsigned(i / width);
+    const unsigned base = (x*0x8DA6B343u) ^ (seed*0x9E3779B9u) ^ (y*0xD8163841u) ^ 0x243F6A88u;
+    const unsigned t = front_pcg(base), h = (t >> 22) ^ t;
+    const float uA = front_uniform(h*0x2C9277B5u + 0xAC564B05u), uB = front_uniform(h*0xFA6DC5F9u + 0x4712A88Eu);
+    const float uC = front_uniform(h*0xCAA5B80Du + 0x21DD796Bu), uD = front_uniform(h*0x83232C31u + 0x3463E0ACu);
+    const float rA = sqrtf(-2.0f*logf(uA)), rC = sqrtf(-2.0f*logf(uC));
+    noise[size_t(i)*3+0] = rA*cosf(uB*6.28318530718f);
+    noise[size_t(i)*3+1] = rA*sinf(uB*6.28318530718f);
+    noise[size_t(i)*3+2] = rC*cosf(uD*6.28318530718f);
 }
 
 __global__ void k_front_gather(const float* image, float* tokens, int width, int height, int shift) {
@@ -111,7 +144,10 @@ __global__ void k_front_native32(const float* peer, float* native, int n, int cl
 class FrontEnd {
 public:
     FrontControls controls{};  // stem features 10..14 (engine option controls=)
+    const float* history = nullptr;  // stem features 7..9 (engine option temporal=), null: current colour
+    unsigned noise_seed = 0;         // 0: the captured tile; otherwise the original's noise for this seed
 private:
+    unsigned loaded_seed = 0;
     static int checked(int w, int h) {
         if (w <= 0 || h <= 0 || w % 64 || h % 64) throw std::invalid_argument("front end requires RGB extents that are multiples of 64");
         return w;
@@ -176,7 +212,12 @@ public:
         ready = false;
         if (!rgb.data || rgb.count != pixels*3) return false;
         if (!check(dir,"rgb",rgb.data,pixels*3,verify,comparisons)) return false;
-        FRONT_LAUNCH(k_front_stem,pixels*32,rgb.data,noise.data,stem.data,tokens.data,width,height,controls);
+        if (noise_seed != loaded_seed) {
+            if (noise_seed) FRONT_LAUNCH(k_front_noise,pixels,noise.data,width,height,noise_seed);
+            else load_noise();
+            loaded_seed = noise_seed;
+        }
+        FRONT_LAUNCH(k_front_stem,pixels*32,rgb.data,noise.data,stem.data,tokens.data,width,height,controls,history);
         const float *raw = nullptr, *quant = nullptr;
         const bool fused = !verify && !c512_resident::exact_math;  // bodies gather/scatter themselves
         auto io = [](int in_hwc, int w, int h, int shift) {

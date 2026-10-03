@@ -83,7 +83,7 @@ __global__ void k_tone_update(float* tone, float key) {
 
 __global__ void k_candidate_input_full(const unsigned char* src, float* output, int frame_w, int frame_h,
                                        int pitch, int bpp, int width, int height, int sw, int sh,
-                                       const float* tone = nullptr) {
+                                       const float* tone = nullptr, int encoded = 0) {
     const int pixel = (int)(blockIdx.x*blockDim.x + threadIdx.x);
     if (pixel >= width*height) return;
     const int x = min(pixel % width, sw-1), y = min(pixel / width, sh-1);
@@ -102,7 +102,10 @@ __global__ void k_candidate_input_full(const unsigned char* src, float* output, 
         }
         srgb = fminf(fmaxf(srgb, 0.0f), 1.0f);
         float linear = srgb <= 0.04045f ? srgb/12.92f : powf((srgb+0.055f)/1.055f, 2.4f);
-        output[pixel*3+c] = tone ? tone_aces(linear*tone[2]) : linear;
+        float v = tone ? tone_aces(linear*tone[2]) : linear;
+        // encoded: the display-encoded value, what the original is fed.
+        if (encoded) v = tone ? (v <= 0.0031308f ? 12.92f*v : 1.055f*powf(v, 1.0f/2.4f) - 0.055f) : srgb;
+        output[pixel*3+c] = v;
     }
 }
 
@@ -179,6 +182,8 @@ struct OutputOptions {
     int compact = 0;  // extent=compact: smallest multiple-of-64 extent (fast path only)
     float tone = 0.0f;  // tone=K: luma mode network input through auto exposure (key K) + ACES
     float controls[5] = {0, 0, 0, 0, 0};  // controls=a,b,c,d,e: stem features 10..14
+    int encoded = 0;      // encoded=1: feed the network display-encoded colour, as the original
+    float temporal = 0.0f;  // temporal=S: the original's history recurrence, S x its blend scale
     float scale = 1.0f;
     float limit = 0.0f, smooth = 0.0f, sigma = 0.02f, strength = 1.0f, gate = 0.03f;
     int gain = -1;
@@ -206,8 +211,10 @@ __device__ inline float srgb_encode_device(float v) {
 // The network's luminance ratio at network pixel (x, y) of sw x sh content
 // (row stride W); with denoise the ratio of edge-weighted neighbourhood sums.
 __device__ inline float net_ratio(const float* linear, const float* color, int x, int y, int sw, int sh, int W,
-                                  int denoise) {
+                                  int denoise, int encoded = 0) {
     auto lum = [&](const float* v, bool clamp) {
+        if (encoded)  // display-encoded network colours: luminance of their light
+            return .2126f*srgb_decode_device(v[0]) + .7152f*srgb_decode_device(v[1]) + .0722f*srgb_decode_device(v[2]);
         return clamp ? .2126f*fmaxf(v[0], 0.0f) + .7152f*fmaxf(v[1], 0.0f) + .0722f*fmaxf(v[2], 0.0f)
                      : .2126f*v[0] + .7152f*v[1] + .0722f*v[2];
     };
@@ -242,14 +249,16 @@ __global__ void k_ratio_map(const float* linear, const float* color, const unsig
     float yin = .2126f*raw[0] + .7152f*raw[1] + .0722f*raw[2];
     float r;
     if (sw == frame_w && sh == frame_h) {
-        r = net_ratio(linear, color, x, y, sw, sh, W, o.denoise);
+        r = net_ratio(linear, color, x, y, sw, sh, W, o.denoise, o.encoded);
     } else {
         float fx = fminf(fmaxf((x+0.5f)*sw/frame_w - 0.5f, 0.0f), float(sw-1));
         float fy = fminf(fmaxf((y+0.5f)*sh/frame_h - 0.5f, 0.0f), float(sh-1));
         int x0 = int(fx), y0 = int(fy), x1 = min(x0+1, sw-1), y1 = min(y0+1, sh-1);
         float tx = fx - x0, ty = fy - y0;
-        float a = net_ratio(linear, color, x0, y0, sw, sh, W, o.denoise), b = net_ratio(linear, color, x1, y0, sw, sh, W, o.denoise);
-        float c = net_ratio(linear, color, x0, y1, sw, sh, W, o.denoise), d = net_ratio(linear, color, x1, y1, sw, sh, W, o.denoise);
+        float a = net_ratio(linear, color, x0, y0, sw, sh, W, o.denoise, o.encoded);
+        float b = net_ratio(linear, color, x1, y0, sw, sh, W, o.denoise, o.encoded);
+        float c = net_ratio(linear, color, x0, y1, sw, sh, W, o.denoise, o.encoded);
+        float d = net_ratio(linear, color, x1, y1, sw, sh, W, o.denoise, o.encoded);
         r = (a*(1.0f-tx) + b*tx)*(1.0f-ty) + (c*(1.0f-tx) + d*tx)*ty;
     }
     if (tone && yin > 1e-5f) {
@@ -434,6 +443,73 @@ void network_extent(int frame_w, int frame_h, int& width, int& height, bool comp
 }
 
 // All resident components for one network extent (RGB width x height).
+// temporal=S. The original's temporal pre/post blocks (peer DLSSNR-AMD
+// fswin_t.comp, NR_TEMPORAL_HISTORY): the previous network image, carried to
+// this frame along the motion, is stem features 7..9, and the head's fourth
+// row (coefficient row 6) gives w = sigmoid(row . features) * 0.7397 (the
+// model's blend scale) * S; the image is lerp(rgb, history, w) and becomes
+// the next history.
+__global__ void k_coord_identity(float2* coord, int w, int h) {
+    int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i < w*h) coord[i] = make_float2(float(i % w), float(i / w));
+}
+// Network pixel (x, y) of sw x sh content: the previous image (same layout)
+// at this pixel's place in the history's frame (coord: frame pixel -> its
+// frame position then, (.., < 0) none; null: same frame), Catmull-Rom. A
+// pixel without one is marked by a negative first channel.
+__global__ void k_history_sample(const float* previous, const float2* coord, float* out,
+                                 int fw, int fh, int sw, int sh, int W, int H) {
+    int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= W*H) return;
+    int x = min(i % W, sw-1), y = min(i / W, sh-1);
+    float px = float(x), py = float(y);
+    if (coord) {
+        int fx = min(max(int((x+0.5f)*fw/sw), 0), fw-1), fy = min(max(int((y+0.5f)*fh/sh), 0), fh-1);
+        float2 c = coord[size_t(fy)*fw + fx];
+        if (c.y < 0.0f) { out[size_t(i)*3] = -1.0f; out[size_t(i)*3+1] = 0.0f; out[size_t(i)*3+2] = 0.0f; return; }
+        // c is where frame pixel (fx, fy) was; move this pixel by the same.
+        px += (c.x - fx)*sw/fw; py += (c.y - fy)*sh/fh;
+    }
+    px = fminf(fmaxf(px, 0.0f), float(sw-1)); py = fminf(fmaxf(py, 0.0f), float(sh-1));
+    int ix = int(floorf(px)), iy = int(floorf(py));
+    float tx = px - ix, ty = py - iy;
+    float wx[4], wy[4];
+    auto cr = [](float t, float* wt) {
+        float t2 = t*t, t3 = t2*t;
+        wt[0] = -0.5f*t3 + t2 - 0.5f*t; wt[1] = 1.5f*t3 - 2.5f*t2 + 1.0f;
+        wt[2] = -1.5f*t3 + 2.0f*t2 + 0.5f*t; wt[3] = 0.5f*t3 - 0.5f*t2;
+    };
+    cr(tx, wx); cr(ty, wy);
+    for (int c = 0; c < 3; ++c) {
+        float v = 0.0f;
+        for (int j = 0; j < 4; ++j) {
+            int sy = min(max(iy-1+j, 0), sh-1);
+            float row = 0.0f;
+            for (int k = 0; k < 4; ++k) row += wx[k]*previous[(size_t(sy)*W + min(max(ix-1+k, 0), sw-1))*3 + c];
+            v += wy[j]*row;
+        }
+        out[size_t(i)*3+c] = fminf(fmaxf(v, 0.0f), 1.0f);
+    }
+}
+// The head's history weight from its 32 features (tile layout of
+// k_head70_finish) and the blend into both head images, in place.
+__global__ void k_head_temporal(const float* tiles, const float* row, const float* history,
+                                float* rgb_a, float* rgb_b, int width, int height, float scale) {
+    int p = blockIdx.x*blockDim.x + threadIdx.x;
+    if (p >= width*height) return;
+    const float* h = history + size_t(p)*3;
+    if (h[0] < 0.0f) return;
+    int x = p % width, y = p / width;
+    const float* t = tiles + size_t(((y/8)*(width/8) + x/8)*64 + (y%8)*8 + x%8)*32;
+    float o = 0.0f;
+    for (int k = 0; k < 32; ++k) o += t[k]*row[k];
+    float w = fminf(fmaxf(scale / (1.0f + expf(-o)), 0.0f), 1.0f);
+    for (int c = 0; c < 3; ++c) {
+        rgb_a[size_t(p)*3+c] += (h[c] - rgb_a[size_t(p)*3+c])*w;
+        rgb_b[size_t(p)*3+c] += (h[c] - rgb_b[size_t(p)*3+c])*w;
+    }
+}
+
 struct Network {
     int W, H, width, height, tokens, vit_tokens;  // vit_tokens: tokens padded to a multiple of 64
     size_t n, hn;
@@ -509,7 +585,7 @@ struct Network {
 
     // sw x sh: the network content (the frame, or its downscale); 0 = the frame.
     void run(const unsigned char* src, int fw, int fh, int pitch, int bpp, bool crop, hipStream_t stream,
-             int sw = 0, int sh = 0, const float* tone = nullptr) {
+             int sw = 0, int sh = 0, const float* tone = nullptr, int encoded = 0) {
         if (sw <= 0 || sh <= 0) { sw = fw; sh = fh; }
         if (crop) {
             if (W != 256 || H != 256) throw std::runtime_error("crop mode needs the 256x256 network");
@@ -517,7 +593,7 @@ struct Network {
                                src, color->data, fw, fh, pitch, bpp);
         } else {
             hipLaunchKernelGGL(k_candidate_input_full, dim3((W*H+255)/256), dim3(256), 0, stream,
-                               src, color->data, fw, fh, pitch, bpp, W, H, sw, sh, tone);
+                               src, color->data, fw, fh, pitch, bpp, W, H, sw, sh, tone, encoded);
         }
         HIP_CHECK(hipGetLastError());
         bool ok = front->run_from_device({color->data,color->count}) &&
@@ -617,6 +693,15 @@ struct Engine {
     int out_w = 0, out_h = 0, out_bpp = 0;
     float last_ms = 0.0f;
     unsigned long long completed = 0;
+    // temporal=S: the previous network image (network layout) and the frame
+    // it is on; per job the frame-pixel positions of the job's pixels in that
+    // frame (coord[coord_cur], built in prepare), the sampled history, the
+    // head's row 6 and the noise seed counter.
+    std::unique_ptr<Buffer> hist_prev, hist_cur, coord[2], hist_row;
+    long long hist_frame = -1;
+    int hist_W = 0, hist_H = 0, hist_sw = 0, hist_sh = 0;
+    int coord_cur = -1;                // -1: no history for this job; 2: same frame (identity)
+    unsigned temporal_seed = 0;
     std::unique_ptr<Buffer> tone_state;  // tone=K: log-luminance sums, applied exposure, valid, smoothed log2
     std::string error;
 
@@ -640,6 +725,8 @@ struct Engine {
             else if (key == "scale") options.scale = std::stof(value);
             else if (key == "extent" && (value == "compact" || value == "legacy")) options.compact = value == "compact";
             else if (key == "tone") options.tone = std::stof(value);
+            else if (key == "encoded") options.encoded = std::stoi(value);
+            else if (key == "temporal") options.temporal = std::stof(value);
             else if (key == "controls") {
                 // style/128, local tone, local structure, skin, background (the
                 // original's defaults without its automatic mask: 0,0,1,-1,-1).
@@ -657,7 +744,9 @@ struct Engine {
         if (options.sigma <= 0.0f || options.gate <= 0.0f || options.smooth < 0.0f || options.smooth > 1.0f ||
             options.limit < 0.0f || options.strength < 0.0f || options.denoise < 0 || options.denoise > 4 ||
             options.scale < 0.25f || options.scale > 1.0f || (options.scale < 1.0f && !options.luma) ||
-            options.tone < 0.0f || options.tone > 1.0f || (options.tone > 0.0f && !options.luma))
+            options.tone < 0.0f || options.tone > 1.0f || (options.tone > 0.0f && !options.luma) ||
+            options.encoded < 0 || options.encoded > 1 || (options.encoded && !options.luma) ||
+            options.temporal < 0.0f || options.temporal > 1.0f || (options.temporal > 0.0f && !options.luma))
             throw std::runtime_error("engine options out of range");
         // The caller's thread may carry a stale HIP error from its own work;
         // setup checks hipGetLastError() after its first launches.
@@ -801,6 +890,8 @@ struct Engine {
             HIP_CHECK(hipStreamSynchronize(stream));
             history_cur = -1;
             if (!crop && options.luma && options.smooth > 0.0f) carry_history(w, h);
+            coord_cur = -1;
+            if (!crop && options.luma && options.temporal > 0.0f) history_coords(w, h);
         } catch (const std::exception& e) {
             failed = true; error = e.what(); return -1;
         }
@@ -858,9 +949,52 @@ struct Engine {
             tone = tone_state->data;
         }
         for (int k = 0; k < 5; ++k) net->front->controls.v[k] = job_crop ? 0.0f : options.controls[k];
+        const bool temporal = !job_crop && options.luma && options.temporal > 0.0f;
+        bool use_history = false;
+        if (temporal) {
+            if (!hist_row) {
+                std::vector<float> row(32);
+                std::string path = config[16] + "/coeff_history.f32";
+                FILE* f = fopen(path.c_str(), "rb");
+                if (!f || fread(row.data(), sizeof(float), 32, f) != 32) {
+                    if (f) fclose(f);
+                    throw std::runtime_error("temporal needs " + path);
+                }
+                fclose(f);
+                hist_row.reset(new Buffer(32));
+                HIP_CHECK(hipMemcpy(hist_row->data, row.data(), 32*sizeof(float), hipMemcpyHostToDevice));
+            }
+            size_t count = size_t(W)*H*3;
+            if (!hist_cur || hist_cur->count < count) hist_cur.reset(new Buffer(count));
+            use_history = coord_cur >= 0 && hist_prev && hist_W == W && hist_H == H && hist_sw == sw && hist_sh == sh;
+            if (use_history)
+                hipLaunchKernelGGL(k_history_sample, dim3((W*H+255)/256), dim3(256), 0, stream,
+                                   hist_prev->data,
+                                   coord_cur == 2 ? nullptr : reinterpret_cast<const float2*>(coord[coord_cur]->data),
+                                   hist_cur->data, frame_w, frame_h, sw, sh, W, H);
+            // The original's seed: a counter per run, 0 on the first frame and
+            // after a reset (here: whenever there is no history to blend with).
+            temporal_seed = use_history ? temporal_seed + 1 : 0;
+        }
+        net->front->history = use_history ? hist_cur->data : nullptr;
+        net->front->noise_seed = temporal ? temporal_seed : 0;
         HIP_CHECK(hipEventRecord(start, stream));
         net->run(reinterpret_cast<const unsigned char*>(raw_input->data), frame_w, frame_h, frame_pitch,
-                 frame_bpp, job_crop, stream, sw, sh, tone);
+                 frame_bpp, job_crop, stream, sw, sh, tone, !job_crop && options.encoded);
+        if (temporal) {
+            if (use_history) {
+                hipLaunchKernelGGL(k_head_temporal, dim3((W*H+255)/256), dim3(256), 0, stream,
+                                   net->head70->native_view().data, hist_row->data, hist_cur->data,
+                                   net->rgb_native->data, net->rgb_public->data, W, H, 0.7397f*options.temporal);
+                HIP_CHECK(hipGetLastError());
+            }
+            size_t count = size_t(W)*H*3;
+            if (!hist_prev || hist_prev->count < count) hist_prev.reset(new Buffer(count));
+            HIP_CHECK(hipMemcpyAsync(hist_prev->data, net->rgb_native->data, count*sizeof(float),
+                                     hipMemcpyDeviceToDevice, stream));
+            hist_W = W; hist_H = H; hist_sw = sw; hist_sh = sh;
+            hist_frame = job_frame;
+        }
         HIP_CHECK(hipEventRecord(stop, stream));
         size_t count = size_t(W)*H*3;
         std::vector<float> native, pub, rgb;
@@ -985,6 +1119,33 @@ struct Engine {
         HIP_CHECK(hipGetLastError());
         HIP_CHECK(hipStreamSynchronize(compose_stream));
         history_cur = cur;
+    }
+
+    // temporal: where each pixel of job_frame was on hist_frame, chaining the
+    // per-frame motion (caller holds the mutex, the worker is idle).
+    void history_coords(int w, int h) {
+        if (hist_frame < 0 || !hist_prev) return;
+        if (hist_frame == job_frame) { coord_cur = 2; return; }
+        const float mx = options.motion == 2 ? motion_mx : 1.0f, my = options.motion == 2 ? motion_my : 1.0f;
+        if (!options.motion || (mx == 0.0f && my == 0.0f) || mv_w != w || mv_h != h || hist_frame > job_frame) return;
+        if (job_frame - hist_frame >= kRing) return;
+        for (auto& b : coord)
+            if (!b || b->count < size_t(w)*h*2) b.reset(new Buffer(size_t(w)*h*2));
+        hipLaunchKernelGGL(k_coord_identity, dim3((w*h+255)/256), dim3(256), 0, compose_stream,
+                           reinterpret_cast<float2*>(coord[0]->data), w, h);
+        int cur = 0;
+        for (long long f = hist_frame + 1; f <= job_frame; ++f) {
+            int slot = int(f % kRing);
+            if (ring_frame[slot] != f) return;  // motion lost: no history
+            hipLaunchKernelGGL(k_warp_map, dim3((w*h+255)/256), dim3(256), 0, compose_stream,
+                               reinterpret_cast<const float2*>(coord[cur]->data),
+                               reinterpret_cast<const float2*>(ring[slot]->data),
+                               reinterpret_cast<float2*>(coord[1-cur]->data), w, h, mx, my);
+            cur = 1 - cur;
+        }
+        HIP_CHECK(hipGetLastError());
+        HIP_CHECK(hipStreamSynchronize(compose_stream));
+        coord_cur = cur;
     }
 
     // map_only: write the carried map (k_map_out, RGBA16F) instead of composing.
