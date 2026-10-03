@@ -837,3 +837,14 @@ the engine writes the full frame (the input's alpha is always kept):
   ratio without the inverse curve (diagnostic). The tone exposure now moves
   only past 1/4 stop with slow adaptation (cars entering the frame must not
   step it).
+- Controls tuned for lighting over invented detail (S324). Public docs
+  (reshade-dlss5-linux, OptiScaler DLSS-NR): LocalTone = local contrast and
+  tone, LocalStructure = fine detail the model synthesises, SkinStructure =
+  structure on characters (needs the auto mask), Style = models A/B/C.
+  WhitePoint-8 stand-in, game config, broad (>=32 px) / fine log-ratio std:
+  0,0,1 0.072/0.041; 0,1,1 0.092/0.043; 0,1,0.3 0.054/0.021; 0,1.5,0.3
+  0.076/0.027; 0,2,0.3 0.076/0.029 (limit-bound); Style 1-2 barely differs.
+  LocalTone is frame-wide: with 1.5 a bright object entering changes the
+  edit elsewhere by 3% (0.032 vs 0.017, "breathing"); 1.0 does not (0.019).
+  Game config: controls=0,1,0.3,-1,-1 (edit a smooth lighting field: sign
+  glow on walls, lit ground brighter, glass no longer clipped dark).
