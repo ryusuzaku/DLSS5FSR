@@ -795,3 +795,13 @@ the engine writes the full frame (the input's alpha is always kept):
   absolute luminance differences in the proxy. On a capture re-encoded for
   WhitePoint 8, the edit without `tone` is blotchy mottling on walls and
   glass; with `tone=0.18` it is clean definition.
+- `controls=a,b,c,d,e` sets stem input features 10..14, which the original
+  uses as its controls: Style/128, LocalTone, LocalStructure, skin and
+  background (peer DLSSNR-AMD `image_input.glsl`; without the automatic mask
+  its defaults are `0,0,1,-1,-1`). The fixtures were captured with zeros,
+  which stays the default. With zeros the network barely edits (+-0.4% at
+  the original's output scale, gain=0), which is why `gain=1` (32x the
+  original's `base + o*0.25`) once looked necessary and amplified noise into
+  grain. With `0,0,1,-1,-1` at gain=0 the edit is clean and structured
+  (ratio p1 0.82 / p99 1.27 on the 496x310 crop); on the luma path the
+  structural edit doubles and grain/structure falls from 0.88 to 0.56.

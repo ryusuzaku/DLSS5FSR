@@ -178,6 +178,7 @@ struct OutputOptions {
     int luma = 0, denoise = 0, motion = 2, motion_sign = 1;  // motion 2 = auto
     int compact = 0;  // extent=compact: smallest multiple-of-64 extent (fast path only)
     float tone = 0.0f;  // tone=K: luma mode network input through auto exposure (key K) + ACES
+    float controls[5] = {0, 0, 0, 0, 0};  // controls=a,b,c,d,e: stem features 10..14
     float scale = 1.0f;
     float limit = 0.0f, smooth = 0.0f, sigma = 0.02f, strength = 1.0f, gate = 0.03f;
     int gain = -1;
@@ -639,6 +640,17 @@ struct Engine {
             else if (key == "scale") options.scale = std::stof(value);
             else if (key == "extent" && (value == "compact" || value == "legacy")) options.compact = value == "compact";
             else if (key == "tone") options.tone = std::stof(value);
+            else if (key == "controls") {
+                // style/128, local tone, local structure, skin, background (the
+                // original's defaults without its automatic mask: 0,0,1,-1,-1).
+                size_t at = 0;
+                for (int k = 0; k < 5; ++k) {
+                    size_t comma = value.find(',', at);
+                    if ((comma == std::string::npos) != (k == 4)) throw std::runtime_error("controls needs five values: " + line);
+                    options.controls[k] = std::stof(value.substr(at, comma - at));
+                    at = comma + 1;
+                }
+            }
             else if (key == "motion_sign" && (value == "1" || value == "-1")) options.motion_sign = std::stoi(value);
             else throw std::runtime_error("unknown engine option: " + line);
         }
@@ -845,6 +857,7 @@ struct Engine {
             HIP_CHECK(hipGetLastError());
             tone = tone_state->data;
         }
+        for (int k = 0; k < 5; ++k) net->front->controls.v[k] = job_crop ? 0.0f : options.controls[k];
         HIP_CHECK(hipEventRecord(start, stream));
         net->run(reinterpret_cast<const unsigned char*>(raw_input->data), frame_w, frame_h, frame_pitch,
                  frame_bpp, job_crop, stream, sw, sh, tone);

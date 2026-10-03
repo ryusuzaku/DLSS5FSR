@@ -23,9 +23,13 @@ __device__ inline bool front_window_pixel(int token, int width, int height, int 
     return x >= 0 && x < width && y >= 0 && y < height;
 }
 
-// 15 input channels: noise(3), 1, x(3), x(3), zeros(5); x=half((rgb-.5)*.125).
+// 15 input channels: noise(3), 1, x(3), x(3), controls(5); x=half((rgb-.5)*.125).
+// The controls are the original's style/128, local tone, local structure, skin
+// and background features (peer DLSSNR-AMD image_input.glsl); the fixtures
+// were captured with all five zero, which stays the default.
+struct FrontControls { float v[5]; };
 __global__ void k_front_stem(const float* rgb, const float* noise, const float* stem,
-                             float* tokens, int width, int height) {
+                             float* tokens, int width, int height, FrontControls controls = {}) {
     int id = blockIdx.x*blockDim.x+threadIdx.x;
     if (id >= width*height*32) return;
     int token = id/32, c = id%32, x, y;
@@ -40,7 +44,7 @@ __global__ void k_front_stem(const float* rgb, const float* noise, const float* 
         float v = h70_h(centered*.125f);
         f[4+k] = v; f[7+k] = v;
     }
-    for (int k = 10; k < 15; ++k) f[k] = 0.0f;
+    for (int k = 10; k < 15; ++k) f[k] = h70_h(controls.v[k-10]);
     float part = 0.0f;
     for (int k = 0; k < 15; ++k) part += f[k]*stem[k*32+c];
     tokens[id] = h70_h(part);
@@ -105,6 +109,9 @@ __global__ void k_front_native32(const float* peer, float* native, int n, int cl
 }
 
 class FrontEnd {
+public:
+    FrontControls controls{};  // stem features 10..14 (engine option controls=)
+private:
     static int checked(int w, int h) {
         if (w <= 0 || h <= 0 || w % 64 || h % 64) throw std::invalid_argument("front end requires RGB extents that are multiples of 64");
         return w;
@@ -169,7 +176,7 @@ public:
         ready = false;
         if (!rgb.data || rgb.count != pixels*3) return false;
         if (!check(dir,"rgb",rgb.data,pixels*3,verify,comparisons)) return false;
-        FRONT_LAUNCH(k_front_stem,pixels*32,rgb.data,noise.data,stem.data,tokens.data,width,height);
+        FRONT_LAUNCH(k_front_stem,pixels*32,rgb.data,noise.data,stem.data,tokens.data,width,height,controls);
         const float *raw = nullptr, *quant = nullptr;
         const bool fused = !verify && !c512_resident::exact_math;  // bodies gather/scatter themselves
         auto io = [](int in_hwc, int w, int h, int shift) {
