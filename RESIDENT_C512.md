@@ -822,3 +822,18 @@ the engine writes the full frame (the input's alpha is always kept):
   with encoded+temporal the edit is 1.6x and settles (frame 50 -> 79
   structure 0.0925 -> 0.0931); a still frame keeps ~1% residual flicker
   from the moving noise.
+- Moving objects (S324, `RE_OBJECT` in resident_engine_frame: a capture patch
+  driven across a still background with motion only on it). `temporal=1`
+  leaves a long trail behind moving objects (in game: see-through cars a few
+  lengths behind): the recurrence re-applies the network to its own output,
+  so the edit builds up over ~20-50 runs, and wherever an object uncovers the
+  background that build-up restarts. Trail vs a still run 0.058 (temporal)
+  vs 0.031 (off). History guards (`history_clamp=1` TAA neighbourhood clamp,
+  `=2` default: drop history where the carried previous input differs from
+  the current by more than `reject`) remove the immediate see-through copy
+  but not the restart; the clamp also cuts the edit and adds flicker. Game
+  config is therefore temporal=0 with smooth=0.85 (pan shimmer 0.0027 vs
+  0.0022 with temporal, no added trail). `tone_inverse=0` applies the toned
+  ratio without the inverse curve (diagnostic). The tone exposure now moves
+  only past 1/4 stop with slow adaptation (cars entering the frame must not
+  step it).

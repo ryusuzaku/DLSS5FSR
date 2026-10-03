@@ -16,7 +16,10 @@
 //   (re_compose_map_device, RGBA16F) after the last frame, for checking what
 //   the shim's map resolve makes of it on frame n. RE_DUMP_PREFIX=P writes
 //   every game-cadence frame's output to P_NNN.bin (same format as out.bin),
-//   for measuring frame-to-frame stability.
+//   for measuring frame-to-frame stability. RE_OBJECT=sx,sy,w,h,x,y moves a
+//   w x h patch of the capture (from sx,sy) across a still background instead
+//   of panning: frame f draws it at (x + f*pan, y), with motion only on it
+//   (like a car passing a still camera; for checking history ghosts).
 // out.bin: 12-byte header (width, height, bpp as uint32) + tightly packed rows.
 #include <hip/hip_runtime.h>
 #include <windows.h>
@@ -73,7 +76,26 @@ int main(int argc, char** argv) {
     for (size_t i = 0; i < field.size(); i += 2) { field[i] = sign*float(pan)/(uv ? float(w) : 1.0f); field[i+1] = 0.0f; }
     if (hipMemcpy(mv, field.data(), field.size()*4, hipMemcpyHostToDevice) != hipSuccess) return 1;
     std::vector<unsigned char> shifted(size_t(pitch)*h), frame(size_t(w)*h*bpp);
+    int obj[6] = {0, 0, 0, 0, 0, 0};
+    const bool object = getenv("RE_OBJECT") &&
+        sscanf(getenv("RE_OBJECT"), "%d,%d,%d,%d,%d,%d", &obj[0], &obj[1], &obj[2], &obj[3], &obj[4], &obj[5]) == 6;
     auto stage = [&](int index) {
+        if (object) {
+            memcpy(shifted.data(), pixels, shifted.size());
+            const int ox = obj[4] + index*pan, oy = obj[5];
+            for (size_t i = 0; i < field.size(); ++i) field[i] = 0.0f;
+            for (int y = 0; y < obj[3]; ++y)
+                for (int x = 0; x < obj[2]; ++x) {
+                    int dx = ox + x, dy = oy + y;
+                    if (dx < 0 || dx >= w || dy < 0 || dy >= h) continue;
+                    memcpy(&shifted[size_t(dy)*pitch + size_t(dx)*bpp],
+                           pixels + size_t(obj[1]+y)*pitch + size_t(obj[0]+x)*bpp, bpp);
+                    // this pixel was pan to the left on the previous frame
+                    field[(size_t(dy)*w + dx)*2] = -sign*float(pan)/(uv ? float(w) : 1.0f);
+                }
+            return hipMemcpy(staging, shifted.data(), shifted.size(), hipMemcpyHostToDevice) == hipSuccess &&
+                   hipMemcpy(mv, field.data(), field.size()*4, hipMemcpyHostToDevice) == hipSuccess;
+        }
         int offset = index*pan;
         for (int y = 0; y < h; ++y)
             for (int x = 0; x < w; ++x) {

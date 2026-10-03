@@ -73,9 +73,12 @@ __global__ void k_tone_measure(const unsigned char* src, int pitch, int bpp, int
 __global__ void k_tone_update(float* tone, float key) {
     if (tone[1] > 0.0f) {
         const float target = fminf(fmaxf(log2f(key) - tone[0] / tone[1] * 1.44269504f, -6.0f), 6.0f);
-        tone[4] = tone[3] > 0.0f ? tone[4] + (target - tone[4])*0.25f : target;  // smoothed over runs
+        // Slow and sticky: a car driving into view moves the frame average,
+        // and every exposure step changes the network's answer in bright
+        // areas (a brightness pump), so only lasting changes past 1/4 stop move it.
+        tone[4] = tone[3] > 0.0f ? tone[4] + (target - tone[4])*0.05f : target;  // smoothed over runs
         const float applied = tone[3] > 0.0f ? log2f(tone[2]) : 1e9f;
-        if (fabsf(tone[4] - applied) > 1.5f/32.0f) tone[2] = exp2f(rintf(tone[4]*32.0f) / 32.0f);
+        if (fabsf(tone[4] - applied) > 0.25f) tone[2] = exp2f(rintf(tone[4]*32.0f) / 32.0f);
         tone[3] = 1.0f;
     }
     tone[0] = 0.0f; tone[1] = 0.0f;
@@ -184,6 +187,9 @@ struct OutputOptions {
     float controls[5] = {0, 0, 0, 0, 0};  // controls=a,b,c,d,e: stem features 10..14
     int encoded = 0;      // encoded=1: feed the network display-encoded colour, as the original
     float temporal = 0.0f;  // temporal=S: the original's history recurrence, S x its blend scale
+    int tone_inverse = 1;  // tone: map the ratio back through the inverse curve (0: use it as it is)
+    int history_clamp = 2;  // history guard: 0 none, 1 neighbourhood clamp, 2 reject where the input changed
+    float reject = 0.06f;   // history_clamp=2: largest input channel change that keeps the history
     float scale = 1.0f;
     float limit = 0.0f, smooth = 0.0f, sigma = 0.02f, strength = 1.0f, gate = 0.03f;
     int gain = -1;
@@ -261,9 +267,11 @@ __global__ void k_ratio_map(const float* linear, const float* color, const unsig
         float d = net_ratio(linear, color, x1, y1, sw, sh, W, o.denoise, o.encoded);
         r = (a*(1.0f-tx) + b*tx)*(1.0f-ty) + (c*(1.0f-tx) + d*tx)*ty;
     }
-    if (tone && yin > 1e-5f) {
+    if (tone && yin > 1e-5f && o.tone_inverse) {
         // The network's ratio is on the toned picture: carry it back to the
-        // frame's own light through the inverse curve (luminance).
+        // frame's own light through the inverse curve (luminance). Near the
+        // curve's shoulder the inverse amplifies any change in the answer
+        // without bound (tone_inverse=0 applies the toned ratio as it is).
         const float e = tone[2], t = tone_aces(yin*e);
         r = tone_aces_inverse(t*r) / e / yin;
     }
@@ -491,6 +499,46 @@ __global__ void k_history_sample(const float* previous, const float2* coord, flo
         out[size_t(i)*3+c] = fminf(fmaxf(v, 0.0f), 1.0f);
     }
 }
+// Clamp the carried history (in place) to the current input's 3x3
+// neighbourhood range per channel, as TAA does: a pixel the moving object
+// has just uncovered (zero motion, history = the object) cannot bring the
+// object's colour back as a see-through ghost. The original relies on its
+// network to reject such history; ours lets part of it through.
+__global__ void k_history_clamp(const float* color, float* history, int sw, int sh, int W, int H) {
+    int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= W*H) return;
+    float* q = history + size_t(i)*3;
+    if (q[0] < 0.0f) return;
+    int x = min(i % W, sw-1), y = min(i / W, sh-1);
+    for (int c = 0; c < 3; ++c) {
+        float lo = 1e9f, hi = -1e9f;
+        for (int dy = -1; dy <= 1; ++dy)
+            for (int dx = -1; dx <= 1; ++dx) {
+                int nx = min(max(x+dx, 0), sw-1), ny = min(max(y+dy, 0), sh-1);
+                float v = color[(size_t(ny)*W + nx)*3 + c];
+                lo = fminf(lo, v); hi = fmaxf(hi, v);
+            }
+        q[c] = fminf(fmaxf(q[c], lo), hi);
+    }
+}
+// history_clamp=2 (default): reject instead of clamp. hin is the previous
+// run's network input carried the same way as the history; where it differs
+// from the current input (largest channel > thr, e.g. road the car just
+// uncovered) the history is dropped for that pixel, so the network's own
+// edit survives everywhere the content stayed the same.
+__global__ void k_history_reject(const float* color, float* history, const float* hin, int sw, int sh,
+                                 int W, int H, float thr) {
+    int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= W*H) return;
+    float* q = history + size_t(i)*3;
+    const float* p = hin + size_t(i)*3;
+    if (q[0] < 0.0f) return;
+    if (p[0] < 0.0f) { q[0] = -1.0f; return; }
+    int x = min(i % W, sw-1), y = min(i / W, sh-1);
+    const float* cc = color + (size_t(y)*W + x)*3;
+    float d = fmaxf(fabsf(p[0]-cc[0]), fmaxf(fabsf(p[1]-cc[1]), fabsf(p[2]-cc[2])));
+    if (d > thr) q[0] = -1.0f;
+}
 // The head's history weight from its 32 features (tile layout of
 // k_head70_finish) and the blend into both head images, in place.
 __global__ void k_head_temporal(const float* tiles, const float* row, const float* history,
@@ -585,7 +633,8 @@ struct Network {
 
     // sw x sh: the network content (the frame, or its downscale); 0 = the frame.
     void run(const unsigned char* src, int fw, int fh, int pitch, int bpp, bool crop, hipStream_t stream,
-             int sw = 0, int sh = 0, const float* tone = nullptr, int encoded = 0) {
+             int sw = 0, int sh = 0, const float* tone = nullptr, int encoded = 0,
+             float* history_clamp = nullptr, const float* history_input = nullptr, float reject = 0.0f) {
         if (sw <= 0 || sh <= 0) { sw = fw; sh = fh; }
         if (crop) {
             if (W != 256 || H != 256) throw std::runtime_error("crop mode needs the 256x256 network");
@@ -594,6 +643,12 @@ struct Network {
         } else {
             hipLaunchKernelGGL(k_candidate_input_full, dim3((W*H+255)/256), dim3(256), 0, stream,
                                src, color->data, fw, fh, pitch, bpp, W, H, sw, sh, tone, encoded);
+            if (history_clamp && history_input)
+                hipLaunchKernelGGL(k_history_reject, dim3((W*H+255)/256), dim3(256), 0, stream,
+                                   color->data, history_clamp, history_input, sw, sh, W, H, reject);
+            else if (history_clamp)
+                hipLaunchKernelGGL(k_history_clamp, dim3((W*H+255)/256), dim3(256), 0, stream,
+                                   color->data, history_clamp, sw, sh, W, H);
         }
         HIP_CHECK(hipGetLastError());
         bool ok = front->run_from_device({color->data,color->count}) &&
@@ -697,7 +752,7 @@ struct Engine {
     // it is on; per job the frame-pixel positions of the job's pixels in that
     // frame (coord[coord_cur], built in prepare), the sampled history, the
     // head's row 6 and the noise seed counter.
-    std::unique_ptr<Buffer> hist_prev, hist_cur, coord[2], hist_row;
+    std::unique_ptr<Buffer> hist_prev, hist_cur, coord[2], hist_row, hin_prev, hin_cur;
     long long hist_frame = -1;
     int hist_W = 0, hist_H = 0, hist_sw = 0, hist_sh = 0;
     int coord_cur = -1;                // -1: no history for this job; 2: same frame (identity)
@@ -727,6 +782,9 @@ struct Engine {
             else if (key == "tone") options.tone = std::stof(value);
             else if (key == "encoded") options.encoded = std::stoi(value);
             else if (key == "temporal") options.temporal = std::stof(value);
+            else if (key == "history_clamp") options.history_clamp = std::stoi(value);
+            else if (key == "reject") options.reject = std::stof(value);
+            else if (key == "tone_inverse") options.tone_inverse = std::stoi(value);
             else if (key == "controls") {
                 // style/128, local tone, local structure, skin, background (the
                 // original's defaults without its automatic mask: 0,0,1,-1,-1).
@@ -950,7 +1008,7 @@ struct Engine {
         }
         for (int k = 0; k < 5; ++k) net->front->controls.v[k] = job_crop ? 0.0f : options.controls[k];
         const bool temporal = !job_crop && options.luma && options.temporal > 0.0f;
-        bool use_history = false;
+        bool use_history = false, hin_ok = false;
         if (temporal) {
             if (!hist_row) {
                 std::vector<float> row(32);
@@ -967,11 +1025,15 @@ struct Engine {
             size_t count = size_t(W)*H*3;
             if (!hist_cur || hist_cur->count < count) hist_cur.reset(new Buffer(count));
             use_history = coord_cur >= 0 && hist_prev && hist_W == W && hist_H == H && hist_sw == sw && hist_sh == sh;
+            if (!hin_cur || hin_cur->count < count) hin_cur.reset(new Buffer(count));
+            hin_ok = use_history && hin_prev;
+            const float2* coords = coord_cur == 2 || !use_history ? nullptr : reinterpret_cast<const float2*>(coord[coord_cur]->data);
             if (use_history)
                 hipLaunchKernelGGL(k_history_sample, dim3((W*H+255)/256), dim3(256), 0, stream,
-                                   hist_prev->data,
-                                   coord_cur == 2 ? nullptr : reinterpret_cast<const float2*>(coord[coord_cur]->data),
-                                   hist_cur->data, frame_w, frame_h, sw, sh, W, H);
+                                   hist_prev->data, coords, hist_cur->data, frame_w, frame_h, sw, sh, W, H);
+            if (hin_ok)
+                hipLaunchKernelGGL(k_history_sample, dim3((W*H+255)/256), dim3(256), 0, stream,
+                                   hin_prev->data, coords, hin_cur->data, frame_w, frame_h, sw, sh, W, H);
             // The original's seed: a counter per run, 0 on the first frame and
             // after a reset (here: whenever there is no history to blend with).
             temporal_seed = use_history ? temporal_seed + 1 : 0;
@@ -980,7 +1042,9 @@ struct Engine {
         net->front->noise_seed = temporal ? temporal_seed : 0;
         HIP_CHECK(hipEventRecord(start, stream));
         net->run(reinterpret_cast<const unsigned char*>(raw_input->data), frame_w, frame_h, frame_pitch,
-                 frame_bpp, job_crop, stream, sw, sh, tone, !job_crop && options.encoded);
+                 frame_bpp, job_crop, stream, sw, sh, tone, !job_crop && options.encoded,
+                 use_history && options.history_clamp ? hist_cur->data : nullptr,
+                 use_history && options.history_clamp == 2 && hin_ok ? hin_cur->data : nullptr, options.reject);
         if (temporal) {
             if (use_history) {
                 hipLaunchKernelGGL(k_head_temporal, dim3((W*H+255)/256), dim3(256), 0, stream,
@@ -991,6 +1055,9 @@ struct Engine {
             size_t count = size_t(W)*H*3;
             if (!hist_prev || hist_prev->count < count) hist_prev.reset(new Buffer(count));
             HIP_CHECK(hipMemcpyAsync(hist_prev->data, net->rgb_native->data, count*sizeof(float),
+                                     hipMemcpyDeviceToDevice, stream));
+            if (!hin_prev || hin_prev->count < count) hin_prev.reset(new Buffer(count));
+            HIP_CHECK(hipMemcpyAsync(hin_prev->data, net->color->data, count*sizeof(float),
                                      hipMemcpyDeviceToDevice, stream));
             hist_W = W; hist_H = H; hist_sw = sw; hist_sh = sh;
             hist_frame = job_frame;
