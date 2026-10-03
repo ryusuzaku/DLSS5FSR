@@ -344,6 +344,7 @@ enum DlssNrMode : unsigned int {
     NR_MODE_RESOLVE = 1,
     NR_MODE_DOWNSAMPLE = 2,
     NR_MODE_MOTION = 3,  // the game's motion vectors -> float2 prev-minus-cur in dispatch pixels
+    NR_MODE_DEPTH = 4,   // the game's depth -> float at dispatch pixels (nearest)
 };
 
 // The game's motion vectors for the resident engine's temporal carry:
@@ -353,6 +354,9 @@ struct MotionInput {
     ID3D12Resource* res = nullptr;
     float scaleX = 1.0f, scaleY = 1.0f;
     unsigned int guideW = 0, guideH = 0;
+    // The game's depth (optional) and the region of it covering the frame.
+    ID3D12Resource* depth = nullptr;
+    unsigned int depthW = 0, depthH = 0;
 };
 
 // The CPU mirror of cbuffer Params in shaders/dlssnr.hlsl.
@@ -600,6 +604,9 @@ ID3D12Resource* HipStagingOut();
 ID3D12Resource* HipStagingMotion();
 UINT64 HipStagingMotionRowPitch();
 void HipSetMotionStaged(bool staged);
+UINT64 HipStagingDepthOffset();      // depth rows (R32F) inside the motion staging buffer
+UINT64 HipStagingDepthRowPitch();
+void HipSetDepthStaged(bool staged);
 bool HipUsable();
 
 // The one-frame-late choreography, driven from DoEvaluateD3D12:

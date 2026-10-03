@@ -102,6 +102,10 @@ struct State {
     UINT64 mvPitch = 0, mvBytes = 0;
     bool motionStaged = false;
     uint64_t engineMotionFrames = 0;
+    // Depth (R32F rows) after the motion in the same buffer.
+    UINT64 depthOffset = 0, depthPitch = 0;
+    bool depthStaged = false;
+    int (*EngineDepth)(const void*, int, int, int) = nullptr;  // optional (re_depth)
 
     uint64_t runs = 0;  // successful model launches (for the log)
 
@@ -237,6 +241,8 @@ void DropStaging() {
     s.bufMv.Reset();
     s.mvPitch = s.mvBytes = 0;
     s.motionStaged = false;
+    s.depthOffset = s.depthPitch = 0;
+    s.depthStaged = false;
     s.ptrIn = s.ptrOut = nullptr;
     if (s.hIn) CloseHandle(s.hIn);
     if (s.hOut) CloseHandle(s.hOut);
@@ -590,7 +596,12 @@ bool EnsureStaging(unsigned int w, unsigned int h, unsigned int bpp) {
         const UINT64 mvRow = (UINT64)w * 8;
         s.mvPitch = (mvRow + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) /
                     D3D12_TEXTURE_DATA_PITCH_ALIGNMENT * D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
-        s.mvBytes = s.mvPitch * h;
+        // Depth rows (R32F) follow at a placement-aligned offset.
+        s.depthPitch = ((UINT64)w * 4 + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) /
+                       D3D12_TEXTURE_DATA_PITCH_ALIGNMENT * D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
+        s.depthOffset = (s.mvPitch * h + D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1) /
+                        D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT * D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT;
+        s.mvBytes = s.depthOffset + s.depthPitch * h;
         D3D12_RESOURCE_DESC md = bd;
         md.Width = s.mvBytes;
         hipExternalMemoryHandleDesc hd{};
@@ -616,6 +627,7 @@ bool EnsureStaging(unsigned int w, unsigned int h, unsigned int bpp) {
             s.extMv = nullptr; s.ptrMv = nullptr;
             if (s.hMv) CloseHandle(s.hMv);
             s.hMv = nullptr; s.bufMv.Reset(); s.mvPitch = s.mvBytes = 0;
+            s.depthOffset = s.depthPitch = 0;
         }
     }
 
@@ -803,9 +815,26 @@ bool CandidateInputCapture() {
         LOGE("hip: candidate input capture cannot open %ls", tmp.c_str());
         return false;
     }
-    const bool written = fwrite(header, 1, sizeof(header), f) == sizeof(header) &&
-                         fwrite(pixels.data(), 1, pixels.size(), f) == pixels.size() &&
-                         fflush(f) == 0;
+    bool written = fwrite(header, 1, sizeof(header), f) == sizeof(header) &&
+                   fwrite(pixels.data(), 1, pixels.size(), f) == pixels.size();
+    // Optional trailer: "D5DEP001", width, height, then the staged depth
+    // (float, tightly packed rows), for offline tests of depth guidance.
+    if (written && s.depthStaged && s.ptrMv && s.depthPitch) {
+        std::vector<float> depth((size_t)s.w * s.h);
+        bool ok = true;
+        for (unsigned int y = 0; y < s.h && ok; ++y)
+            ok = s.Memcpy(depth.data() + (size_t)y * s.w,
+                          (const unsigned char*)s.ptrMv + s.depthOffset + (size_t)y * s.depthPitch,
+                          (size_t)s.w * 4, hipMemcpyDeviceToHost) == hipSuccess;
+        if (ok) ok = s.StreamSynchronize(s.stream) == hipSuccess;
+        if (ok) {
+            const unsigned int dims[2] = {s.w, s.h};
+            written = fwrite("D5DEP001", 1, 8, f) == 8 && fwrite(dims, 4, 2, f) == 2 &&
+                      fwrite(depth.data(), 4, depth.size(), f) == depth.size();
+            LOGI("hip: capture includes depth (%ux%u)", s.w, s.h);
+        }
+    }
+    written = written && fflush(f) == 0;
     const bool closed = fclose(f) == 0;
     if (!written || !closed ||
         !MoveFileExW(tmp.c_str(), cfg.candidateInputCapturePath.c_str(),
@@ -857,6 +886,7 @@ static bool EngineReady() {
         GetProcAddress(s.engineDll, "re_compose_map_device");
     s.EngineMapParams = (int (*)(float*))GetProcAddress(s.engineDll, "re_luma_map_params");
     s.EngineControls = (int (*)(const float*, int))GetProcAddress(s.engineDll, "re_controls");
+    s.EngineDepth = (int (*)(const void*, int, int, int))GetProcAddress(s.engineDll, "re_depth");
     s.engineControlsGeneration = 0;
     s.EnginePollFrame = (int (*)(unsigned char*, unsigned long long, int, int, int, float*))
         GetProcAddress(s.engineDll, "re_poll_frame");
@@ -926,6 +956,11 @@ bool ResidentEngineSubmit() {
                  (unsigned long long)s.engineMotionFrames, s.w, s.h, maxX, maxY, sumX / (float)s.w,
                  mode >= -1 && mode <= 3 ? kModes[mode + 1] : "n/a");
         }
+    }
+    if (cfg.residentEngineFull && s.EngineDepth && s.depthStaged && s.ptrMv && s.depthPitch) {
+        const int d = s.EngineDepth((const unsigned char*)s.ptrMv + s.depthOffset, (int)s.w, (int)s.h,
+                                    (int)s.depthPitch);
+        if (d < 0) LOGW("hip: resident engine depth rejected: %s", s.EngineError());
     }
     if (s.EngineControls) {
         const NrControls& c = NrControlValues();
@@ -10894,6 +10929,9 @@ ID3D12Resource* StagingOut() { return S().bufOut.Get(); }
 ID3D12Resource* StagingMotion() { return S().bufMv.Get(); }
 UINT64 StagingMotionRowPitch() { return S().mvPitch; }
 void SetMotionStaged(bool staged) { S().motionStaged = staged; }
+UINT64 StagingDepthOffset() { return S().depthOffset; }
+UINT64 StagingDepthRowPitch() { return S().depthPitch; }
+void SetDepthStaged(bool staged) { S().depthStaged = staged; }
 bool LumaMap(float params[4]) {
     for (int i = 0; i < 4; ++i) params[i] = S().mapParams[i];
     return S().mapActive;
@@ -10955,6 +10993,9 @@ ID3D12Resource* HipStagingOut() { return hipb::StagingOut(); }
 ID3D12Resource* HipStagingMotion() { return hipb::StagingMotion(); }
 UINT64 HipStagingMotionRowPitch() { return hipb::StagingMotionRowPitch(); }
 void HipSetMotionStaged(bool staged) { hipb::SetMotionStaged(staged); }
+UINT64 HipStagingDepthOffset() { return hipb::StagingDepthOffset(); }
+UINT64 HipStagingDepthRowPitch() { return hipb::StagingDepthRowPitch(); }
+void HipSetDepthStaged(bool staged) { hipb::SetDepthStaged(staged); }
 bool HipUsable() { return hipb::Usable(); }
 
 }  // namespace ngx

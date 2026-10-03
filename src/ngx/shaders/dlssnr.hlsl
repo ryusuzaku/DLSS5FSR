@@ -169,6 +169,18 @@ void main(uint3 id : SV_DispatchThreadID)
         return;
     }
 
+    // Depth for the resident engine: the game's depth under this pixel,
+    // nearest (a blend across a silhouette is a depth that exists nowhere).
+    if (gMode == 4)
+    {
+        int2 texel = int2(uv * float2(gGuideWidth, gGuideHeight));
+        texel = min(texel, int2(gGuideWidth, gGuideHeight) - 1);
+        float d = gSource.Load(int3(texel, 0)).x;
+        if (isnan(d) || isinf(d)) d = 0.0;
+        gTarget[id.xy] = float4(d, 0.0, 0.0, 0.0);
+        return;
+    }
+
     if (gMode == 0)
     {
         float4 source = gSource.Load(int3(id.xy, 0));

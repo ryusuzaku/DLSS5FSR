@@ -69,6 +69,19 @@ int main(int argc, char** argv) {
     memcpy(hdr, capture.data()+8, sizeof(hdr));
     int w = int(hdr[0]), h = int(hdr[1]), bpp = int(hdr[2]), pitch = int(hdr[3]);
     const unsigned char* pixels = capture.data()+36;
+    // Optional depth trailer (D5DEP001, width, height, float rows), sent
+    // through re_depth before every submit (the still capture's depth).
+    void* depth_dev = nullptr;
+    typedef int (*DepthFn)(const void*, int, int, int);
+    auto send_depth = (DepthFn)GetProcAddress(dll, "re_depth");
+    {
+        const size_t at = 36 + size_t(pitch)*h;
+        if (send_depth && capture.size() >= at + 16 + size_t(w)*h*4 && !memcmp(capture.data()+at, "D5DEP001", 8)) {
+            if (hipMalloc(&depth_dev, size_t(w)*h*4) != hipSuccess ||
+                hipMemcpy(depth_dev, capture.data()+at+16, size_t(w)*h*4, hipMemcpyHostToDevice) != hipSuccess) return 1;
+            printf("capture depth: %dx%d\n", w, h);
+        }
+    }
     void *staging = nullptr, *mv = nullptr, *still = nullptr;
     if (hipMalloc(&staging, size_t(pitch)*h) != hipSuccess || hipMalloc(&mv, size_t(w)*h*8) != hipSuccess ||
         hipMalloc(&still, size_t(w)*h*8) != hipSuccess || hipMemset(still, 0, size_t(w)*h*8) != hipSuccess) return 1;
@@ -118,7 +131,7 @@ int main(int argc, char** argv) {
         // Warm up on the first position until a result lands (decides motion=auto too).
         if (!stage(0)) return 1;
         for (int tries = 0; tries < 1000 && r != 1; ++tries) {
-            if (motion(still, w, h, w*8) < 0 || submit_full(staging, w, h, pitch, bpp, 1) < 0) return 1;
+            if (motion(still, w, h, w*8) < 0 || (depth_dev && send_depth(depth_dev, w, h, w*4) < 0 ? -1 : submit_full(staging, w, h, pitch, bpp, 1)) < 0) return 1;
             r = poll_frame(frame.data(), size_t(w)*bpp, w, h, bpp, &ms);
             std::this_thread::sleep_for(std::chrono::milliseconds(16));
         }
@@ -135,7 +148,7 @@ int main(int argc, char** argv) {
             const bool moving = k != staged;
             if (moving && !stage(k)) return 1;
             staged = k;
-            if (motion(moving ? mv : still, w, h, w*8) < 0 || submit_full(staging, w, h, pitch, bpp, 1) < 0) {
+            if (motion(moving ? mv : still, w, h, w*8) < 0 || (depth_dev && send_depth(depth_dev, w, h, w*4) < 0 ? -1 : submit_full(staging, w, h, pitch, bpp, 1)) < 0) {
                 fprintf(stderr, "submit failed: %s\n", error()); return 1;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(period));
@@ -180,7 +193,7 @@ int main(int argc, char** argv) {
         r = 0;
         for (int tries = 0; tries < 1000 && r != 1; ++tries) {
             // The pan's motion on the frame that moved, none on repeats of it.
-            if (motion(tries == 0 ? mv : still, w, h, w*8) < 0 || submit_full(staging, w, h, pitch, bpp, 1) < 0) {
+            if (motion(tries == 0 ? mv : still, w, h, w*8) < 0 || (depth_dev && send_depth(depth_dev, w, h, w*4) < 0 ? -1 : submit_full(staging, w, h, pitch, bpp, 1)) < 0) {
                 fprintf(stderr, "submit failed: %s\n", error()); return 1;
             }
             r = poll_frame(frame.data(), size_t(w)*bpp, w, h, bpp, &ms);

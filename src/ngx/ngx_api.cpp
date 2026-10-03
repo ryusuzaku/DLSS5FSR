@@ -239,6 +239,16 @@ NVSDK_NGX_Result DoEvaluateD3D12(ID3D12GraphicsCommandList* cl,
         const bool display = md.Width >= (UINT64)outRect.w;
         motion.guideW = display ? outRect.w : colorRect.w;
         motion.guideH = display ? outRect.h : colorRect.h;
+        if (depth) {
+            const D3D12_RESOURCE_DESC dd = depth->GetDesc();
+            const bool depthDisplay = dd.Width >= (UINT64)outRect.w;
+            motion.depth = depth;
+            motion.depthW = depthDisplay ? outRect.w : colorRect.w;
+            motion.depthH = depthDisplay ? outRect.h : colorRect.h;
+            if (n == 0 || (n % 3000) == 0)
+                LOGI("evaluate #%llu depth: %llux%u format %u guide %ux%u", n, (unsigned long long)dd.Width,
+                     dd.Height, (unsigned)dd.Format, motion.depthW, motion.depthH);
+        }
         if (n == 0 || (n % 3000) == 0)
             LOGI("evaluate #%llu motion: %llux%u format %u scale %.3f,%.3f guide %ux%u (%s resolution)", n,
                  (unsigned long long)md.Width, md.Height, (unsigned)md.Format, motion.scaleX, motion.scaleY,

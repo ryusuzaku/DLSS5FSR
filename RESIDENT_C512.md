@@ -857,3 +857,14 @@ the engine writes the full frame (the input's alpha is always kept):
   resident_engine_frame `RE_CONTROLS=1,0,0.3,1,-1,0`: byte-identical to
   `controls=0,1,0.3,-1,-1 strength=1`. OptiScaler.ini [DlssNr] holds the
   starting values (Style, Intensity, LocalStructure, LocalTone).
+- Depth guidance (S324). The shim stages the game's depth (NGX Depth,
+  nearest-resampled to the staging size by dlssnr.hlsl mode 4, typeless
+  depth formats read as their depth channel) into the motion staging buffer
+  after the vectors and hands it to the engine (`re_depth`) before each
+  submit; captures append it as a `D5DEP001` trailer (width, height, float
+  rows), which resident_engine_frame feeds back. `depth_sigma=S` weights the
+  denoise window's neighbours by exp(-(relative depth difference / S)^2), so a
+  wider window (game config denoise=3, depth_sigma=0.05) smooths the ratio
+  on a surface without mixing surfaces across silhouettes. Synthetic depth
+  step check: output changes only next to the step, no non-finite values.
+  Real-depth tuning waits for the first capture with the trailer.

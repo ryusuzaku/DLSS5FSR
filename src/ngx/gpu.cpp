@@ -244,6 +244,15 @@ DXGI_FORMAT TypedFormat(DXGI_FORMAT f) {
         // Two-channel layouts (motion vectors): float is the NGX convention.
         case DXGI_FORMAT_R16G16_TYPELESS:        return DXGI_FORMAT_R16G16_FLOAT;
         case DXGI_FORMAT_R32G32_TYPELESS:        return DXGI_FORMAT_R32G32_FLOAT;
+        // Depth buffers, read as their depth channel.
+        case DXGI_FORMAT_R32_TYPELESS:           return DXGI_FORMAT_R32_FLOAT;
+        case DXGI_FORMAT_D32_FLOAT:              return DXGI_FORMAT_R32_FLOAT;
+        case DXGI_FORMAT_R24G8_TYPELESS:         return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+        case DXGI_FORMAT_D24_UNORM_S8_UINT:      return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+        case DXGI_FORMAT_R32G8X24_TYPELESS:      return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+        case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:   return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+        case DXGI_FORMAT_R16_TYPELESS:           return DXGI_FORMAT_R16_UNORM;
+        case DXGI_FORMAT_D16_UNORM:              return DXGI_FORMAT_R16_UNORM;
         case DXGI_FORMAT_R32G32B32_TYPELESS:     return DXGI_FORMAT_R32G32B32_FLOAT;
         case DXGI_FORMAT_R8G8B8A8_TYPELESS:
         case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:    return DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -728,6 +737,45 @@ bool GpuNeuralChain(ID3D12GraphicsCommandList* cl, ID3D12Resource* output,
         }
     }
     HipSetMotionStaged(motionStaged);
+
+    // ---- stage the game's depth beside the motion -------------------------
+    // Same buffer as the motion (its rows sit after the vectors), same list,
+    // so the next evaluate's counter check covers it too.
+    bool depthStaged = false;
+    if (motionStaged && motion->depth && motion->depthW && motion->depthH && HipStagingDepthRowPitch()) {
+        PooledTexture* dTex = GpuAcquireTexture(L"depth", DXGI_FORMAT_R32_FLOAT, outRect.w, outRect.h);
+        if (dTex && SupportsTypedUav(g.device.Get(), DXGI_FORMAT_R32_FLOAT)) {
+            const D3D12_RESOURCE_STATES dIn = GpuGuessIncomingState(motion->depth);
+            GpuTransition(cl, motion->depth, dIn, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            GpuSetState(cl, *dTex, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            DlssNrConstants dc = c;
+            dc.Mode = NR_MODE_DEPTH;
+            dc.GuideWidth = motion->depthW;
+            dc.GuideHeight = motion->depthH;
+            const bool ok = GpuNrDispatch(cl, dc, motion->depth, nullptr, nullptr, nullptr, nullptr,
+                                          dTex->res.Get(), nullptr);
+            GpuTransition(cl, motion->depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, dIn);
+            if (ok) {
+                GpuSetState(cl, *dTex, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                D3D12_TEXTURE_COPY_LOCATION ddst{};
+                ddst.pResource = HipStagingMotion();
+                ddst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                ddst.PlacedFootprint.Offset = HipStagingDepthOffset();
+                ddst.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R32_FLOAT;
+                ddst.PlacedFootprint.Footprint.Width = outRect.w;
+                ddst.PlacedFootprint.Footprint.Height = outRect.h;
+                ddst.PlacedFootprint.Footprint.Depth = 1;
+                ddst.PlacedFootprint.Footprint.RowPitch = (UINT)HipStagingDepthRowPitch();
+                D3D12_TEXTURE_COPY_LOCATION dsrc{};
+                dsrc.pResource = dTex->res.Get();
+                dsrc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                dsrc.SubresourceIndex = 0;
+                cl->CopyTextureRegion(&ddst, 0, 0, 0, &dsrc, nullptr);
+                depthStaged = true;
+            }
+        }
+    }
+    HipSetDepthStaged(depthStaged);
 
     // ---- the model ------------------------------------------------------
     // Identity, for now: the proxy is both the model's input and its answer.
