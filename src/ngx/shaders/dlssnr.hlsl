@@ -321,10 +321,22 @@ void main(uint3 id : SV_DispatchThreadID)
         const bool inside = all(mapUv >= 0.0) && all(mapUv <= 1.0);
         const float peak = max(proxySample.r, max(proxySample.g, proxySample.b));
         const float fade = saturate((1.0 - peak) / 0.05);
+        // The engine's map is in linear light (it decodes what it is handed). With passthrough the proxy
+        // here is still display-encoded -- behind OptiScaler's DLSS-NR pass it is OptiScaler's encoded
+        // proxy -- so the gate compares the decoded luminance, and the ratio is carried into the
+        // encoded domain before it scales encoded values (otherwise ~2.2x too strong).
+        const float proxyLinearLuma = gPassthrough != 0 ? dot(SrgbToLinear(saturate(proxySample.rgb)), kLuma)
+                                                        : dot(proxy, kLuma);
         float weight = 0.0;
         if (inside && m.y >= 0.0)
-            weight = fade * exp(-abs(dot(proxy, kLuma) - m.y) * gMapInvGate);
+            weight = fade * exp(-abs(proxyLinearLuma - m.y) * gMapInvGate);
         float r = 1.0 + (m.x - 1.0) * weight;
+        if (gPassthrough != 0 && proxyLinearLuma > 1e-5)
+        {
+            const float encodedBefore = LinearToSrgb(proxyLinearLuma.xxx).x;
+            const float encodedAfter = LinearToSrgb(saturate(proxyLinearLuma * r).xxx).x;
+            r = encodedAfter / max(encodedBefore, 1e-5);
+        }
         if (isnan(r) || isinf(r)) r = 1.0;
         model = float3(proxySample.r >= 1.0 ? proxy.r : proxy.r * r,
                        proxySample.g >= 1.0 ? proxy.g : proxy.g * r,

@@ -884,3 +884,22 @@ the engine writes the full frame (the input's alpha is always kept):
   texture detail is averaged out of the ratio and lighting/geometry edges
   stay. AMD FSR Ray Regeneration needs amd_fidelityfx_denoiser_dx12.dll
   1.2 (FSR SDK 2.3.0, matching the game's 2740 loader/upscaler).
+- Setup corrections (S325). Behind OptiScaler's DLSS-NR pass the shim is
+  handed OptiScaler's display-encoded proxy, but the game INI had
+  Passthrough=0, so the shim encoded it a second time: that is the
+  washed-out input of every capture so far (decoding the canonical capture
+  once gives luma p1/p50 0.08/0.34 instead of 0.31/0.60). Passthrough=1 now;
+  the map resolve decodes the proxy for its gate and carries the engine's
+  linear-light ratio into the encoded domain before scaling (otherwise the
+  gate compares unlike quantities and the edit is ~2.2x too strong).
+  `tone` is dropped (the input is already display-referred) and gate/sigma
+  go back to display scale (0.03/0.02). OptiScaler re-composes the shim's
+  output with its own TransferStrength/ColourStrength; set to 1.0/0.0 so the
+  engine's edit is applied once and luminance-only.
+- `interval=K` (luma) starts a network run at most every K submitted
+  frames; the motion-carried map covers the rest. In game the network ran
+  on 85% of frames at a median 5.9 ms. Pan 10 px/frame: error vs a fresh
+  result 0.018 (K=1), 0.021 (2), 0.022 (3), 0.019 (4); shimmer 0.0023,
+  0.0012, 0.0007, 0.0008 (fewer new maps). Game config interval=3. (The
+  shim's ResidentEngineInterval skips whole submissions, motion included,
+  and breaks the motion chain; leave it at 1.)

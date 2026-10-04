@@ -1523,6 +1523,10 @@ int main(int argc, char** argv) {
         const bool resolve = resolveEnv && *resolveEnv == '1';
         engine.debugView = resolve ? 0 : 2;
         if (resolve) { engine.transferStrength = 1.0f; engine.colourStrength = 0.0f; }
+        // DLSS5_RESIDENT_ENGINE_PASSTHROUGH=1: the colour is already display-encoded (as behind
+        // OptiScaler's DLSS-NR pass), so the shim neither encodes nor decodes it.
+        const char* passEnv = getenv("DLSS5_RESIDENT_ENGINE_PASSTHROUGH");
+        if (passEnv && *passEnv == '1') engine.passthrough = 1;
         engine.residentEngineDll = engineDll;
         engine.residentEngineConfig = engineConfig;
         const char* fullEnv = getenv("DLSS5_RESIDENT_ENGINE_FULL");

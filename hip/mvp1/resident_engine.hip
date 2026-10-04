@@ -189,6 +189,8 @@ struct OutputOptions {
     int external = 0;     // external_controls=1: controls and strength follow re_controls
     float depth_sigma = 0.0f;  // depth_sigma=S: denoise also weights neighbours by relative depth difference
     int albedo_guide = 0;      // albedo_guide=1: denoise compares lighting (luminance / RR albedo), not texture
+    int interval = 1;          // interval=K: start a network run at most every K submitted frames (luma);
+                               // the motion-carried map covers the frames between, at 1/K of the GPU time
     float temporal = 0.0f;  // temporal=S: the original's history recurrence, S x its blend scale
     int tone_inverse = 1;  // tone: map the ratio back through the inverse curve (0: use it as it is)
     int history_clamp = 2;  // history guard: 0 none, 1 neighbourhood clamp, 2 reject where the input changed
@@ -822,6 +824,7 @@ struct Engine {
             else if (key == "external_controls") options.external = std::stoi(value);
             else if (key == "depth_sigma") options.depth_sigma = std::stof(value);
             else if (key == "albedo_guide") options.albedo_guide = std::stoi(value);
+            else if (key == "interval") options.interval = std::stoi(value);
             else if (key == "temporal") options.temporal = std::stof(value);
             else if (key == "history_clamp") options.history_clamp = std::stoi(value);
             else if (key == "reject") options.reject = std::stof(value);
@@ -979,6 +982,8 @@ struct Engine {
             ++frame_counter;
         }
         if (busy || pending) return 0;
+        if (!crop && options.luma && options.interval > 1 && job_frame >= 0 &&
+            frame_counter - 1 - job_frame < options.interval) return 0;
         job_frame = frame_counter - 1;
         try {
             if (bytes > raw_bytes) {
