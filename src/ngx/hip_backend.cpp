@@ -105,6 +105,9 @@ struct State {
     // Depth (R32F rows) after the motion in the same buffer.
     UINT64 depthOffset = 0, depthPitch = 0;
     bool depthStaged = false;
+    UINT64 albedoOffset = 0;  // albedo luminance rows (same pitch as the depth) after the depth
+    bool albedoStaged = false;
+    int (*EngineAlbedo)(const void*, int, int, int) = nullptr;  // optional (re_albedo)
     int (*EngineDepth)(const void*, int, int, int) = nullptr;  // optional (re_depth)
 
     uint64_t runs = 0;  // successful model launches (for the log)
@@ -243,6 +246,8 @@ void DropStaging() {
     s.motionStaged = false;
     s.depthOffset = s.depthPitch = 0;
     s.depthStaged = false;
+    s.albedoOffset = 0;
+    s.albedoStaged = false;
     s.ptrIn = s.ptrOut = nullptr;
     if (s.hIn) CloseHandle(s.hIn);
     if (s.hOut) CloseHandle(s.hOut);
@@ -601,7 +606,9 @@ bool EnsureStaging(unsigned int w, unsigned int h, unsigned int bpp) {
                        D3D12_TEXTURE_DATA_PITCH_ALIGNMENT * D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
         s.depthOffset = (s.mvPitch * h + D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1) /
                         D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT * D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT;
-        s.mvBytes = s.depthOffset + s.depthPitch * h;
+        s.albedoOffset = (s.depthOffset + s.depthPitch * h + D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1) /
+                         D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT * D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT;
+        s.mvBytes = s.albedoOffset + s.depthPitch * h;
         D3D12_RESOURCE_DESC md = bd;
         md.Width = s.mvBytes;
         hipExternalMemoryHandleDesc hd{};
@@ -628,6 +635,7 @@ bool EnsureStaging(unsigned int w, unsigned int h, unsigned int bpp) {
             if (s.hMv) CloseHandle(s.hMv);
             s.hMv = nullptr; s.bufMv.Reset(); s.mvPitch = s.mvBytes = 0;
             s.depthOffset = s.depthPitch = 0;
+            s.albedoOffset = 0;
         }
     }
 
@@ -887,6 +895,7 @@ static bool EngineReady() {
     s.EngineMapParams = (int (*)(float*))GetProcAddress(s.engineDll, "re_luma_map_params");
     s.EngineControls = (int (*)(const float*, int))GetProcAddress(s.engineDll, "re_controls");
     s.EngineDepth = (int (*)(const void*, int, int, int))GetProcAddress(s.engineDll, "re_depth");
+    s.EngineAlbedo = (int (*)(const void*, int, int, int))GetProcAddress(s.engineDll, "re_albedo");
     s.engineControlsGeneration = 0;
     s.EnginePollFrame = (int (*)(unsigned char*, unsigned long long, int, int, int, float*))
         GetProcAddress(s.engineDll, "re_poll_frame");
@@ -961,6 +970,16 @@ bool ResidentEngineSubmit() {
         const int d = s.EngineDepth((const unsigned char*)s.ptrMv + s.depthOffset, (int)s.w, (int)s.h,
                                     (int)s.depthPitch);
         if (d < 0) LOGW("hip: resident engine depth rejected: %s", s.EngineError());
+    }
+    if (cfg.residentEngineFull && s.EngineAlbedo && s.albedoStaged && s.ptrMv && s.depthPitch) {
+        const int a = s.EngineAlbedo((const unsigned char*)s.ptrMv + s.albedoOffset, (int)s.w, (int)s.h,
+                                     (int)s.depthPitch);
+        if (a < 0) LOGW("hip: resident engine albedo rejected: %s", s.EngineError());
+        static bool logged = false;
+        if (!logged && a >= 0) {
+            logged = true;
+            LOGI("hip: resident engine %s the RR albedo", a ? "uses" : "ignores (albedo_guide=0)");
+        }
     }
     if (s.EngineControls) {
         const NrControls& c = NrControlValues();
@@ -10932,6 +10951,8 @@ void SetMotionStaged(bool staged) { S().motionStaged = staged; }
 UINT64 StagingDepthOffset() { return S().depthOffset; }
 UINT64 StagingDepthRowPitch() { return S().depthPitch; }
 void SetDepthStaged(bool staged) { S().depthStaged = staged; }
+UINT64 StagingAlbedoOffset() { return S().albedoOffset; }
+void SetAlbedoStaged(bool staged) { S().albedoStaged = staged; }
 bool LumaMap(float params[4]) {
     for (int i = 0; i < 4; ++i) params[i] = S().mapParams[i];
     return S().mapActive;
@@ -10996,6 +11017,8 @@ void HipSetMotionStaged(bool staged) { hipb::SetMotionStaged(staged); }
 UINT64 HipStagingDepthOffset() { return hipb::StagingDepthOffset(); }
 UINT64 HipStagingDepthRowPitch() { return hipb::StagingDepthRowPitch(); }
 void HipSetDepthStaged(bool staged) { hipb::SetDepthStaged(staged); }
+UINT64 HipStagingAlbedoOffset() { return hipb::StagingAlbedoOffset(); }
+void HipSetAlbedoStaged(bool staged) { hipb::SetAlbedoStaged(staged); }
 bool HipUsable() { return hipb::Usable(); }
 
 }  // namespace ngx

@@ -188,6 +188,7 @@ struct OutputOptions {
     int encoded = 0;      // encoded=1: feed the network display-encoded colour, as the original
     int external = 0;     // external_controls=1: controls and strength follow re_controls
     float depth_sigma = 0.0f;  // depth_sigma=S: denoise also weights neighbours by relative depth difference
+    int albedo_guide = 0;      // albedo_guide=1: denoise compares lighting (luminance / RR albedo), not texture
     float temporal = 0.0f;  // temporal=S: the original's history recurrence, S x its blend scale
     int tone_inverse = 1;  // tone: map the ratio back through the inverse curve (0: use it as it is)
     int history_clamp = 2;  // history guard: 0 none, 1 neighbourhood clamp, 2 reject where the input changed
@@ -223,7 +224,14 @@ __device__ inline float srgb_encode_device(float v) {
 // surfaces across a silhouette even where their luminance matches.
 __device__ inline float net_ratio(const float* linear, const float* color, int x, int y, int sw, int sh, int W,
                                   int denoise, int encoded = 0, const float* depth = nullptr, int fw = 0,
-                                  int fh = 0, float dsig = 0.0f) {
+                                  int fh = 0, float dsig = 0.0f, const float* albedo = nullptr) {
+    // albedo (frame pixels, optional): the edge test compares demodulated
+    // luminance -- the light on the surface -- so texture detail is averaged
+    // out of the ratio while lighting and geometry edges stay.
+    auto alb = [&](int nx, int ny) {
+        int fx = min(int((nx+0.5f)*fw/sw), fw-1), fy = min(int((ny+0.5f)*fh/sh), fh-1);
+        return fmaxf(albedo[size_t(fy)*fw + fx], 0.02f);
+    };
     auto dep = [&](int nx, int ny) {
         int fx = min(int((nx+0.5f)*fw/sw), fw-1), fy = min(int((ny+0.5f)*fh/sh), fh-1);
         return depth[size_t(fy)*fw + fx];
@@ -237,13 +245,15 @@ __device__ inline float net_ratio(const float* linear, const float* color, int x
                      : .2126f*v[0] + .7152f*v[1] + .0722f*v[2];
     };
     const float yin = lum(color + (size_t(y)*W + x)*3, false);
+    const bool use_albedo = albedo && fw > 0 && denoise > 0;
+    const float lin = use_albedo ? yin / alb(x, y) : yin;
     float sum_in = 0.0f, sum_out = 0.0f;
     for (int dy = -denoise; dy <= denoise; ++dy)
         for (int dx = -denoise; dx <= denoise; ++dx) {
             int nx = min(max(x+dx, 0), sw-1), ny = min(max(y+dy, 0), sh-1);
             float yi = lum(color + (size_t(ny)*W + nx)*3, false);
             float yo = lum(linear + (size_t(ny)*W + nx)*3, true);
-            float d = (yi - yin) / (yin + 0.02f);
+            float d = use_albedo ? (yi / alb(nx, ny) - lin) / (lin + 0.02f) : (yi - yin) / (yin + 0.02f);
             float wgt = denoise ? expf(-d*d*50.0f) : 1.0f;  // relative luminance difference, sigma 0.1
             if (use_depth) {
                 float rd = fabsf(dep(nx, ny) - dc) / (fabsf(dc) + 1e-6f) / dsig;
@@ -262,7 +272,7 @@ __device__ inline float net_ratio(const float* linear, const float* color, int x
 __global__ void k_ratio_map(const float* linear, const float* color, const unsigned char* src, int pitch, int bpp,
                             const float2* previous, int previous_valid, OutputOptions o, float2* map,
                             int frame_w, int frame_h, int sw, int sh, int W, const float* tone = nullptr,
-                            const float* depth = nullptr) {
+                            const float* depth = nullptr, const float* albedo = nullptr) {
     int i = blockIdx.x*blockDim.x + threadIdx.x;
     if (i >= frame_w*frame_h) return;
     int x = i % frame_w, y = i / frame_w;
@@ -272,17 +282,18 @@ __global__ void k_ratio_map(const float* linear, const float* color, const unsig
     float yin = .2126f*raw[0] + .7152f*raw[1] + .0722f*raw[2];
     float r;
     if (sw == frame_w && sh == frame_h) {
-        r = net_ratio(linear, color, x, y, sw, sh, W, o.denoise, o.encoded, depth, frame_w, frame_h, o.depth_sigma);
+        r = net_ratio(linear, color, x, y, sw, sh, W, o.denoise, o.encoded, depth, frame_w, frame_h, o.depth_sigma,
+                      albedo);
     } else {
         float fx = fminf(fmaxf((x+0.5f)*sw/frame_w - 0.5f, 0.0f), float(sw-1));
         float fy = fminf(fmaxf((y+0.5f)*sh/frame_h - 0.5f, 0.0f), float(sh-1));
         int x0 = int(fx), y0 = int(fy), x1 = min(x0+1, sw-1), y1 = min(y0+1, sh-1);
         float tx = fx - x0, ty = fy - y0;
         const float ds = o.depth_sigma;
-        float a = net_ratio(linear, color, x0, y0, sw, sh, W, o.denoise, o.encoded, depth, frame_w, frame_h, ds);
-        float b = net_ratio(linear, color, x1, y0, sw, sh, W, o.denoise, o.encoded, depth, frame_w, frame_h, ds);
-        float c = net_ratio(linear, color, x0, y1, sw, sh, W, o.denoise, o.encoded, depth, frame_w, frame_h, ds);
-        float d = net_ratio(linear, color, x1, y1, sw, sh, W, o.denoise, o.encoded, depth, frame_w, frame_h, ds);
+        float a = net_ratio(linear, color, x0, y0, sw, sh, W, o.denoise, o.encoded, depth, frame_w, frame_h, ds, albedo);
+        float b = net_ratio(linear, color, x1, y0, sw, sh, W, o.denoise, o.encoded, depth, frame_w, frame_h, ds, albedo);
+        float c = net_ratio(linear, color, x0, y1, sw, sh, W, o.denoise, o.encoded, depth, frame_w, frame_h, ds, albedo);
+        float d = net_ratio(linear, color, x1, y1, sw, sh, W, o.denoise, o.encoded, depth, frame_w, frame_h, ds, albedo);
         r = (a*(1.0f-tx) + b*tx)*(1.0f-ty) + (c*(1.0f-tx) + d*tx)*ty;
     }
     if (tone && yin > 1e-5f && o.tone_inverse) {
@@ -780,6 +791,10 @@ struct Engine {
     std::unique_ptr<Buffer> depth_next, job_depth;
     int depth_w = 0, depth_h = 0;
     bool depth_fresh = false, job_depth_valid = false;
+    // re_albedo: the same for the RR diffuse albedo's luminance.
+    std::unique_ptr<Buffer> albedo_next, job_albedo;
+    int albedo_w = 0, albedo_h = 0;
+    bool albedo_fresh = false, job_albedo_valid = false;
     std::unique_ptr<Buffer> tone_state;  // tone=K: log-luminance sums, applied exposure, valid, smoothed log2
     std::string error;
 
@@ -806,6 +821,7 @@ struct Engine {
             else if (key == "encoded") options.encoded = std::stoi(value);
             else if (key == "external_controls") options.external = std::stoi(value);
             else if (key == "depth_sigma") options.depth_sigma = std::stof(value);
+            else if (key == "albedo_guide") options.albedo_guide = std::stoi(value);
             else if (key == "temporal") options.temporal = std::stof(value);
             else if (key == "history_clamp") options.history_clamp = std::stoi(value);
             else if (key == "reject") options.reject = std::stof(value);
@@ -980,6 +996,15 @@ struct Engine {
                 job_depth_valid = true;
             }
             depth_fresh = false;
+            job_albedo_valid = false;
+            if (!crop && albedo_fresh && albedo_w == w && albedo_h == h) {
+                if (!job_albedo || job_albedo->count < size_t(w)*h) job_albedo.reset(new Buffer(size_t(w)*h));
+                HIP_CHECK(hipMemcpyAsync(job_albedo->data, albedo_next->data, size_t(w)*h*sizeof(float),
+                                         hipMemcpyDeviceToDevice, stream));
+                HIP_CHECK(hipStreamSynchronize(stream));
+                job_albedo_valid = true;
+            }
+            albedo_fresh = false;
             history_cur = -1;
             if (!crop && options.luma && options.smooth > 0.0f) carry_history(w, h);
             coord_cur = -1;
@@ -1137,7 +1162,8 @@ struct Engine {
                                        : reinterpret_cast<const float2*>(maps[published]->data),
                                    int(previous_valid), job_options(job_strength), reinterpret_cast<float2*>(maps[next]->data),
                                    frame_w, frame_h, sw, sh, W, tone,
-                                   job_depth_valid ? job_depth->data : nullptr);
+                                   job_depth_valid ? job_depth->data : nullptr,
+                                   job_albedo_valid ? job_albedo->data : nullptr);
                 HIP_CHECK(hipGetLastError());
                 HIP_CHECK(hipStreamSynchronize(stream));
                 float elapsed = 0.0f;
@@ -1246,6 +1272,22 @@ struct Engine {
             failed = true; error = e.what(); return -1;
         }
         depth_w = w; depth_h = h; depth_fresh = true;
+        return 1;
+    }
+
+    // re_albedo: the RR diffuse albedo luminance for the next job (albedo_guide).
+    int albedo(const void* src, int w, int h, int pitch) {
+        if (!options.albedo_guide || !options.luma) return 0;
+        std::lock_guard<std::mutex> lock(mutex);
+        try {
+            if (!albedo_next || albedo_next->count < size_t(w)*h) albedo_next.reset(new Buffer(size_t(w)*h));
+            HIP_CHECK(hipMemcpy2DAsync(albedo_next->data, size_t(w)*sizeof(float), src, size_t(pitch),
+                                       size_t(w)*sizeof(float), h, hipMemcpyDeviceToDevice, compose_stream));
+            HIP_CHECK(hipStreamSynchronize(compose_stream));
+        } catch (const std::exception& e) {
+            failed = true; error = e.what(); return -1;
+        }
+        albedo_w = w; albedo_h = h; albedo_fresh = true;
         return 1;
     }
 
@@ -1440,6 +1482,14 @@ __declspec(dllexport) int re_depth(const void* depth, int width, int height, int
     std::lock_guard<std::mutex> lock(g_mutex);
     if (!g_engine || !depth) return -1;
     return g_engine->depth(depth, width, height, pitch);
+}
+
+// Luma mode: the RR diffuse albedo luminance of the frame the next
+// re_submit_full carries (float per frame pixel). 1 kept, 0 unused, -1 error.
+__declspec(dllexport) int re_albedo(const void* albedo, int width, int height, int pitch) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!g_engine || !albedo) return -1;
+    return g_engine->albedo(albedo, width, height, pitch);
 }
 
 // The caller's NR controls: intensity, style (0..2), local structure, local

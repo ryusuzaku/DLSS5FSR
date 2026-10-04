@@ -868,3 +868,19 @@ the engine writes the full frame (the input's alpha is always kept):
   on a surface without mixing surfaces across silhouettes. Synthetic depth
   step check: output changes only next to the step, no non-finite values.
   Real-depth tuning waits for the first capture with the trailer.
+- RR guides (S325). OptiScaler (mainline and the DLSS-NR fork) reports DLSS
+  Ray Reconstruction unavailable on AMD, so the game never hands out its
+  path-tracing guides. OptiRR (LordRhysJones) translates RR to AMD FSR Ray
+  Regeneration but has no DLSS-NR pass; a full merge with
+  Dagherbou/OptiScaler_DLSSNR conflicts in 88 files, so the NR module was
+  ported onto OptiRR instead (branch rr-nr in the local OptiRR clone:
+  dlssnr/, shaders/dlssnr/, its config block, menu panel, the call after
+  TryEvaluateOptiFeature, the NR fork's Shader_Dx12 base and GpuTime_Dx12).
+  OptiRR's RR feature hands the frame's diffuse/specular albedo, normals,
+  roughness and depth to the NR provider (`dlssnr_call_set_guides`). The
+  shim stages the diffuse albedo's luminance (shader mode 5) after the
+  depth and passes it to the engine (`re_albedo`); `albedo_guide=1` makes
+  the denoise compare demodulated luminance (light on the surface), so
+  texture detail is averaged out of the ratio and lighting/geometry edges
+  stay. AMD FSR Ray Regeneration needs amd_fidelityfx_denoiser_dx12.dll
+  1.2 (FSR SDK 2.3.0, matching the game's 2740 loader/upscaler).

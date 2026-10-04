@@ -777,6 +777,43 @@ bool GpuNeuralChain(ID3D12GraphicsCommandList* cl, ID3D12Resource* output,
     }
     HipSetDepthStaged(depthStaged);
 
+    // ---- stage the RR diffuse albedo's luminance after the depth ---------
+    bool albedoStaged = false;
+    if (motionStaged && motion->albedo && motion->albedoW && motion->albedoH && HipStagingDepthRowPitch()) {
+        PooledTexture* aTex = GpuAcquireTexture(L"albedo", DXGI_FORMAT_R32_FLOAT, outRect.w, outRect.h);
+        if (aTex && SupportsTypedUav(g.device.Get(), DXGI_FORMAT_R32_FLOAT)) {
+            const D3D12_RESOURCE_STATES aIn = GpuGuessIncomingState(motion->albedo);
+            GpuTransition(cl, motion->albedo, aIn, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            GpuSetState(cl, *aTex, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            DlssNrConstants ac = c;
+            ac.Mode = NR_MODE_ALBEDO;
+            ac.GuideWidth = motion->albedoW;
+            ac.GuideHeight = motion->albedoH;
+            const bool ok = GpuNrDispatch(cl, ac, motion->albedo, nullptr, nullptr, nullptr, nullptr,
+                                          aTex->res.Get(), nullptr);
+            GpuTransition(cl, motion->albedo, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, aIn);
+            if (ok) {
+                GpuSetState(cl, *aTex, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                D3D12_TEXTURE_COPY_LOCATION adst{};
+                adst.pResource = HipStagingMotion();
+                adst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                adst.PlacedFootprint.Offset = HipStagingAlbedoOffset();
+                adst.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R32_FLOAT;
+                adst.PlacedFootprint.Footprint.Width = outRect.w;
+                adst.PlacedFootprint.Footprint.Height = outRect.h;
+                adst.PlacedFootprint.Footprint.Depth = 1;
+                adst.PlacedFootprint.Footprint.RowPitch = (UINT)HipStagingDepthRowPitch();
+                D3D12_TEXTURE_COPY_LOCATION asrc{};
+                asrc.pResource = aTex->res.Get();
+                asrc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                asrc.SubresourceIndex = 0;
+                cl->CopyTextureRegion(&adst, 0, 0, 0, &asrc, nullptr);
+                albedoStaged = true;
+            }
+        }
+    }
+    HipSetAlbedoStaged(albedoStaged);
+
     // ---- the model ------------------------------------------------------
     // Identity, for now: the proxy is both the model's input and its answer.
     // When the HIP backend produced an answer for the PREVIOUS frame, that

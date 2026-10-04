@@ -181,6 +181,18 @@ void main(uint3 id : SV_DispatchThreadID)
         return;
     }
 
+    // RR diffuse albedo for the resident engine: its luminance, nearest.
+    if (gMode == 5)
+    {
+        int2 texel = int2(uv * float2(gGuideWidth, gGuideHeight));
+        texel = min(texel, int2(gGuideWidth, gGuideHeight) - 1);
+        float3 a = gSource.Load(int3(texel, 0)).rgb;
+        float l = dot(max(a, 0.0), float3(0.2126, 0.7152, 0.0722));
+        if (isnan(l) || isinf(l)) l = 0.0;
+        gTarget[id.xy] = float4(l, 0.0, 0.0, 0.0);
+        return;
+    }
+
     if (gMode == 0)
     {
         float4 source = gSource.Load(int3(id.xy, 0));

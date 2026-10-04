@@ -239,6 +239,17 @@ NVSDK_NGX_Result DoEvaluateD3D12(ID3D12GraphicsCommandList* cl,
         const bool display = md.Width >= (UINT64)outRect.w;
         motion.guideW = display ? outRect.w : colorRect.w;
         motion.guideH = display ? outRect.h : colorRect.h;
+        // RR guides handed over earlier this frame (once per hand-over).
+        static unsigned int usedGuides = 0;
+        const NrGuides& guides = NrGuideValues();
+        if (guides.diffuseAlbedo && guides.generation != usedGuides) {
+            usedGuides = guides.generation;
+            const D3D12_RESOURCE_DESC ad = guides.diffuseAlbedo->GetDesc();
+            const bool albedoDisplay = ad.Width >= (UINT64)outRect.w;
+            motion.albedo = guides.diffuseAlbedo;
+            motion.albedoW = albedoDisplay ? outRect.w : colorRect.w;
+            motion.albedoH = albedoDisplay ? outRect.h : colorRect.h;
+        }
         if (depth) {
             const D3D12_RESOURCE_DESC dd = depth->GetDesc();
             const bool depthDisplay = dd.Width >= (UINT64)outRect.w;
@@ -293,6 +304,11 @@ void SetModuleDir(const std::wstring& dir) { g_moduleDir = dir; }
 
 NrControls& NrControlValues() {
     static NrControls values;
+    return values;
+}
+
+NrGuides& NrGuideValues() {
+    static NrGuides values;
     return values;
 }
 
@@ -752,6 +768,25 @@ int dlssnr_call_evaluate(ID3D12GraphicsCommandList* cmd, void* feature,
         }
     }
     return (int)DoEvaluateD3D12(cmd, (const NVSDK_NGX_Handle*)feature, p);
+}
+
+// This frame's ray reconstruction guides from the RR denoiser (OptiRR), for
+// the NR pass that follows on the same list.
+void dlssnr_call_set_guides(ID3D12Resource* diffuseAlbedo, ID3D12Resource* specularAlbedo,
+                            ID3D12Resource* normals, ID3D12Resource* roughness, ID3D12Resource* depth,
+                            unsigned int flags) {
+    NrGuides& g = NrGuideValues();
+    const bool first = g.generation == 0;
+    g.diffuseAlbedo = diffuseAlbedo; g.specularAlbedo = specularAlbedo;
+    g.normals = normals; g.roughness = roughness; g.depth = depth; g.flags = flags;
+    ++g.generation;
+    if (first) {
+        auto fmt = [](ID3D12Resource* r) { return r ? (unsigned)r->GetDesc().Format : 0u; };
+        auto w = [](ID3D12Resource* r) { return r ? (unsigned long long)r->GetDesc().Width : 0ull; };
+        LOGI("dlssnr: RR guides arrive: diffuse albedo %llu wide fmt %u, specular albedo fmt %u, normals fmt %u, "
+             "roughness fmt %u, depth fmt %u, roughness packed %u", w(diffuseAlbedo), fmt(diffuseAlbedo),
+             fmt(specularAlbedo), fmt(normals), fmt(roughness), fmt(depth), flags & 1u);
+    }
 }
 
 void dlssnr_call_set_extras(void* capabilityParams, float /*globalTone*/,

@@ -43,6 +43,20 @@ struct NrControls {
 };
 NrControls& NrControlValues();
 
+// Ray reconstruction guides handed over by the RR denoiser that runs before
+// NR in the same frame (OptiRR's FSR Ray Regeneration, dlssnr_call_set_guides).
+// generation counts hand-overs; an NR evaluate uses them only once.
+struct NrGuides {
+    ID3D12Resource* diffuseAlbedo = nullptr;
+    ID3D12Resource* specularAlbedo = nullptr;
+    ID3D12Resource* normals = nullptr;
+    ID3D12Resource* roughness = nullptr;
+    ID3D12Resource* depth = nullptr;
+    unsigned int flags = 0;
+    unsigned int generation = 0;
+};
+NrGuides& NrGuideValues();
+
 // ---------------------------------------------------------------- logging --
 
 enum LogLevel { L_ERROR = 0, L_WARN = 1, L_INFO = 2, L_DEBUG = 3 };
@@ -345,6 +359,7 @@ enum DlssNrMode : unsigned int {
     NR_MODE_DOWNSAMPLE = 2,
     NR_MODE_MOTION = 3,  // the game's motion vectors -> float2 prev-minus-cur in dispatch pixels
     NR_MODE_DEPTH = 4,   // the game's depth -> float at dispatch pixels (nearest)
+    NR_MODE_ALBEDO = 5,  // RR diffuse albedo -> its luminance at dispatch pixels (nearest)
 };
 
 // The game's motion vectors for the resident engine's temporal carry:
@@ -357,6 +372,9 @@ struct MotionInput {
     // The game's depth (optional) and the region of it covering the frame.
     ID3D12Resource* depth = nullptr;
     unsigned int depthW = 0, depthH = 0;
+    // The RR diffuse albedo (optional) and the region of it covering the frame.
+    ID3D12Resource* albedo = nullptr;
+    unsigned int albedoW = 0, albedoH = 0;
 };
 
 // The CPU mirror of cbuffer Params in shaders/dlssnr.hlsl.
@@ -607,6 +625,8 @@ void HipSetMotionStaged(bool staged);
 UINT64 HipStagingDepthOffset();      // depth rows (R32F) inside the motion staging buffer
 UINT64 HipStagingDepthRowPitch();
 void HipSetDepthStaged(bool staged);
+UINT64 HipStagingAlbedoOffset();     // albedo luminance rows (R32F) after the depth
+void HipSetAlbedoStaged(bool staged);
 bool HipUsable();
 
 // The one-frame-late choreography, driven from DoEvaluateD3D12:
