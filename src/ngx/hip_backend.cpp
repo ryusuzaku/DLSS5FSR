@@ -527,6 +527,18 @@ static bool StagingFailed(unsigned int w, unsigned int h, unsigned int bpp, cons
     return false;
 }
 
+// Shared staging allocations are rounded up: at least 4 MB, in 1 MB steps.
+// In game, CreateSharedHandle failed with E_INVALIDARG for the 1.8 MB and
+// 2.9 MB buffers of 605x378 and 756x473 (retried for minutes) while every
+// size from 4.6 MB up worked; the same sizes pass in a standalone probe, so
+// the cause is the game's context, and the rounding keeps clear of it. It
+// also lets a small resize land in the same size class.
+UINT64 StagingAllocBytes(UINT64 bytes) {
+    const UINT64 step = 1ull << 20, floor = 4ull << 20;
+    const UINT64 b = (bytes + step - 1) / step * step;
+    return b < floor ? floor : b;
+}
+
 bool EnsureStaging(unsigned int w, unsigned int h, unsigned int bpp) {
     State& s = S();
     if (!s.usable) return false;
@@ -551,7 +563,7 @@ bool EnsureStaging(unsigned int w, unsigned int h, unsigned int bpp) {
     hp.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC bd{};
     bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    bd.Width = s.bytes;
+    bd.Width = StagingAllocBytes(s.bytes);
     bd.Height = 1;
     bd.DepthOrArraySize = 1;
     bd.MipLevels = 1;
@@ -579,7 +591,7 @@ bool EnsureStaging(unsigned int w, unsigned int h, unsigned int bpp) {
         hipExternalMemoryHandleDesc hd{};
         hd.type = hipExternalMemoryHandleTypeD3D12Resource;
         hd.handle.win32.handle = handle;
-        hd.size = s.bytes;
+        hd.size = StagingAllocBytes(s.bytes);
         hd.flags = hipExternalMemoryDedicated;
         if (s.ImportExternalMemory(&ext, &hd) != hipSuccess) {
             LOGE("hip: ImportExternalMemory failed");
@@ -587,7 +599,7 @@ bool EnsureStaging(unsigned int w, unsigned int h, unsigned int bpp) {
         }
         hipExternalMemoryBufferDesc gd{};
         gd.offset = 0;
-        gd.size = s.bytes;
+        gd.size = StagingAllocBytes(s.bytes);
         if (s.ExternalMemoryGetMappedBuffer(&ptr, ext, &gd) != hipSuccess ||
             !ptr) {
             LOGE("hip: GetMappedBuffer failed");
@@ -615,7 +627,7 @@ bool EnsureStaging(unsigned int w, unsigned int h, unsigned int bpp) {
                          D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT * D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT;
         s.mvBytes = s.albedoOffset + s.depthPitch * h;
         D3D12_RESOURCE_DESC md = bd;
-        md.Width = s.mvBytes;
+        md.Width = StagingAllocBytes(s.mvBytes);
         hipExternalMemoryHandleDesc hd{};
         hipExternalMemoryBufferDesc gd{};
         bool ok = SUCCEEDED(g.device->CreateCommittedResource(
@@ -626,10 +638,10 @@ bool EnsureStaging(unsigned int w, unsigned int h, unsigned int bpp) {
         if (ok) {
             hd.type = hipExternalMemoryHandleTypeD3D12Resource;
             hd.handle.win32.handle = s.hMv;
-            hd.size = s.mvBytes;
+            hd.size = StagingAllocBytes(s.mvBytes);
             hd.flags = hipExternalMemoryDedicated;
             gd.offset = 0;
-            gd.size = s.mvBytes;
+            gd.size = StagingAllocBytes(s.mvBytes);
             ok = s.ImportExternalMemory(&s.extMv, &hd) == hipSuccess &&
                  s.ExternalMemoryGetMappedBuffer(&s.ptrMv, s.extMv, &gd) == hipSuccess && s.ptrMv;
         }
