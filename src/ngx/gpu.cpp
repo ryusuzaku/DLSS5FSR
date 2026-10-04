@@ -483,12 +483,15 @@ bool GpuBlit(ID3D12GraphicsCommandList* cl, ID3D12Resource* src, SubRect srcRect
 
 // The model texture is ping-ponged. Frame n's resolve binds the slot prepare #n
 // wrote as an SRV on the game's list; prepare #(n+1) rewrites on our own queue.
-// With a single texture those two overlap -- the gate can only prove list n-1
-// executed, so list n (the reader) may still be in flight when we rewrite. Two
-// slots put the rewrite on the other one, and prepare #(n+2) reuses a slot only
-// after the gate has proven the list that read it has executed.
-static const wchar_t* HipModelTag(unsigned int parity) {
-    return parity ? L"hipmodel1" : L"hipmodel0";
+// With a single texture those two overlap -- the gate can only prove list n-3
+// executed, so lists n-2..n (the readers) may still be in flight when we
+// rewrite. Three slots put the rewrite on one no in-flight list reads, and
+// prepare #(n+3) reuses a slot only after the gate has proven the list that
+// read it has executed.
+static const unsigned int kHipModelSlots = 3;
+static const wchar_t* HipModelTag(unsigned int slot) {
+    static const wchar_t* const tags[kHipModelSlots] = {L"hipmodel0", L"hipmodel1", L"hipmodel2"};
+    return tags[slot % kHipModelSlots];
 }
 
 // Cyberpunk keeps two frames in flight; 32 evaluates leaves ample margin for a
@@ -851,7 +854,17 @@ bool GpuNeuralChain(ID3D12GraphicsCommandList* cl, ID3D12Resource* output,
     if (bindLog)
         LOGI("nr: chain model bind: hipFrameReady=%d parity=%u hipW=%u hipH=%u",
              (int)g.hipFrameReady, g.hipModelParity, g.hipW, g.hipH);
-    if (g.hipFrameReady) {
+    // A ratio map the engine has not refreshed for a while no longer matches
+    // the frame: carried along motion it paints an old picture's shading over
+    // the new one (S326, windowed: the gate starved for thousands of frames and
+    // left a shadow image). Past kMaxMapLag the frame passes through unedited.
+    static const uint64_t kMaxMapLag = 8;
+    const uint64_t mapLag =
+        g.hipEvaluate > g.hipStagingFrame ? g.hipEvaluate - g.hipStagingFrame : 0;
+    const bool mapStale = g.hipMapMode && mapLag > kMaxMapLag;
+    if (bindLog && mapStale)
+        LOGW("nr: map is %llu frames old; passing the frame through", (unsigned long long)mapLag);
+    if (g.hipFrameReady && !mapStale) {
         hipModel = GpuAcquireTexture(HipModelTag(g.hipModelParity), g.hipFmt,
                                      g.hipW, g.hipH);
         if (bindLog && !hipModel)
@@ -907,7 +920,7 @@ bool GpuNeuralChain(ID3D12GraphicsCommandList* cl, ID3D12Resource* output,
     // was then (lag x this frame's motion) and gates it on luminance here.
     ID3D12Resource* motionSrv = nullptr;
     if (hipModel && g.hipMapMode && model == hipModel->res.Get()) {
-        const uint64_t lag = g.hipEvaluate > g.hipStagingFrame ? g.hipEvaluate - g.hipStagingFrame : 0;
+        const uint64_t lag = mapLag;
         const float carry = (float)(lag < 3 ? lag : 3);
         c.Pad1 = 1;
         float invGate = g.hipMapParams[2];
@@ -1029,13 +1042,16 @@ bool GpuPrepareHipModel(uint64_t n, const Config& cfg) {
     // one frame ahead of submission -- Cyberpunk does, permanently -- leaves
     // exactly one list in flight, so the freshest value it can expose is n-2;
     // an exact n-1 test therefore never fires and the model stops after frame
-    // 0. Accept n-2 (and n-1, so a submit-per-frame game is unaffected);
-    // anything further behind still skips -- never poll: blocking here could
-    // deadlock a game that submits from this very thread. n-2 is only safe
-    // because the model texture ping-pongs (see HipModelTag): the one list
-    // still in flight reads the other slot, not the one rewritten below.
+    // 0. Windowed, or when the GPU falls behind, it keeps one more list in
+    // flight and the counter sits at n-3 for good (S326: the engine starved
+    // for thousands of frames). Accept down to n-3 (and n-1/n-2, so a
+    // submit-per-frame game is unaffected); anything further behind still
+    // skips -- never poll: blocking here could deadlock a game that submits
+    // from this very thread. n-3 is only safe because the model texture
+    // rotates through three slots (see HipModelTag): the lists still in
+    // flight read the other slots, not the one rewritten below.
     unsigned int counter = 0xFFFFFFFFu;
-    const uint64_t need = (n >= 2) ? (n - 2) : 0;
+    const uint64_t need = (n >= 3) ? (n - 3) : 0;
     if (!ReadCounter(g, counter) || (uint64_t)counter < need) {
         static uint64_t throttled = 0;
         ++throttled;
@@ -1197,14 +1213,14 @@ bool GpuPrepareHipModel(uint64_t n, const Config& cfg) {
         }
     }
 
-    // Refresh the model texture on our own queue. Ping-pong makes the rewrite
-    // safe even though the gate above accepts a one-frame-late counter:
-    // prepare #n writes slot n&1, frame n's resolve binds that slot, and this
-    // code only reuses slot n&1 again at #(n+2) -- by then the gate has proven
+    // Refresh the model texture on our own queue. Rotation makes the rewrite
+    // safe even though the gate above accepts a counter up to three behind:
+    // prepare #n writes slot n%3, frame n's resolve binds that slot, and this
+    // code only reuses it again at #(n+3) -- by then the gate has proven
     // list n, that slot's only reader, executed.
     float mapParams[4] = {};
     const bool mapMode = HipLumaMap(mapParams);
-    const unsigned int parity = (unsigned int)(n & 1);
+    const unsigned int parity = (unsigned int)(n % kHipModelSlots);
     PooledTexture* m =
         GpuAcquireTexture(HipModelTag(parity), g.hipFmt, g.hipW, g.hipH);
     if (!m) return false;
