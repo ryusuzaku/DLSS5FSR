@@ -491,6 +491,25 @@ static const wchar_t* HipModelTag(unsigned int parity) {
     return parity ? L"hipmodel1" : L"hipmodel0";
 }
 
+// Cyberpunk keeps two frames in flight; 32 evaluates leaves ample margin for a
+// game that queues more, at the cost of a few textures held a little longer.
+static const uint64_t kRetireEvaluates = 32;
+
+void GpuRetire(ComPtr<ID3D12Resource> res) {
+    if (!res) return;
+    GpuContext& g = Gpu();
+    g.retired.push_back({std::move(res), g.evaluates + kRetireEvaluates});
+}
+
+void GpuTickRetired() {
+    GpuContext& g = Gpu();
+    ++g.evaluates;
+    auto& r = g.retired;
+    r.erase(std::remove_if(r.begin(), r.end(),
+                           [&](const GpuContext::Retired& x) { return x.until <= g.evaluates; }),
+            r.end());
+}
+
 PooledTexture* GpuAcquireTexture(const wchar_t* tag, DXGI_FORMAT fmt,
                                  unsigned int w, unsigned int h) {
     GpuContext& g = Gpu();
@@ -503,7 +522,8 @@ PooledTexture* GpuAcquireTexture(const wchar_t* tag, DXGI_FORMAT fmt,
 
         // Same name, different shape: a resize or a format change. The old
         // texture may still be referenced by a frame in flight, so it is
-        // dropped here and the GPU is left to retire it on its own schedule.
+        // retired rather than freed.
+        GpuRetire(std::move(up->res));
         up.reset();
         break;
     }

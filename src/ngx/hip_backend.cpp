@@ -239,8 +239,11 @@ void DropStaging() {
     if (s.extMv) s.DestroyExternalMemory(s.extMv);
     s.extIn = s.extOut = s.extMv = nullptr;
     s.ptrMv = nullptr;
+    // The HIP side has synchronised; the D3D12 buffers may still be copied
+    // into or read by game lists in flight, so they are retired, not freed.
     if (s.hMv) CloseHandle(s.hMv);
     s.hMv = nullptr;
+    GpuRetire(std::move(s.bufMv));
     s.bufMv.Reset();
     s.mvPitch = s.mvBytes = 0;
     s.motionStaged = false;
@@ -252,6 +255,8 @@ void DropStaging() {
     if (s.hIn) CloseHandle(s.hIn);
     if (s.hOut) CloseHandle(s.hOut);
     s.hIn = s.hOut = nullptr;
+    GpuRetire(std::move(s.bufIn));
+    GpuRetire(std::move(s.bufOut));
     s.bufIn.Reset();
     s.bufOut.Reset();
     s.w = s.h = s.bpp = 0;

@@ -166,6 +166,7 @@ NVSDK_NGX_Result DoEvaluateD3D12(ID3D12GraphicsCommandList* cl,
     if (!cl) return NVSDK_NGX_Result_FAIL_InvalidParameter;
 
     const uint64_t n = f->evaluateCount++;
+    GpuTickRetired();
 
     ID3D12Resource* color = nullptr;
     ID3D12Resource* output = nullptr;

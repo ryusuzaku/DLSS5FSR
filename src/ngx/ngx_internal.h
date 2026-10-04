@@ -486,10 +486,28 @@ struct GpuContext {
     // chain fail with no error anywhere.
     std::vector<std::unique_ptr<PooledTexture>> pool;
 
+    // Resources replaced by a resize. D3D12 frees memory on the last Release
+    // and does not wait for command lists that still reference it; the game
+    // keeps frames n-1 and n-2 in flight, so a texture or staging buffer
+    // dropped at once is a GPU page fault (S325: TDR while dragging
+    // OptiScaler's model-resolution slider). They wait here instead and go
+    // kRetireEvaluates evaluates later (GpuTickRetired).
+    struct Retired {
+        ComPtr<ID3D12Resource> res;
+        uint64_t until = 0;
+    };
+    std::vector<Retired> retired;
+    uint64_t evaluates = 0;
+
     bool valid = false;
 };
 
 GpuContext& Gpu();
+
+// Keeps `res` alive until the frames in flight that may use it have executed.
+void GpuRetire(ComPtr<ID3D12Resource> res);
+// Once per evaluate: advances the count and drops what has waited long enough.
+void GpuTickRetired();
 
 bool GpuInit(ID3D12Device* dev);
 void GpuShutdown();
