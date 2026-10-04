@@ -198,16 +198,35 @@ bool BuildCounterPipeline(GpuContext& g) {
         return false;
     }
 
-    D3D12_HEAP_PROPERTIES hp{};
-    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC bd = CD3DX12_RESOURCE_DESC::Buffer(16);
     bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+
+    // CPU-visible first, so ReadCounter is a plain memory read.
+    D3D12_HEAP_PROPERTIES chp{};
+    chp.Type = D3D12_HEAP_TYPE_CUSTOM;
+    chp.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_BACK;
+    chp.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
+    void* mapped = nullptr;
+    if (SUCCEEDED(g.device->CreateCommittedResource(
+            &chp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COMMON,
+            nullptr, IID_PPV_ARGS(&g.counterBuf))) &&
+        SUCCEEDED(g.counterBuf->Map(0, nullptr, &mapped)) && mapped) {
+        g.counterHost = static_cast<volatile unsigned int*>(mapped);
+        LOGI("counter: CPU-visible (read in place)");
+        return true;
+    }
+    g.counterBuf.Reset();
+    g.counterHost = nullptr;
+
+    D3D12_HEAP_PROPERTIES hp{};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
     if (FAILED(g.device->CreateCommittedResource(
             &hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COMMON,
             nullptr, IID_PPV_ARGS(&g.counterBuf)))) {
         LOGE("counter: buffer creation failed");
         return false;
     }
+    LOGI("counter: device memory (read through our queue)");
     return true;
 }
 
@@ -309,6 +328,31 @@ bool GpuInit(ID3D12Device* dev) {
     }
     g.fenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
 
+    {
+        D3D12_COMMAND_QUEUE_DESC cqd{};
+        cqd.Type = D3D12_COMMAND_LIST_TYPE_COPY;
+        cqd.Priority = D3D12_COMMAND_QUEUE_PRIORITY_HIGH;
+        bool ok = SUCCEEDED(dev->CreateCommandQueue(&cqd, IID_PPV_ARGS(&g.copyQueue))) &&
+                  SUCCEEDED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY,
+                                                        IID_PPV_ARGS(&g.copyAlloc))) &&
+                  SUCCEEDED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY,
+                                                   g.copyAlloc.Get(), nullptr,
+                                                   IID_PPV_ARGS(&g.copyList))) &&
+                  SUCCEEDED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE,
+                                             IID_PPV_ARGS(&g.copyFence)));
+        if (ok) g.copyEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (ok && g.copyEvent) {
+            g.copyList->Close();
+            LOGI("gpu: model copies on a copy queue");
+        } else {
+            g.copyQueue.Reset();
+            g.copyAlloc.Reset();
+            g.copyList.Reset();
+            g.copyFence.Reset();
+            LOGW("gpu: no copy queue; model copies use the direct queue");
+        }
+    }
+
     D3D12_DESCRIPTOR_HEAP_DESC hd{};
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     hd.NumDescriptors = kDescriptorCount;
@@ -378,6 +422,13 @@ void GpuShutdown() {
         WaitForSingleObject(g.fenceEvent, 2000);
     }
     if (g.fenceEvent) CloseHandle(g.fenceEvent);
+    if (g.copyQueue && g.copyFence && g.copyEvent) {
+        g.copyQueue->Signal(g.copyFence.Get(), ++g.copyFenceValue);
+        g.copyFence->SetEventOnCompletion(g.copyFenceValue, g.copyEvent);
+        WaitForSingleObject(g.copyEvent, 2000);
+    }
+    if (g.copyEvent) CloseHandle(g.copyEvent);
+    if (g.counterHost && g.counterBuf) g.counterBuf->Unmap(0, nullptr);
     g = GpuContext{};
 }
 
@@ -944,6 +995,9 @@ bool GpuNeuralChain(ID3D12GraphicsCommandList* cl, ID3D12Resource* output,
         LOGE("nr: resolve dispatch failed");
         return false;
     }
+    // Back to COMMON, the only state a copy queue may take it from when it
+    // rewrites this slot three frames on.
+    if (hipModel) GpuSetState(cl, *hipModel, D3D12_RESOURCE_STATE_COMMON);
 
     return true;
 }
@@ -980,6 +1034,10 @@ namespace {
 // the signal to skip the HIP work this evaluate. A 32-bit read cannot tear.
 bool ReadCounter(GpuContext& g, unsigned int& out) {
     out = 0xFFFFFFFFu;
+    if (g.counterHost) {
+        out = *g.counterHost;
+        return true;
+    }
 
     D3D12_HEAP_PROPERTIES hp{};
     hp.Type = D3D12_HEAP_TYPE_READBACK;
@@ -1012,6 +1070,46 @@ bool ReadCounter(GpuContext& g, unsigned int& out) {
 }  // namespace
 
 bool GpuHipFrameReady() { return Gpu().hipFrameReady; }
+
+namespace {
+
+// Where the prepare blocks the game's thread: the counter read, the HIP work
+// (identity copy, engine submit and compose, all synchronous) and the model
+// texture copy. Mean and worst over each 600 prepared frames.
+LONGLONG PrepNow() {
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);
+    return t.QuadPart;
+}
+
+struct PrepStat {
+    LONGLONG sum = 0, worst = 0;
+    unsigned int n = 0;
+    void add(LONGLONG d) { sum += d; worst = d > worst ? d : worst; ++n; }
+};
+
+struct PrepTimers {
+    PrepStat counter, hip, copy;
+    unsigned int frames = 0;
+    void report() {
+        if (++frames < 600) return;
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        const double ms = 1000.0 / (double)f.QuadPart;
+        auto mean = [&](const PrepStat& s) { return s.n ? (double)s.sum * ms / s.n : 0.0; };
+        LOGI("nr: prepare blocking over %u frames (mean/worst ms): counter %.3f/%.3f, hip %.3f/%.3f, copy %.3f/%.3f",
+             frames, mean(counter), (double)counter.worst * ms, mean(hip), (double)hip.worst * ms,
+             mean(copy), (double)copy.worst * ms);
+        *this = PrepTimers{};
+    }
+};
+
+PrepTimers& PrepTimes() {
+    static PrepTimers t;
+    return t;
+}
+
+}  // namespace
 
 bool GpuPrepareHipModel(uint64_t n, const Config& cfg) {
     GpuContext& g = Gpu();
@@ -1052,7 +1150,10 @@ bool GpuPrepareHipModel(uint64_t n, const Config& cfg) {
     // flight read the other slots, not the one rewritten below.
     unsigned int counter = 0xFFFFFFFFu;
     const uint64_t need = (n >= 3) ? (n - 3) : 0;
-    if (!ReadCounter(g, counter) || (uint64_t)counter < need) {
+    const LONGLONG tCounter = PrepNow();
+    const bool counterRead = ReadCounter(g, counter);
+    PrepTimes().counter.add(PrepNow() - tCounter);
+    if (!counterRead || (uint64_t)counter < need) {
         static uint64_t throttled = 0;
         ++throttled;
         if (throttled <= 3 || (throttled % 300) == 0)
@@ -1064,6 +1165,7 @@ bool GpuPrepareHipModel(uint64_t n, const Config& cfg) {
 
     // The staged proxy bytes are the model's input; the launch synchronises,
     // so sharedOut holds the answer by the time it returns.
+    const LONGLONG tHip = PrepNow();
     if (!HipRunModel()) return false;
     if (!cfg.residentEngineConfig.empty() && !HipResidentEngineSubmit()) {
         static bool engineFailureLogged = false;
@@ -1218,6 +1320,7 @@ bool GpuPrepareHipModel(uint64_t n, const Config& cfg) {
     // prepare #n writes slot n%3, frame n's resolve binds that slot, and this
     // code only reuses it again at #(n+3) -- by then the gate has proven
     // list n, that slot's only reader, executed.
+    PrepTimes().hip.add(PrepNow() - tHip);
     float mapParams[4] = {};
     const bool mapMode = HipLumaMap(mapParams);
     const unsigned int parity = (unsigned int)(n % kHipModelSlots);
@@ -1225,7 +1328,14 @@ bool GpuPrepareHipModel(uint64_t n, const Config& cfg) {
         GpuAcquireTexture(HipModelTag(parity), g.hipFmt, g.hipW, g.hipH);
     if (!m) return false;
 
-    if (FAILED(g.scratchList->Reset(g.alloc.Get(), nullptr))) return false;
+    const LONGLONG tCopy = PrepNow();
+    // A slot left in another state (a resolve that bailed out early) goes
+    // through the direct queue once, which transitions it back to COMMON.
+    const bool viaCopyQueue = g.copyQueue != nullptr && m->state == D3D12_RESOURCE_STATE_COMMON;
+    ID3D12GraphicsCommandList* list = viaCopyQueue ? g.copyList.Get() : g.scratchList.Get();
+    if (viaCopyQueue ? FAILED(g.copyList->Reset(g.copyAlloc.Get(), nullptr))
+                     : FAILED(g.scratchList->Reset(g.alloc.Get(), nullptr)))
+        return false;
 
     D3D12_TEXTURE_COPY_LOCATION dst{};
     dst.pResource = m->res.Get();
@@ -1241,17 +1351,31 @@ bool GpuPrepareHipModel(uint64_t n, const Config& cfg) {
     src.PlacedFootprint.Footprint.Depth = 1;
     src.PlacedFootprint.Footprint.RowPitch = (UINT)HipStagingRowPitch();
 
-    GpuSetState(g.scratchList.Get(), *m, D3D12_RESOURCE_STATE_COPY_DEST);
-    g.scratchList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-    GpuSetState(g.scratchList.Get(), *m,
-                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    g.scratchList->Close();
-    ID3D12CommandList* lists[] = {g.scratchList.Get()};
-    g.queue->ExecuteCommandLists(1, lists);
-    g.queue->Signal(g.fence.Get(), ++g.fenceValue);
-    g.fence->SetEventOnCompletion(g.fenceValue, g.fenceEvent);
-    WaitForSingleObject(g.fenceEvent, 2000);
-    g.alloc->Reset();  // the list stays closed for the next user
+    if (viaCopyQueue) {
+        // The slot is in COMMON (the resolve hands it back so); a copy queue
+        // promotes it to COPY_DEST and it decays to COMMON when the copy ends.
+        g.copyList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        g.copyList->Close();
+        ID3D12CommandList* lists[] = {g.copyList.Get()};
+        g.copyQueue->ExecuteCommandLists(1, lists);
+        g.copyQueue->Signal(g.copyFence.Get(), ++g.copyFenceValue);
+        g.copyFence->SetEventOnCompletion(g.copyFenceValue, g.copyEvent);
+        WaitForSingleObject(g.copyEvent, 2000);
+        g.copyAlloc->Reset();
+        m->state = D3D12_RESOURCE_STATE_COMMON;
+    } else {
+        GpuSetState(list, *m, D3D12_RESOURCE_STATE_COPY_DEST);
+        list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        GpuSetState(list, *m, D3D12_RESOURCE_STATE_COMMON);
+        list->Close();
+        ID3D12CommandList* lists[] = {list};
+        g.queue->ExecuteCommandLists(1, lists);
+        g.queue->Signal(g.fence.Get(), ++g.fenceValue);
+        g.fence->SetEventOnCompletion(g.fenceValue, g.fenceEvent);
+        WaitForSingleObject(g.fenceEvent, 2000);
+        g.alloc->Reset();  // the list stays closed for the next user
+    }
+    PrepTimes().copy.add(PrepNow() - tCopy);
 
     // S186 PROBE 2: CopyTextureRegion returns void, so a silent failure would
     // be invisible. A device-level error is the one thing it does leave behind.
@@ -1273,6 +1397,7 @@ bool GpuPrepareHipModel(uint64_t n, const Config& cfg) {
     g.hipMapMode = mapMode;
     for (int i = 0; i < 4; ++i) g.hipMapParams[i] = mapParams[i];
     g.hipStagingFrame = counter;
+    PrepTimes().report();
     return true;
 }
 

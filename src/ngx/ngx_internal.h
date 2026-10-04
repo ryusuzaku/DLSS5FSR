@@ -455,6 +455,21 @@ struct GpuContext {
     ComPtr<ID3D12RootSignature> counterRoot;
     ComPtr<ID3D12PipelineState> counterPso;
     ComPtr<ID3D12Resource> counterBuf;
+    // The counter buffer lives in CPU-visible memory when the driver allows a
+    // UAV there (custom heap, write-back, L0): the game's list writes it and
+    // the CPU reads it in place, with no copy, allocation or wait per frame.
+    // Null: the old path (copy on our queue, wait).
+    volatile unsigned int* counterHost = nullptr;
+
+    // The per-frame model texture copy runs on a COPY queue (the DMA engine),
+    // which proceeds alongside the game's graphics work instead of taking
+    // turns with it on a second direct queue. Null: the direct queue is used.
+    ComPtr<ID3D12CommandQueue> copyQueue;
+    ComPtr<ID3D12CommandAllocator> copyAlloc;
+    ComPtr<ID3D12GraphicsCommandList> copyList;
+    ComPtr<ID3D12Fence> copyFence;
+    HANDLE copyEvent = nullptr;
+    UINT64 copyFenceValue = 0;
 
     // The one-frame-late HIP model. hipFrameReady says the model texture
     // holds the previous frame's answer and the resolve may bind it; the
