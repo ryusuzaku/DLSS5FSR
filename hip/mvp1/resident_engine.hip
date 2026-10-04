@@ -180,6 +180,8 @@ unsigned char srgb8(float linear) { return (unsigned char)nearbyintf(srgb_encode
 //   motion_sign=-1 flips the vectors (games that store cur - prev)
 //   scale=S        luma mode: run the network on an S x downscale of the frame
 //                  (0.25..1) and upsample its ratio map (about S^2 the work)
+//   budget=N       luma mode: at most N network pixels; lowers the scale further
+//                  for large frames (5120x1440 ultrawide) so the cost stays put
 struct OutputOptions {
     int luma = 0, denoise = 0, motion = 2, motion_sign = 1;  // motion 2 = auto
     int compact = 0;  // extent=compact: smallest multiple-of-64 extent (fast path only)
@@ -196,6 +198,7 @@ struct OutputOptions {
     int history_clamp = 2;  // history guard: 0 none, 1 neighbourhood clamp, 2 reject where the input changed
     float reject = 0.06f;   // history_clamp=2: largest input channel change that keeps the history
     float scale = 1.0f;
+    float budget = 0.0f;  // budget=N: cap on network pixels after scale (0 = none)
     float limit = 0.0f, smooth = 0.0f, sigma = 0.02f, strength = 1.0f, gate = 0.03f;
     int gain = -1;
 };
@@ -818,6 +821,7 @@ struct Engine {
             else if (key == "motion" && (value == "0" || value == "1" || value == "auto"))
                 options.motion = value == "auto" ? 2 : value == "1";
             else if (key == "scale") options.scale = std::stof(value);
+            else if (key == "budget") options.budget = std::stof(value);
             else if (key == "extent" && (value == "compact" || value == "legacy")) options.compact = value == "compact";
             else if (key == "tone") options.tone = std::stof(value);
             else if (key == "encoded") options.encoded = std::stoi(value);
@@ -846,6 +850,7 @@ struct Engine {
         if (options.sigma <= 0.0f || options.gate <= 0.0f || options.smooth < 0.0f || options.smooth > 1.0f ||
             options.limit < 0.0f || options.strength < 0.0f || options.denoise < 0 || options.denoise > 4 ||
             options.scale < 0.25f || options.scale > 1.0f || (options.scale < 1.0f && !options.luma) ||
+            options.budget < 0.0f || (options.budget > 0.0f && (options.budget < 64.0f*64.0f || !options.luma)) ||
             options.tone < 0.0f || options.tone > 1.0f || (options.tone > 0.0f && !options.luma) ||
             options.encoded < 0 || options.encoded > 1 || (options.encoded && !options.luma) ||
             options.temporal < 0.0f || options.temporal > 1.0f || (options.temporal > 0.0f && !options.luma))
@@ -1047,9 +1052,12 @@ struct Engine {
         int W = 256, H = 256;
         // Luma mode may run the network on a downscale of the frame (scale).
         int sw = frame_w, sh = frame_h;
-        if (!job_crop && options.luma && options.scale < 1.0f) {
-            sw = std::max(64, int(frame_w*options.scale + 0.5f));
-            sh = std::max(64, int(frame_h*options.scale + 0.5f));
+        float scale = options.scale;
+        if (options.budget > 0.0f)
+            scale = std::min(scale, std::sqrt(options.budget/(float(frame_w)*float(frame_h))));
+        if (!job_crop && options.luma && scale < 1.0f) {
+            sw = std::max(64, int(frame_w*scale + 0.5f));
+            sh = std::max(64, int(frame_h*scale + 0.5f));
         }
         if (!job_crop) network_extent(sw, sh, W, H, options.compact);
         if (!net || net->W != W || net->H != H) {

@@ -903,3 +903,9 @@ the engine writes the full frame (the input's alpha is always kept):
   0.0012, 0.0007, 0.0008 (fewer new maps). Game config interval=3. (The
   shim's ResidentEngineInterval skips whole submissions, motion included,
   and breaks the motion chain; leave it at 1.)
+- `budget=N` (luma) caps the network at N pixels after `scale`: for a
+  larger frame the scale drops to sqrt(N / frame pixels). At 3021x850
+  (5120x1440 behind OptiScaler's 59% model resolution) the network took
+  17.9 ms at scale 0.5, 9.2 ms with budget=250000, 6.7 ms with 160000
+  (idle GPU). Smaller frames are unaffected (991x620 at scale 0.5 is 154k
+  pixels). Game config budget=250000.
