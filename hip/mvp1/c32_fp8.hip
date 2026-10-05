@@ -36,7 +36,11 @@ __device__ inline float f8(unsigned char b) { return __builtin_amdgcn_cvt_f32_fp
 __device__ inline acc8 step(acc8 c, const unsigned char* a, int lda, const unsigned char* b, int ldb, int k) {
     const int l = threadIdx.x % 32, off = (l / 16) * 8 + k;
     op8 av = *reinterpret_cast<const op8*>(a + (l % 16) * lda + off);
+#if C32F8_EXP == 1
+    op8 bv = {0x38383838, int((size_t)b & 0x3F)};
+#else
     op8 bv = *reinterpret_cast<const op8*>(b + (l % 16) * ldb + off);
+#endif
     return __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(av, bv, c);
 }
 // A 32-deep slice from zero (the reference's slice sum).
@@ -53,6 +57,9 @@ __global__ void k_c32_fp8_weights(const float* dw, unsigned char* w8, int n) {
     if (i < n) w8[i] = c32f8::q8h(dw[i]);  // the weights are E4M3 values already
 }
 
+#ifndef C32F8_EXP
+#define C32F8_EXP 0
+#endif
 #ifdef C32F8_PROF
 __device__ unsigned long long c32f8_prof[16];
 #define C32F8_MARK(i) do { if (threadIdx.x == 0) marks[i] = wall_clock64(); } while (0)
@@ -97,24 +104,19 @@ void k_c32_fp8(const float* in, const float* __restrict__ dw, const unsigned cha
     if (tid < 64) { in_base[tid] = io.base(io.in_hwc, win, tid); out_base[tid] = io.base(io.out_hwc, win, tid); }
     __syncthreads();
     C32F8_MARK(1);
-    {   // F(input), 8 channels of one token per thread.
-        const int t = tid/4, c0 = tid%4*8, b = in_base[t];
-        float v[8];
-        if (b < 0) {
-            for (int j = 0; j < 8; ++j) v[j] = 0.0f;
-        } else if (!io.permute) {
-            float4 lo = *reinterpret_cast<const float4*>(in + b + c0), hi = *reinterpret_cast<const float4*>(in + b + c0 + 4);
-            v[0] = lo.x; v[1] = lo.y; v[2] = lo.z; v[3] = lo.w; v[4] = hi.x; v[5] = hi.y; v[6] = hi.z; v[7] = hi.w;
-        } else {
-            for (int j = 0; j < 8; ++j) v[j] = in[b + peer_to_native32(c0+j)];
-        }
-        for (int j = 0; j < 8; ++j) X[t*32 + c0+j] = q8(v[j]);
-    }
-    // FFN residual in the projection tile's lanes (rt = wave/2, ct = wave%2).
+    // One read of the input serves F(input) and the FFN residual: each thread
+    // loads the 8 values its projection tile lanes own (rows wave/2*16+lr+e,
+    // column wave%2*16+lc), which together cover the window once.
     float ffn[8];
-    for (int e = 0; e < 8; ++e) {
-        int r = wave/2*16+lr+e, c = wave%2*16+lc, b = in_base[r];
-        ffn[e] = c32f_h((b < 0 ? 0.0f : in[b + io.channel(c)])*g1[c]);
+    {
+        const int c = wave%2*16+lc, ch = io.channel(c);
+        const float gc = g1[c];
+        for (int e = 0; e < 8; ++e) {
+            const int r = wave/2*16+lr+e, b = in_base[r];
+            const float v = b < 0 ? 0.0f : in[b + ch];
+            X[r*32 + c] = q8(v);
+            ffn[e] = c32f_h(v*gc);
+        }
     }
     __syncthreads();
     C32F8_MARK(2);
@@ -158,7 +160,11 @@ void k_c32_fp8(const float* in, const float* __restrict__ dw, const unsigned cha
             s = c32f_h(s + __shfl_xor(s, 8));
             s = c32f_h(s + __shfl_xor(s, 4));
             s = c32f_h(s + __shfl_xor(s, 2));
+#if C32F8_EXP == 3
+            const float inverse = 0.5f;
+#else
             const float inverse = c32f_h(1.f/sqrtf(fmaxf(s, .00006198883056640625f)));
+#endif
             float q0 = c32f_h(v0*inverse), q1 = c32f_h(v1*inverse);
             if (m == 0) { q0 = c32f_h(q0*head_scale); q1 = c32f_h(q1*head_scale); }
             dst[r*32+lc] = q8h(q0);
@@ -175,7 +181,11 @@ void k_c32_fp8(const float* in, const float* __restrict__ dw, const unsigned cha
             acc8 c = slice32(Qs+rt*16*32, 32, Ks+ct*16*32, 32, 0);
             for (int e = 0; e < 8; ++e) {
                 int q = rt*16+lr+e, k = ct*16+lc;
+#if C32F8_EXP == 2
+                float score = c32f_h(c[e]+0.25f*k);
+#else
                 float score = c32f_h(c[e]+B[q*64+k]);
+#endif
                 float b = score*.044921875f+1.30078125f;
                 float clipped = fminf(1.5693359375f, fmaxf(1.03125f, c32f_h(b)));
                 _Float16 hc = split512_to_half(clipped);
@@ -188,6 +198,9 @@ void k_c32_fp8(const float* in, const float* __restrict__ dw, const unsigned cha
     }
     __syncthreads();
     C32F8_MARK(6);
+#if C32F8_EXP == 4
+    if (tid < 64) den[tid] = float(sc[tid*64]);
+#else
     if (tid < 64) {
         const _Float16* e = sc + tid*64;
         float parity[2]; const int lanes[4] = {0,2,8,10}; const int offs[3] = {4,32,36};
@@ -206,6 +219,7 @@ void k_c32_fp8(const float* in, const float* __restrict__ dw, const unsigned cha
         }
         den[tid] = c32f_h(1.f/c32f_h(parity[0]+parity[1]));
     }
+#endif
     __syncthreads();
     C32F8_MARK(7);
     for (int i = tid; i < 64*64; i += 256) P[i] = q8h(c32f_h(float(sc[i])*den[i/64]));

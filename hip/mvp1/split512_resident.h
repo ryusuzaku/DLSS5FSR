@@ -8,6 +8,8 @@
 #include "tiled_gemm.hip"
 #include "split512_attention_wmma.hip"
 #include "swin_block_wmma.hip"
+#include <map>
+#include "swin_block_fp8.hip"
 #include <memory>
 #include <utility>
 
