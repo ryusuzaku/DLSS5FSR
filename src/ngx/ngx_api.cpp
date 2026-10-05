@@ -237,34 +237,43 @@ NVSDK_NGX_Result DoEvaluateD3D12(ID3D12GraphicsCommandList* cl,
         params->TryGetF(NVSDK_NGX_Parameter_MV_Scale_X, motion.scaleX);
         params->TryGetF(NVSDK_NGX_Parameter_MV_Scale_Y, motion.scaleY);
         const D3D12_RESOURCE_DESC md = mv->GetDesc();
-        const bool display = md.Width >= (UINT64)outRect.w;
-        motion.guideW = display ? outRect.w : colorRect.w;
-        motion.guideH = display ? outRect.h : colorRect.h;
+        const D3D12_RESOURCE_DESC cd = color->GetDesc();
+        const D3D12_RESOURCE_DESC od = output->GetDesc();
+        // The region of a guide texture that covers the frame. A guide the
+        // size of the colour texture shares its render subrect; one the size
+        // of the output covers the output; anything else (OptiScaler's NR
+        // pass hands a resampled colour next to the game's own depth and
+        // vectors) covers the whole view with its whole extent. Reading such
+        // a texture over the colour's extent took its top-left corner: the
+        // carry and depth no longer lined up with the picture.
+        auto guideExtent = [&](const D3D12_RESOURCE_DESC& gd, unsigned int& w, unsigned int& h) {
+            if (gd.Width == cd.Width && gd.Height == cd.Height) { w = colorRect.w; h = colorRect.h; return "render"; }
+            if (gd.Width == od.Width && gd.Height == od.Height) { w = outRect.w; h = outRect.h; return "display"; }
+            w = (unsigned int)gd.Width; h = gd.Height;
+            return "own";
+        };
+        const char* display = guideExtent(md, motion.guideW, motion.guideH);
         // RR guides handed over earlier this frame (once per hand-over).
         static unsigned int usedGuides = 0;
         const NrGuides& guides = NrGuideValues();
         if (guides.diffuseAlbedo && guides.generation != usedGuides) {
             usedGuides = guides.generation;
             const D3D12_RESOURCE_DESC ad = guides.diffuseAlbedo->GetDesc();
-            const bool albedoDisplay = ad.Width >= (UINT64)outRect.w;
             motion.albedo = guides.diffuseAlbedo;
-            motion.albedoW = albedoDisplay ? outRect.w : colorRect.w;
-            motion.albedoH = albedoDisplay ? outRect.h : colorRect.h;
+            guideExtent(ad, motion.albedoW, motion.albedoH);
         }
         if (depth) {
             const D3D12_RESOURCE_DESC dd = depth->GetDesc();
-            const bool depthDisplay = dd.Width >= (UINT64)outRect.w;
             motion.depth = depth;
-            motion.depthW = depthDisplay ? outRect.w : colorRect.w;
-            motion.depthH = depthDisplay ? outRect.h : colorRect.h;
+            guideExtent(dd, motion.depthW, motion.depthH);
             if (n == 0 || (n % 3000) == 0)
                 LOGI("evaluate #%llu depth: %llux%u format %u guide %ux%u", n, (unsigned long long)dd.Width,
                      dd.Height, (unsigned)dd.Format, motion.depthW, motion.depthH);
         }
         if (n == 0 || (n % 3000) == 0)
-            LOGI("evaluate #%llu motion: %llux%u format %u scale %.3f,%.3f guide %ux%u (%s resolution)", n,
+            LOGI("evaluate #%llu motion: %llux%u format %u scale %.3f,%.3f guide %ux%u (%s extent)", n,
                  (unsigned long long)md.Width, md.Height, (unsigned)md.Format, motion.scaleX, motion.scaleY,
-                 motion.guideW, motion.guideH, display ? "display" : "render");
+                 motion.guideW, motion.guideH, display);
     }
     if (c.nrPasses && !GpuNeuralChain(cl, output, outRect, c, mv ? &motion : nullptr)) {
         LOGW("evaluate: colour passes did not run, leaving the resample");

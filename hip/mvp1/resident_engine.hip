@@ -723,6 +723,9 @@ struct Engine {
     std::unique_ptr<Buffer> raw_input;
     size_t raw_bytes = 0;
     hipEvent_t start = nullptr, stop = nullptr;
+    // Recorded on compose_stream after a job's inputs are copied; the worker's
+    // stream waits on it on the device, so the caller never blocks on them.
+    hipEvent_t inputs_ready = nullptr;
 
     // Worker state.
     std::mutex mutex;
@@ -868,6 +871,7 @@ struct Engine {
         // Load weights and validate the configuration up front at 256x256.
         net.reset(new Network(config, 256, 256));
         HIP_CHECK(hipEventCreate(&start)); HIP_CHECK(hipEventCreate(&stop));
+        HIP_CHECK(hipEventCreateWithFlags(&inputs_ready, hipEventDisableTiming));
         HIP_CHECK(hipDeviceSynchronize());
         worker = std::thread([this] { loop(); });
     }
@@ -882,6 +886,7 @@ struct Engine {
         if (stream) (void)hipStreamSynchronize(stream);
         if (start) (void)hipEventDestroy(start);
         if (stop) (void)hipEventDestroy(stop);
+        if (inputs_ready) (void)hipEventDestroy(inputs_ready);
         if (pinned) (void)hipHostFree(pinned);
         if (compose_pinned) (void)hipHostFree(compose_pinned);
         if (compose_stream) (void)hipStreamSynchronize(compose_stream);
@@ -979,7 +984,6 @@ struct Engine {
                         }
                     }
                 }
-                HIP_CHECK(hipStreamSynchronize(compose_stream));
             } catch (const std::exception& e) {
                 failed = true; error = e.what(); return -1;
             }
@@ -995,18 +999,18 @@ struct Engine {
                 raw_input.reset(new Buffer((bytes+3)/4));
                 raw_bytes = raw_input->count*sizeof(float);
             }
-            // The job's inputs are copied on the high-priority compose stream: the
-            // caller (the game's render thread) waits for them, and the network's
-            // low-priority stream is starved under a path-traced frame (S326: the
-            // shim's prepare blocked 47 ms mean, 625 ms worst, on these syncs).
+            // The job's inputs are copied on the high-priority compose stream
+            // (the network's low-priority stream is starved under a path-traced
+            // frame, S326) and nobody waits for them here: the worker's stream
+            // waits on inputs_ready, and compose_device's one sync per frame
+            // covers the caller's buffers (S328: each sync here cost the game's
+            // thread a GPU round trip, 4-8 ms mean per frame in all).
             HIP_CHECK(hipMemcpyAsync(raw_input->data, staging, bytes, hipMemcpyDeviceToDevice, compose_stream));
-            HIP_CHECK(hipStreamSynchronize(compose_stream));
             job_depth_valid = false;
             if (!crop && depth_fresh && depth_w == w && depth_h == h) {
                 if (!job_depth || job_depth->count < size_t(w)*h) job_depth.reset(new Buffer(size_t(w)*h));
                 HIP_CHECK(hipMemcpyAsync(job_depth->data, depth_next->data, size_t(w)*h*sizeof(float),
                                          hipMemcpyDeviceToDevice, compose_stream));
-                HIP_CHECK(hipStreamSynchronize(compose_stream));
                 job_depth_valid = true;
             }
             depth_fresh = false;
@@ -1015,7 +1019,6 @@ struct Engine {
                 if (!job_albedo || job_albedo->count < size_t(w)*h) job_albedo.reset(new Buffer(size_t(w)*h));
                 HIP_CHECK(hipMemcpyAsync(job_albedo->data, albedo_next->data, size_t(w)*h*sizeof(float),
                                          hipMemcpyDeviceToDevice, compose_stream));
-                HIP_CHECK(hipStreamSynchronize(compose_stream));
                 job_albedo_valid = true;
             }
             albedo_fresh = false;
@@ -1023,6 +1026,10 @@ struct Engine {
             if (!crop && options.luma && options.smooth > 0.0f) carry_history(w, h);
             coord_cur = -1;
             if (!crop && options.luma && options.temporal > 0.0f) history_coords(w, h);
+            HIP_CHECK(hipEventRecord(inputs_ready, compose_stream));
+            // Only the luma path is followed by a compose that syncs; the
+            // others hand the staging back to the caller on return.
+            if (crop || !options.luma) HIP_CHECK(hipStreamSynchronize(compose_stream));
         } catch (const std::exception& e) {
             failed = true; error = e.what(); return -1;
         }
@@ -1053,6 +1060,7 @@ struct Engine {
     }
 
     void run() {
+        HIP_CHECK(hipStreamWaitEvent(stream, inputs_ready, 0));
         int W = 256, H = 256;
         // Luma mode may run the network on a downscale of the frame (scale).
         int sw = frame_w, sh = frame_h;
@@ -1267,7 +1275,6 @@ struct Engine {
             cur = next;
         }
         HIP_CHECK(hipGetLastError());
-        HIP_CHECK(hipStreamSynchronize(compose_stream));
         history_cur = cur;
     }
 
@@ -1284,7 +1291,6 @@ struct Engine {
             if (!depth_next || depth_next->count < size_t(w)*h) depth_next.reset(new Buffer(size_t(w)*h));
             HIP_CHECK(hipMemcpy2DAsync(depth_next->data, size_t(w)*sizeof(float), src, size_t(pitch),
                                        size_t(w)*sizeof(float), h, hipMemcpyDeviceToDevice, compose_stream));
-            HIP_CHECK(hipStreamSynchronize(compose_stream));
         } catch (const std::exception& e) {
             failed = true; error = e.what(); return -1;
         }
@@ -1300,7 +1306,6 @@ struct Engine {
             if (!albedo_next || albedo_next->count < size_t(w)*h) albedo_next.reset(new Buffer(size_t(w)*h));
             HIP_CHECK(hipMemcpy2DAsync(albedo_next->data, size_t(w)*sizeof(float), src, size_t(pitch),
                                        size_t(w)*sizeof(float), h, hipMemcpyDeviceToDevice, compose_stream));
-            HIP_CHECK(hipStreamSynchronize(compose_stream));
         } catch (const std::exception& e) {
             failed = true; error = e.what(); return -1;
         }
@@ -1349,7 +1354,6 @@ struct Engine {
             cur = 1 - cur;
         }
         HIP_CHECK(hipGetLastError());
-        HIP_CHECK(hipStreamSynchronize(compose_stream));
         coord_cur = cur;
     }
 
@@ -1415,6 +1419,9 @@ struct Engine {
         if (failed) return -1;
         if (!options.luma || (map_only && bpp != 8)) return 0;
         int r = compose_into(reinterpret_cast<unsigned char*>(dst), pitch, w, h, bpp, pitch, map_only);
+        if (r == 0 && hipStreamSynchronize(compose_stream) != hipSuccess) {
+            failed = true; error = "compose stream sync failed"; return -1;
+        }
         if (r == 1 && device_ms) *device_ms = last_ms;
         return r;
     }
@@ -1437,6 +1444,9 @@ struct Engine {
             }
             int r = compose_into(composed ? reinterpret_cast<unsigned char*>(composed->data) : nullptr,
                                  size_t(w)*bpp, w, h, bpp, pitch);
+            if (r == 0 && hipStreamSynchronize(compose_stream) != hipSuccess) {
+                failed = true; error = "compose stream sync failed"; return -1;
+            }
             if (r != 1) return r;
             try {
                 HIP_CHECK(hipMemcpyAsync(compose_pinned, composed->data, bytes, hipMemcpyDeviceToHost, compose_stream));

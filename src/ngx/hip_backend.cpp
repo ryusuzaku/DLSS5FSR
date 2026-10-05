@@ -11026,6 +11026,12 @@ bool LumaMap(float params[4]) {
     for (int i = 0; i < 4; ++i) params[i] = S().mapParams[i];
     return S().mapActive;
 }
+bool MotionIsUv() {
+    State& s = S();
+    if (s.engineState <= 0 || !s.EngineMotionMode) return false;
+    const int mode = s.EngineMotionMode();
+    return mode == 2 || mode == 3;
+}
 bool Usable() { return S().usable; }
 bool SelfTest() { return SelfTestImpl(); }
 bool ChainTest() { return ChainTestImpl(); }
@@ -11074,6 +11080,7 @@ void HipFeBlockView() { hipb::FeBlockView(); }
 bool HipFeBlockStaged() { return hipb::FeBlockStaged(); }
 bool HipCandidatePreview() { return hipb::CandidatePreview(); }
 bool HipLumaMap(float params[4]) { return hipb::LumaMap(params); }
+bool HipMotionIsUv() { return hipb::MotionIsUv(); }
 bool HipResidentEngineSubmit() { return hipb::ResidentEngineSubmit(); }
 bool HipCandidateInputCapture() { return hipb::CandidateInputCapture(); }
 UINT64 HipStagingRowPitch() { return hipb::StagingRowPitch(); }

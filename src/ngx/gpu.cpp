@@ -786,6 +786,13 @@ bool GpuNeuralChain(ID3D12GraphicsCommandList* cl, ID3D12Resource* output,
             mc.MvScaleY = motion->scaleY;
             mc.GuideWidth = motion->guideW;
             mc.GuideHeight = motion->guideH;
+            // The pass rescales guide pixels to frame pixels; UV units are
+            // already resolution-free, so cancel it once the engine says UV
+            // (a guide 1707 wide under a 1126-wide frame gave 0.66x vectors).
+            if (HipMotionIsUv()) {
+                mc.MvScaleX *= (float)motion->guideW / (float)outRect.w;
+                mc.MvScaleY *= (float)motion->guideH / (float)outRect.h;
+            }
             const bool ok = GpuNrDispatch(cl, mc, motion->res, nullptr, nullptr, nullptr, nullptr,
                                           mvTex->res.Get(), nullptr);
             GpuTransition(cl, motion->res, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, mvIn);

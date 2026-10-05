@@ -645,6 +645,9 @@ bool HipCandidatePreview();  // opt-in model-texture bridge, DebugView=2 only
 // Whether the last HipCandidatePreview wrote the engine's ratio map (see
 // GpuContext::hipMapMode); params as re_luma_map_params.
 bool HipLumaMap(float params[4]);
+// The engine detected UV-unit motion vectors (re_motion_mode 2/3): staging
+// must not rescale them by the guide-to-frame ratio.
+bool HipMotionIsUv();
 bool HipCandidateInputCapture();  // one-shot or triggered-repeat staged-proxy capture
 UINT64 HipStagingRowPitch();
 UINT64 HipStagingBytes();
