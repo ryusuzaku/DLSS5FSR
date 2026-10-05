@@ -11,6 +11,7 @@
 
 #include "tiled_gemm.hip"
 #include "c32_fused.hip"
+#include "c32_fp8.hip"
 
 namespace c32_resident {
 // Tiled-GEMM rounding policies of the head70/C32 kernels. The expand and QKV
@@ -55,9 +56,12 @@ struct Weights {
     float scale;
     Buffer data;
     Buffer halves;  // first 12288 weights as half (6144 floats of storage) for k_c32_wmma
-    explicit Weights(const std::string& d):dir(d),scale(read(d,"weights",16449)[16384]),data(d,"weights",16449),halves(6144) {
+    Buffer fp8;     // the same as E4M3 bytes (3072 floats of storage) for k_c32_fp8
+    explicit Weights(const std::string& d):dir(d),scale(read(d,"weights",16449)[16384]),data(d,"weights",16449),halves(6144),fp8(3072) {
         hipLaunchKernelGGL(k_c32_half_weights,dim3(48),dim3(256),0,c512_resident::stream,
                            data.data,reinterpret_cast<_Float16*>(halves.data),12288);
+        hipLaunchKernelGGL(k_c32_fp8_weights,dim3(48),dim3(256),0,c512_resident::stream,
+                           data.data,reinterpret_cast<unsigned char*>(fp8.data),12288);
         HIP_CHECK(hipGetLastError());
     }
     // Fused body of one launch: WMMA unless c512_resident::exact_math.
@@ -66,11 +70,12 @@ struct Weights {
             hipLaunchKernelGGL(k_c32_fused,dim3(rows/64),dim3(256),0,c512_resident::stream,
                                input,data.data,scale,raw_out,quant_out);
         } else {
-            hipLaunchKernelGGL(k_c32_wmma,dim3(rows/64),dim3(256),0,c512_resident::stream,
-                               input,data.data,reinterpret_cast<const _Float16*>(halves.data),scale,raw_out,quant_out,io);
+            // FP8 WMMA form: bit-identical to k_c32_wmma, 1.66x faster (S330).
+            hipLaunchKernelGGL(k_c32_fp8,dim3(rows/64),dim3(256),0,c512_resident::stream,
+                               input,data.data,reinterpret_cast<const unsigned char*>(fp8.data),scale,raw_out,quant_out,io);
         }
         HIP_CHECK(hipGetLastError());
-        if (c512_resident::launch_hook) c512_resident::launch_hook(c512_resident::exact_math?"k_c32_fused":"k_c32_wmma");
+        if (c512_resident::launch_hook) c512_resident::launch_hook(c512_resident::exact_math?"k_c32_fused":"k_c32_fp8");
     }
 };
 // Shared retained workspace for sequential C32 body dispatches.
