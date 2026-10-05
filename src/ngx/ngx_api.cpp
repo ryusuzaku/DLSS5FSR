@@ -300,7 +300,7 @@ NVSDK_NGX_Result DoEvaluateD3D12(ID3D12GraphicsCommandList* cl,
 
     // The frame counter goes LAST: the next evaluate trusts that seeing this
     // value means every shim op above -- including the resolve -- executed.
-    if (c.nrPasses && c.hipBackend) GpuWriteFrameCounter(cl, n);
+    if (c.nrPasses && c.hipBackend && !Gpu().hipStagingBusy) GpuWriteFrameCounter(cl, n);
 
     GpuDrainDumps(n, false);
 

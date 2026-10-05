@@ -493,6 +493,12 @@ struct GpuContext {
     bool hipMapMode = false;
     float hipMapParams[4] = {};
     uint64_t hipEvaluate = 0, hipStagingFrame = 0;
+    // A HIP job started by a prepare has not finished yet: it may still be
+    // reading the shared staging, so this frame's list must not rewrite it
+    // (nor write the frame counter that would claim it did).
+    bool hipStagingBusy = false;
+    // The slot this evaluate's list writes (hipEvaluate % slots).
+    unsigned int hipWriteSlot = 0;
 
     // Held by unique_ptr so a pointer to a pooled texture stays valid when the
     // pool grows. GpuNeuralChain holds `proxy` across the acquisition of
@@ -648,6 +654,19 @@ bool HipLumaMap(float params[4]);
 // The engine detected UV-unit motion vectors (re_motion_mode 2/3): staging
 // must not rescale them by the guide-to-frame ratio.
 bool HipMotionIsUv();
+// The work the last prepare queued asynchronously finished (or none is
+// pending). Never blocks.
+bool HipResultReady();
+// The last prepare's work was queued without waiting (collect it next time).
+bool HipResultPending();
+// Bumped whenever the backend shuts down (results from before are void).
+unsigned int HipSession();
+// Staging slots: frame n's list writes slot n % HipStagingSlots() at these
+// byte offsets (colour buffer, or motion/depth/albedo buffer); the HIP side
+// reads the slot set with HipSetReadSlot.
+UINT64 HipStagingSlotOffset(unsigned int slot, bool motion);
+void HipSetReadSlot(unsigned int slot);
+unsigned int HipStagingSlots();
 bool HipCandidateInputCapture();  // one-shot or triggered-repeat staged-proxy capture
 UINT64 HipStagingRowPitch();
 UINT64 HipStagingBytes();

@@ -92,6 +92,14 @@ struct State {
     UINT64 pitch = 0, bytes = 0;
     // What the shared buffers were allocated with; a smaller frame reuses them.
     UINT64 allocBytes = 0, mvAllocBytes = 0;
+    // kStagingSlots frames of colour and motion/depth/albedo staging, one per
+    // evaluate in turn (frame n writes slot n % kStagingSlots); ptrIn/ptrMv
+    // point at the slot the next HIP job reads (SetReadSlot). A job queued
+    // without waiting can then read its slot while later frames' lists write
+    // the others.
+    void *ptrInBase = nullptr, *ptrMvBase = nullptr;
+    UINT64 inStride = 0, mvStride = 0;
+    unsigned int readSlot = 0;
     ComPtr<ID3D12Resource> bufIn, bufOut;
     HANDLE hIn = nullptr, hOut = nullptr;
     hipExternalMemory_t extIn = nullptr, extOut = nullptr;
@@ -145,6 +153,12 @@ struct State {
     int (*EngineMotion)(const void*, int, int, int) = nullptr;  // optional (re_motion)
     int (*EngineComposeDevice)(void*, unsigned long long, int, int, int, float*) = nullptr;  // optional
     int (*EngineMotionMode)() = nullptr;  // optional (re_motion_mode)
+    // Optional (S328): queue the map compose without waiting, poll it later.
+    int (*EngineComposeMapAsync)(void*, unsigned long long, int, int, float*) = nullptr;
+    int (*EngineComposeReady)() = nullptr;
+    bool asyncPending = false;    // the last prepare's compose is still queued
+    unsigned int session = 0;     // bumped by Shutdown: older pending results are void
+    bool identitySkipped = false; // RunModel left sharedOut to the engine's map
     int (*EngineComposeMap)(void*, unsigned long long, int, int, float*) = nullptr;  // optional
     int (*EngineMapParams)(float*) = nullptr;  // optional (re_luma_map_params)
     int (*EngineControls)(const float*, int) = nullptr;  // optional (re_controls)
@@ -254,6 +268,8 @@ void DropStaging() {
     s.albedoOffset = 0;
     s.albedoStaged = false;
     s.ptrIn = s.ptrOut = nullptr;
+    s.ptrInBase = s.ptrMvBase = nullptr;
+    s.inStride = s.mvStride = 0;
     if (s.hIn) CloseHandle(s.hIn);
     if (s.hOut) CloseHandle(s.hOut);
     s.hIn = s.hOut = nullptr;
@@ -447,6 +463,11 @@ void Shutdown() {
         s.engineDll = nullptr;
         s.engineState = 0;
     }
+    // A queued compose died with the engine; never poll the unloaded DLL.
+    s.asyncPending = s.identitySkipped = false;
+    s.EngineComposeMapAsync = nullptr;
+    s.EngineComposeReady = nullptr;
+    ++s.session;
     DropStaging();
     if (s.candidateInputRgb) {
         s.Free(s.candidateInputRgb);
@@ -566,6 +587,15 @@ static bool StagingFailed(unsigned int w, unsigned int h, unsigned int bpp, cons
 // size from 4.6 MB up worked; the same sizes pass in a standalone probe, so
 // the cause is the game's context, and the rounding keeps clear of it. It
 // also lets a small resize land in the same size class.
+constexpr unsigned int kStagingSlots = 4;
+static UINT64 SlotStride(UINT64 bytes) { return (bytes + 0xFFFF) & ~(UINT64)0xFFFF; }
+
+static void PointAtReadSlot() {
+    State& s = S();
+    s.ptrIn = s.ptrInBase ? (unsigned char*)s.ptrInBase + (size_t)s.readSlot * s.inStride : nullptr;
+    s.ptrMv = s.ptrMvBase ? (unsigned char*)s.ptrMvBase + (size_t)s.readSlot * s.mvStride : nullptr;
+}
+
 UINT64 StagingAllocBytes(UINT64 bytes) {
     const UINT64 step = 1ull << 20, floor = 4ull << 20;
     const UINT64 b = (bytes + step - 1) / step * step;
@@ -587,8 +617,11 @@ bool EnsureStaging(unsigned int w, unsigned int h, unsigned int bpp) {
     // (OptiScaler's model-resolution slider, a window resize), always on the
     // way down; whatever the driver objects to, a shrink no longer asks it.
     const StagingLayoutValues L = StagingLayout(w, h, bpp);
-    if (s.bufIn && s.bufOut && s.bpp == bpp && L.bytes <= s.allocBytes &&
-        (!s.bufMv || L.mvBytes <= s.mvAllocBytes)) {
+    if (s.bufIn && s.bufOut && s.bpp == bpp && kStagingSlots * SlotStride(L.bytes) <= s.allocBytes &&
+        (!s.bufMv || kStagingSlots * SlotStride(L.mvBytes) <= s.mvAllocBytes)) {
+        s.inStride = SlotStride(L.bytes);
+        if (s.bufMv) s.mvStride = SlotStride(L.mvBytes);
+        PointAtReadSlot();
         s.w = w;
         s.h = h;
         s.pitch = L.pitch;
@@ -613,7 +646,8 @@ bool EnsureStaging(unsigned int w, unsigned int h, unsigned int bpp) {
 
     s.pitch = L.pitch;
     s.bytes = L.bytes;
-    s.allocBytes = StagingAllocBytes(s.bytes);
+    s.inStride = SlotStride(s.bytes);
+    s.allocBytes = StagingAllocBytes(kStagingSlots * s.inStride);
 
     D3D12_HEAP_PROPERTIES hp{};
     hp.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -666,6 +700,7 @@ bool EnsureStaging(unsigned int w, unsigned int h, unsigned int bpp) {
     if (!import(s.hIn, s.bufIn, s.extIn, s.ptrIn) ||
         !import(s.hOut, s.bufOut, s.extOut, s.ptrOut))
         return StagingFailed(w, h, bpp, "HIP import", E_FAIL);
+    s.ptrInBase = s.ptrIn;
     g_failSkip = 0; g_failLogs = 0;
 
     // Motion staging: float2 per pixel. Optional -- without it the engine
@@ -677,7 +712,8 @@ bool EnsureStaging(unsigned int w, unsigned int h, unsigned int bpp) {
         s.depthOffset = L.depthOffset;
         s.albedoOffset = L.albedoOffset;
         s.mvBytes = L.mvBytes;
-        s.mvAllocBytes = StagingAllocBytes(s.mvBytes);
+        s.mvStride = SlotStride(s.mvBytes);
+        s.mvAllocBytes = StagingAllocBytes(kStagingSlots * s.mvStride);
         D3D12_RESOURCE_DESC md = bd;
         md.Width = s.mvAllocBytes;
         hipExternalMemoryHandleDesc hd{};
@@ -705,8 +741,11 @@ bool EnsureStaging(unsigned int w, unsigned int h, unsigned int bpp) {
             s.hMv = nullptr; s.bufMv.Reset(); s.mvPitch = s.mvBytes = s.mvAllocBytes = 0;
             s.depthOffset = s.depthPitch = 0;
             s.albedoOffset = 0;
+            s.mvStride = 0;
         }
+        s.ptrMvBase = s.ptrMv;
     }
+    PointAtReadSlot();
 
     s.w = w;
     s.h = h;
@@ -716,9 +755,19 @@ bool EnsureStaging(unsigned int w, unsigned int h, unsigned int bpp) {
     return true;
 }
 
+static bool AsyncMapPath();
+
 bool RunModel() {
     State& s = S();
     if (!s.usable || !s.copyKernel || !s.ptrIn || !s.ptrOut || !s.bytes) return false;
+    // The engine's map overwrites sharedOut anyway; waiting for an identity
+    // copy first cost the game's thread a GPU round trip every frame. The
+    // copy runs later, synchronously, only when no map comes (start-up).
+    s.identitySkipped = false;
+    if (s.runs > 0 && AsyncMapPath()) {
+        s.identitySkipped = true;
+        return true;
+    }
 
     int n = (int)s.bytes;
     void* args[] = {&s.ptrIn, &s.ptrOut, &n};
@@ -959,6 +1008,9 @@ static bool EngineReady() {
     s.EngineComposeDevice = (int (*)(void*, unsigned long long, int, int, int, float*))
         GetProcAddress(s.engineDll, "re_compose_device");
     s.EngineMotionMode = (int (*)())GetProcAddress(s.engineDll, "re_motion_mode");
+    s.EngineComposeMapAsync = (int (*)(void*, unsigned long long, int, int, float*))
+        GetProcAddress(s.engineDll, "re_compose_map_async");
+    s.EngineComposeReady = (int (*)())GetProcAddress(s.engineDll, "re_compose_ready");
     s.EngineComposeMap = (int (*)(void*, unsigned long long, int, int, float*))
         GetProcAddress(s.engineDll, "re_compose_map_device");
     s.EngineMapParams = (int (*)(float*))GetProcAddress(s.engineDll, "re_luma_map_params");
@@ -996,6 +1048,16 @@ static bool EngineReady() {
     LOGI("hip: resident engine ready in %.0f ms (candidate encoder5-70 + C32 front end; not original kernels)",
          frequency.QuadPart ? 1000.0 * (double)(end.QuadPart - begin.QuadPart) / (double)frequency.QuadPart : 0.0);
     return true;
+}
+
+// The game's path: full frame, map resolve, RGBA16F staging, and an engine
+// that can compose the map asynchronously.
+static bool AsyncMapPath() {
+    State& s = S();
+    const Config& cfg = Cfg();
+    return !cfg.residentEngineConfig.empty() && cfg.residentEngineFull && cfg.residentEngineMap &&
+           s.engineState > 0 && s.EngineComposeMapAsync && s.EngineComposeReady && s.EngineMapParams &&
+           s.bpp == 8;
 }
 
 // Called once per prepared frame while the staging buffer holds this frame.
@@ -1133,7 +1195,24 @@ bool CandidatePreview() {
         s.mapActive = false;
         if (cfg.residentEngineMap && s.EngineComposeMap && s.EngineMapParams && s.bpp == 8) {
             // Luma mode: the ratio map itself; the resolve applies it to its own frame.
-            const int c = s.EngineComposeMap(s.ptrOut, (unsigned long long)s.pitch, (int)s.w, (int)s.h, &deviceMs);
+            // Queued without waiting when the engine can (collected by the next prepare).
+            const bool async = AsyncMapPath();
+            const int c = async
+                ? s.EngineComposeMapAsync(s.ptrOut, (unsigned long long)s.pitch, (int)s.w, (int)s.h, &deviceMs)
+                : s.EngineComposeMap(s.ptrOut, (unsigned long long)s.pitch, (int)s.w, (int)s.h, &deviceMs);
+            if (async && c == 1) s.asyncPending = true;
+            if (c == 0 && s.identitySkipped) {
+                // No map yet: the identity copy the frame skipped, now, synchronously.
+                s.identitySkipped = false;
+                int n = (int)s.bytes;
+                void* args[] = {&s.ptrIn, &s.ptrOut, &n};
+                if (s.ModuleLaunchKernel(s.copyKernel, (unsigned int)((s.bytes + 255) / 256), 1, 1, 256, 1, 1, 0,
+                                         s.stream, args, nullptr) != hipSuccess ||
+                    s.StreamSynchronize(s.stream) != hipSuccess) {
+                    LOGE("hip: identity copy failed");
+                    return false;
+                }
+            }
             if (c < 0) {
                 LOGE("hip: resident engine disabled: %s", s.EngineError());
                 s.engineState = -1;
@@ -11026,6 +11105,27 @@ bool LumaMap(float params[4]) {
     for (int i = 0; i < 4; ++i) params[i] = S().mapParams[i];
     return S().mapActive;
 }
+bool ResultReady() {
+    State& s = S();
+    if (!s.asyncPending) return true;
+    if (!s.engineDll || s.engineState <= 0) { s.asyncPending = false; return true; }
+    const int r = s.EngineComposeReady ? s.EngineComposeReady() : 1;
+    if (r < 0) {
+        LOGE("hip: resident engine disabled: %s", s.EngineError());
+        s.engineState = -1;
+    }
+    if (r != 0) s.asyncPending = false;
+    return r != 0;
+}
+bool ResultPending() { return S().asyncPending; }
+unsigned int Session() { return S().session; }
+UINT64 StagingSlotOffset(unsigned int slot, bool motion) {
+    return (UINT64)(slot % kStagingSlots) * (motion ? S().mvStride : S().inStride);
+}
+void SetReadSlot(unsigned int slot) {
+    S().readSlot = slot % kStagingSlots;
+    PointAtReadSlot();
+}
 bool MotionIsUv() {
     State& s = S();
     if (s.engineState <= 0 || !s.EngineMotionMode) return false;
@@ -11081,6 +11181,12 @@ bool HipFeBlockStaged() { return hipb::FeBlockStaged(); }
 bool HipCandidatePreview() { return hipb::CandidatePreview(); }
 bool HipLumaMap(float params[4]) { return hipb::LumaMap(params); }
 bool HipMotionIsUv() { return hipb::MotionIsUv(); }
+bool HipResultReady() { return hipb::ResultReady(); }
+bool HipResultPending() { return hipb::ResultPending(); }
+unsigned int HipSession() { return hipb::Session(); }
+UINT64 HipStagingSlotOffset(unsigned int slot, bool motion) { return hipb::StagingSlotOffset(slot, motion); }
+void HipSetReadSlot(unsigned int slot) { hipb::SetReadSlot(slot); }
+unsigned int HipStagingSlots() { return hipb::kStagingSlots; }
 bool HipResidentEngineSubmit() { return hipb::ResidentEngineSubmit(); }
 bool HipCandidateInputCapture() { return hipb::CandidateInputCapture(); }
 UINT64 HipStagingRowPitch() { return hipb::StagingRowPitch(); }

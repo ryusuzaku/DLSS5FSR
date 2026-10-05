@@ -726,6 +726,9 @@ struct Engine {
     // Recorded on compose_stream after a job's inputs are copied; the worker's
     // stream waits on it on the device, so the caller never blocks on them.
     hipEvent_t inputs_ready = nullptr;
+    // Recorded after an asynchronous compose (re_compose_map_async); the
+    // caller polls it with re_compose_ready instead of blocking.
+    hipEvent_t compose_done = nullptr;
 
     // Worker state.
     std::mutex mutex;
@@ -872,6 +875,7 @@ struct Engine {
         net.reset(new Network(config, 256, 256));
         HIP_CHECK(hipEventCreate(&start)); HIP_CHECK(hipEventCreate(&stop));
         HIP_CHECK(hipEventCreateWithFlags(&inputs_ready, hipEventDisableTiming));
+        HIP_CHECK(hipEventCreateWithFlags(&compose_done, hipEventDisableTiming));
         HIP_CHECK(hipDeviceSynchronize());
         worker = std::thread([this] { loop(); });
     }
@@ -887,6 +891,7 @@ struct Engine {
         if (start) (void)hipEventDestroy(start);
         if (stop) (void)hipEventDestroy(stop);
         if (inputs_ready) (void)hipEventDestroy(inputs_ready);
+        if (compose_done) (void)hipEventDestroy(compose_done);
         if (pinned) (void)hipHostFree(pinned);
         if (compose_pinned) (void)hipHostFree(compose_pinned);
         if (compose_stream) (void)hipStreamSynchronize(compose_stream);
@@ -1359,7 +1364,7 @@ struct Engine {
 
     // map_only: write the carried map (k_map_out, RGBA16F) instead of composing.
     int compose_into(unsigned char* out, size_t out_pitch, int w, int h, int bpp, size_t dst_pitch,
-                     bool map_only = false) {
+                     bool map_only = false, bool sync = true) {
         if (!out || published < 0 || map_w != w || map_h != h || cur_w != w || cur_h != h || cur_bpp != bpp ||
             dst_pitch < size_t(w)*bpp || out_pitch < size_t(w)*bpp) return 0;
         try {
@@ -1407,11 +1412,35 @@ struct Engine {
                                    reinterpret_cast<const unsigned char*>(current->data), cur_pitch, bpp,
                                    map, options, out, out_pitch, w, h);
             HIP_CHECK(hipGetLastError());
-            HIP_CHECK(hipStreamSynchronize(compose_stream));
+            if (sync) HIP_CHECK(hipStreamSynchronize(compose_stream));
+            else HIP_CHECK(hipEventRecord(compose_done, compose_stream));
         } catch (const std::exception& e) {
             failed = true; error = e.what(); return -1;
         }
         return 1;
+    }
+
+    // Asynchronous map compose: queued on compose_stream, compose_done marks
+    // the end. 1 queued, 0 nothing to compose (stream left idle), -1 error.
+    int compose_map_async(void* dst, size_t pitch, int w, int h, float* device_ms) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (failed) return -1;
+        if (!options.luma) return 0;
+        int r = compose_into(reinterpret_cast<unsigned char*>(dst), pitch, w, h, 8, pitch, true, false);
+        if (r == 0 && hipStreamSynchronize(compose_stream) != hipSuccess) {
+            failed = true; error = "compose stream sync failed"; return -1;
+        }
+        if (r == 1 && device_ms) *device_ms = last_ms;
+        return r;
+    }
+    // 1 the last asynchronous compose (and everything queued before it on
+    // compose_stream) finished, 0 still running, -1 error.
+    int compose_ready() {
+        hipError_t e = hipEventQuery(compose_done);
+        if (e == hipSuccess) return 1;
+        if (e == hipErrorNotReady) return 0;
+        std::lock_guard<std::mutex> lock(mutex);
+        failed = true; error = "compose event query failed"; return -1;
     }
 
     int compose_device(void* dst, size_t pitch, int w, int h, int bpp, float* device_ms, bool map_only = false) {
@@ -1577,6 +1606,24 @@ __declspec(dllexport) int re_compose_map_device(void* dst, unsigned long long pi
     std::lock_guard<std::mutex> lock(g_mutex);
     if (!g_engine) return -1;
     return g_engine->compose_device(dst, size_t(pitch), width, height, 8, device_ms, true);
+}
+
+// Asynchronous re_compose_map_device: returns once the map is queued (1),
+// 0 nothing yet (nothing queued), -1 error. dst may only be read, and the
+// buffers handed to re_submit_full/re_motion/re_depth/re_albedo since the
+// last ready poll may only be rewritten, once re_compose_ready says 1.
+__declspec(dllexport) int re_compose_map_async(void* dst, unsigned long long pitch, int width, int height,
+                                               float* device_ms) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!g_engine) return -1;
+    return g_engine->compose_map_async(dst, size_t(pitch), width, height, device_ms);
+}
+
+// Non-blocking: 1 the last re_compose_map_async finished, 0 not yet, -1 error.
+__declspec(dllexport) int re_compose_ready() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!g_engine) return -1;
+    return g_engine->compose_ready();
 }
 
 // For a map consumer: params[0..1] scale the staged motion vectors to frame
