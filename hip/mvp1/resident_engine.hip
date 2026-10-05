@@ -199,6 +199,8 @@ struct OutputOptions {
     float reject = 0.06f;   // history_clamp=2: largest input channel change that keeps the history
     float scale = 1.0f;
     float budget = 0.0f;  // budget=N: cap on network pixels after scale (0 = none)
+    float additive = 0.0f;  // additive=A: luma edit as the network's luminance change added to the
+                            // frame (A=1) instead of a ratio (A=0): a ratio cannot light a black pixel
     float limit = 0.0f, smooth = 0.0f, sigma = 0.02f, strength = 1.0f, gate = 0.03f;
     int gain = -1;
 };
@@ -269,6 +271,17 @@ __device__ inline float net_ratio(const float* linear, const float* color, int x
     return (sum_out + 1e-4f) / (sum_in + 1e-4f);
 }
 
+// The network's luminance change at one of its pixels (linear light).
+__device__ inline float net_delta(const float* linear, const float* color, int x, int y, int W, int encoded) {
+    const float* o = linear + (size_t(y)*W + x)*3;
+    const float* i = color + (size_t(y)*W + x)*3;
+    if (encoded)
+        return .2126f*(srgb_decode_device(o[0]) - srgb_decode_device(i[0])) +
+               .7152f*(srgb_decode_device(o[1]) - srgb_decode_device(i[1])) +
+               .0722f*(srgb_decode_device(o[2]) - srgb_decode_device(i[2]));
+    return .2126f*(fmaxf(o[0], 0.0f) - i[0]) + .7152f*(fmaxf(o[1], 0.0f) - i[1]) + .0722f*(fmaxf(o[2], 0.0f) - i[2]);
+}
+
 // Luma mode, after a network run: per frame pixel (ratio, Y_in). The ratio
 // comes from the network at its own resolution (sw x sh content, bilinear
 // up to the frame when scaled); Y_in is the frame's own linearized
@@ -285,10 +298,11 @@ __global__ void k_ratio_map(const float* linear, const float* color, const unsig
     const unsigned char* px = src + size_t(y)*pitch + size_t(x)*bpp;
     for (int c = 0; c < 3; ++c) raw[c] = srgb_decode_device(frame_channel(px, bpp, c));
     float yin = .2126f*raw[0] + .7152f*raw[1] + .0722f*raw[2];
-    float r;
+    float r, delta = 0.0f;
     if (sw == frame_w && sh == frame_h) {
         r = net_ratio(linear, color, x, y, sw, sh, W, o.denoise, o.encoded, depth, frame_w, frame_h, o.depth_sigma,
                       albedo);
+        if (o.additive > 0.0f) delta = net_delta(linear, color, x, y, W, o.encoded);
     } else {
         float fx = fminf(fmaxf((x+0.5f)*sw/frame_w - 0.5f, 0.0f), float(sw-1));
         float fy = fminf(fmaxf((y+0.5f)*sh/frame_h - 0.5f, 0.0f), float(sh-1));
@@ -300,6 +314,16 @@ __global__ void k_ratio_map(const float* linear, const float* color, const unsig
         float c = net_ratio(linear, color, x0, y1, sw, sh, W, o.denoise, o.encoded, depth, frame_w, frame_h, ds, albedo);
         float d = net_ratio(linear, color, x1, y1, sw, sh, W, o.denoise, o.encoded, depth, frame_w, frame_h, ds, albedo);
         r = (a*(1.0f-tx) + b*tx)*(1.0f-ty) + (c*(1.0f-tx) + d*tx)*ty;
+        if (o.additive > 0.0f) {
+            float da = net_delta(linear, color, x0, y0, W, o.encoded), db = net_delta(linear, color, x1, y0, W, o.encoded);
+            float dc = net_delta(linear, color, x0, y1, W, o.encoded), dd = net_delta(linear, color, x1, y1, W, o.encoded);
+            delta = (da*(1.0f-tx) + db*tx)*(1.0f-ty) + (dc*(1.0f-tx) + dd*tx)*ty;
+        }
+    }
+    if (o.additive > 0.0f) {
+        // The same change as a ratio on this pixel; near black it may be large.
+        const float ra = fmaxf(yin + delta, 0.0f) / fmaxf(yin, 1e-4f);
+        r += o.additive*(fminf(ra, 64.0f) - r);
     }
     if (tone && yin > 1e-5f && o.tone_inverse) {
         // The network's ratio is on the toned picture: carry it back to the
@@ -828,6 +852,7 @@ struct Engine {
                 options.motion = value == "auto" ? 2 : value == "1";
             else if (key == "scale") options.scale = std::stof(value);
             else if (key == "budget") options.budget = std::stof(value);
+            else if (key == "additive") options.additive = std::stof(value);
             else if (key == "extent" && (value == "compact" || value == "legacy")) options.compact = value == "compact";
             else if (key == "tone") options.tone = std::stof(value);
             else if (key == "encoded") options.encoded = std::stoi(value);
@@ -857,6 +882,7 @@ struct Engine {
             options.limit < 0.0f || options.strength < 0.0f || options.denoise < 0 || options.denoise > 4 ||
             options.scale < 0.25f || options.scale > 1.0f || (options.scale < 1.0f && !options.luma) ||
             options.budget < 0.0f || (options.budget > 0.0f && (options.budget < 64.0f*64.0f || !options.luma)) ||
+            options.additive < 0.0f || options.additive > 1.0f || (options.additive > 0.0f && !options.luma) ||
             options.tone < 0.0f || options.tone > 1.0f || (options.tone > 0.0f && !options.luma) ||
             options.encoded < 0 || options.encoded > 1 || (options.encoded && !options.luma) ||
             options.temporal < 0.0f || options.temporal > 1.0f || (options.temporal > 0.0f && !options.luma))
