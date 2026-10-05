@@ -104,6 +104,24 @@ int main(int argc, char** argv) {
     int obj[6] = {0, 0, 0, 0, 0, 0};
     const bool object = getenv("RE_OBJECT") &&
         sscanf(getenv("RE_OBJECT"), "%d,%d,%d,%d,%d,%d", &obj[0], &obj[1], &obj[2], &obj[3], &obj[4], &obj[5]) == 6;
+    // RE_NOISE=a: per-frame noise of amplitude a (display units) on every
+    // channel, standing in for the game's frame-to-frame variation (upscaler
+    // jitter, denoiser noise): a still capture is otherwise bit-identical
+    // every frame, which hides the network's temporal flicker.
+    const float noise = getenv("RE_NOISE") ? float(atof(getenv("RE_NOISE"))) : 0.0f;
+    auto add_noise = [&](int index) {
+        if (noise <= 0.0f || bpp != 8) return;
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < w; ++x)
+                for (int c = 0; c < 3; ++c) {
+                    _Float16* v = reinterpret_cast<_Float16*>(&shifted[size_t(y)*pitch + size_t(x)*8 + c*2]);
+                    unsigned s = unsigned(x)*73856093u ^ unsigned(y)*19349663u ^ unsigned(index*3+c)*83492791u;
+                    s ^= s >> 13; s *= 0x5bd1e995u; s ^= s >> 15;
+                    float u = float(s & 0xFFFF) / 65535.0f - 0.5f;
+                    float f = float(*v) + noise*2.0f*u;
+                    *v = (_Float16)(f < 0.0f ? 0.0f : f);
+                }
+    };
     auto stage = [&](int index) {
         if (object) {
             memcpy(shifted.data(), pixels, shifted.size());
@@ -118,6 +136,7 @@ int main(int argc, char** argv) {
                     // this pixel was pan to the left on the previous frame
                     field[(size_t(dy)*w + dx)*2] = -sign*float(pan)/(uv ? float(w) : 1.0f);
                 }
+            add_noise(index);
             return hipMemcpy(staging, shifted.data(), shifted.size(), hipMemcpyHostToDevice) == hipSuccess &&
                    hipMemcpy(mv, field.data(), field.size()*4, hipMemcpyHostToDevice) == hipSuccess;
         }
@@ -127,6 +146,7 @@ int main(int argc, char** argv) {
                 int sx = x + offset; sx = sx < 0 ? 0 : (sx >= w ? w-1 : sx);
                 memcpy(&shifted[size_t(y)*pitch + size_t(x)*bpp], pixels + size_t(y)*pitch + size_t(sx)*bpp, bpp);
             }
+        add_noise(index);
         return hipMemcpy(staging, shifted.data(), shifted.size(), hipMemcpyHostToDevice) == hipSuccess;
     };
     // RE_CONTROLS=intensity,style,structure,tone,skin,mask: re_controls before
@@ -157,7 +177,7 @@ int main(int argc, char** argv) {
         for (int index = 1; index < frames + hold; ++index) {
             int k = index - lag;
             k = k < 0 ? 0 : (k > frames-1 ? frames-1 : k);
-            const bool moving = k != staged;
+            const bool moving = k != staged || noise > 0.0f;
             if (moving && !stage(k)) return 1;
             staged = k;
             if (motion(moving ? mv : still, w, h, w*8) < 0 || ((depth_dev && send_depth(depth_dev, w, h, w*4) < 0) || (albedo_dev && send_albedo(albedo_dev, w, h, w*4) < 0) ? -1 : submit_full(staging, w, h, pitch, bpp, 1)) < 0) {
@@ -174,6 +194,14 @@ int main(int argc, char** argv) {
                     unsigned int dump_hdr[3] = {unsigned(w), unsigned(h), unsigned(bpp)};
                     fwrite(dump_hdr, 4, 3, d);
                     fwrite(frame.data(), 1, frame.size(), d);
+                    fclose(d);
+                }
+                // The staged input of the same frame, tightly packed (edit = output vs input).
+                snprintf(name, sizeof(name), "%s_in_%03d.bin", prefix, index);
+                if (FILE* d = fopen(name, "wb")) {
+                    unsigned int dump_hdr[3] = {unsigned(w), unsigned(h), unsigned(bpp)};
+                    fwrite(dump_hdr, 4, 3, d);
+                    for (int y = 0; y < h; ++y) fwrite(&shifted[size_t(y)*pitch], 1, size_t(w)*bpp, d);
                     fclose(d);
                 }
             }

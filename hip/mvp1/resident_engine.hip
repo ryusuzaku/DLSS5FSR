@@ -343,8 +343,23 @@ __global__ void k_ratio_map(const float* linear, const float* color, const unsig
     if (previous && previous_valid && o.smooth > 0.0f) {
         float2 h = previous[i];
         float wgt;
-        if (o.rel_sigma > 0.0f)
-            wgt = h.y < 0.0f ? 0.0f : o.smooth * expf(-fabsf(log2f((yin + 0.005f) / (h.y + 0.005f))) / o.rel_sigma);
+        if (o.rel_sigma > 0.0f) {
+            // The history's luminance against this pixel's 3x3 neighbourhood
+            // range (a carried map is off by a fraction of a pixel; a
+            // per-pixel ratio test rejects it along every edge).
+            float lo = yin, hi = yin;
+            for (int dy = -1; dy <= 1; ++dy)
+                for (int dx = -1; dx <= 1; ++dx) {
+                    const int nx = min(max(x+dx, 0), frame_w-1), ny = min(max(y+dy, 0), frame_h-1);
+                    const unsigned char* q = src + size_t(ny)*pitch + size_t(nx)*bpp;
+                    const float l = .2126f*srgb_decode_device(frame_channel(q, bpp, 0)) +
+                                    .7152f*srgb_decode_device(frame_channel(q, bpp, 1)) +
+                                    .0722f*srgb_decode_device(frame_channel(q, bpp, 2));
+                    lo = fminf(lo, l); hi = fmaxf(hi, l);
+                }
+            const float nearest = fminf(hi, fmaxf(lo, h.y));
+            wgt = h.y < 0.0f ? 0.0f : o.smooth * expf(-fabsf(log2f((nearest + 0.005f) / (h.y + 0.005f))) / o.rel_sigma);
+        }
         else
             wgt = o.smooth * expf(-fabsf(yin - h.y) / o.sigma);
         ratio = ratio + (h.x - ratio)*wgt;
@@ -431,7 +446,24 @@ __global__ void k_compose(const unsigned char* src, int pitch, int bpp, const fl
     float yin = .2126f*lin[0] + .7152f*lin[1] + .0722f*lin[2];
     float2 m = map[i];
     float fade = fminf(1.0f, fmaxf(0.0f, (1.0f - peak) / 0.05f));
-    float wgt = fade * expf(-fabsf(yin - m.y) / o.gate);
+    float wgt;
+    if (o.rel_gate > 0.0f) {
+        // Same neighbourhood gate as the shim's map resolve (dlssnr.hlsl).
+        float lo = yin, hi = yin;
+        for (int dy = -1; dy <= 1; ++dy)
+            for (int dx = -1; dx <= 1; ++dx) {
+                const int nx = min(max(x+dx, 0), frame_w-1), ny = min(max(y+dy, 0), frame_h-1);
+                const unsigned char* q = src + size_t(ny)*pitch + size_t(nx)*bpp;
+                const float l = .2126f*srgb_decode_device(frame_channel(q, bpp, 0)) +
+                                .7152f*srgb_decode_device(frame_channel(q, bpp, 1)) +
+                                .0722f*srgb_decode_device(frame_channel(q, bpp, 2));
+                lo = fminf(lo, l); hi = fmaxf(hi, l);
+            }
+        const float nearest = fminf(hi, fmaxf(lo, m.y));
+        wgt = m.y < 0.0f ? 0.0f : fade * expf(-fabsf(log2f((nearest + 0.005f) / (m.y + 0.005f))) / o.rel_gate);
+    } else {
+        wgt = fade * expf(-fabsf(yin - m.y) / o.gate);
+    }
     float ratio = 1.0f + (m.x - 1.0f)*wgt;
     if (!isfinite(ratio)) { ratio = 1.0f; wgt = 0.0f; }
     for (int c = 0; c < 4; ++c) {

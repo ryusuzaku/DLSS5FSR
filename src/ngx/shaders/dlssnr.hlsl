@@ -347,12 +347,36 @@ void main(uint3 id : SV_DispatchThreadID)
         const float proxyLinearLuma = gPassthrough != 0 ? dot(SrgbToLinear(saturate(proxySample.rgb)), kLuma)
                                                         : dot(proxy, kLuma);
         float weight = 0.0;
-        // gMapInvGate < 0: the relative gate, -1/tolerance in log2 luminance
-        // (the engine's rel_gate); otherwise 1/the absolute linear tolerance.
+        // gMapInvGate < 0: the relative neighbourhood gate (the engine's
+        // rel_gate, -1/tolerance in log2 luminance): the map's luminance is
+        // compared with the range of this pixel's 3x3 neighbourhood, as a TAA
+        // history clamp does. A carried map lands a fraction of a pixel off;
+        // on an edge that alone is a large ratio, and a per-pixel test dropped
+        // the edit along every edge (outlines everywhere). A value inside the
+        // neighbourhood's range passes; a dark weapon's old edit over a bright
+        // road lies far outside it. Otherwise 1/the absolute linear tolerance.
         if (inside && m.y >= 0.0)
-            weight = fade * (gMapInvGate < 0.0
-                ? exp(-abs(log2((proxyLinearLuma + 0.005) / (m.y + 0.005))) * -gMapInvGate)
-                : exp(-abs(proxyLinearLuma - m.y) * gMapInvGate));
+        {
+            if (gMapInvGate < 0.0)
+            {
+                float lo = proxyLinearLuma, hi = proxyLinearLuma;
+                const float2 texel = 1.0 / size;
+                [unroll] for (int dy = -1; dy <= 1; ++dy)
+                [unroll] for (int dx = -1; dx <= 1; ++dx)
+                {
+                    if (dx == 0 && dy == 0) continue;
+                    const float3 n = gSource.SampleLevel(gLinear, cmpUv + float2(dx, dy) * texel, 0).rgb;
+                    const float l = gPassthrough != 0 ? dot(SrgbToLinear(saturate(n)), kLuma) : dot(n, kLuma);
+                    lo = min(lo, l); hi = max(hi, l);
+                }
+                const float nearest = clamp(m.y, lo, hi);
+                weight = fade * exp(-abs(log2((nearest + 0.005) / (m.y + 0.005))) * -gMapInvGate);
+            }
+            else
+            {
+                weight = fade * exp(-abs(proxyLinearLuma - m.y) * gMapInvGate);
+            }
+        }
         float r = 1.0 + (m.x - 1.0) * weight;
         if (gPassthrough != 0 && proxyLinearLuma > 1e-5)
         {
