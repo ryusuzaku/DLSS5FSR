@@ -90,6 +90,8 @@ struct State {
     // Staging buffers, recreated when the frame size changes.
     unsigned int w = 0, h = 0, bpp = 0;
     UINT64 pitch = 0, bytes = 0;
+    // What the shared buffers were allocated with; a smaller frame reuses them.
+    UINT64 allocBytes = 0, mvAllocBytes = 0;
     ComPtr<ID3D12Resource> bufIn, bufOut;
     HANDLE hIn = nullptr, hOut = nullptr;
     hipExternalMemory_t extIn = nullptr, extOut = nullptr;
@@ -261,6 +263,26 @@ void DropStaging() {
     s.bufOut.Reset();
     s.w = s.h = s.bpp = 0;
     s.pitch = s.bytes = 0;
+    s.allocBytes = s.mvAllocBytes = 0;
+}
+
+// Row pitches and offsets of the colour and motion/depth/albedo staging for
+// a w x h frame.
+struct StagingLayoutValues {
+    UINT64 pitch, bytes, mvPitch, depthPitch, depthOffset, albedoOffset, mvBytes;
+};
+
+StagingLayoutValues StagingLayout(unsigned int w, unsigned int h, unsigned int bpp) {
+    auto align = [](UINT64 v, UINT64 a) { return (v + a - 1) / a * a; };
+    StagingLayoutValues L{};
+    L.pitch = align((UINT64)w * bpp, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
+    L.bytes = L.pitch * h;
+    L.mvPitch = align((UINT64)w * 8, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
+    L.depthPitch = align((UINT64)w * 4, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
+    L.depthOffset = align(L.mvPitch * h, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
+    L.albedoOffset = align(L.depthOffset + L.depthPitch * h, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
+    L.mvBytes = L.albedoOffset + L.depthPitch * h;
+    return L;
 }
 
 // The model kernel. Identity for now: one byte copy, in to out.
@@ -559,22 +581,45 @@ bool EnsureStaging(unsigned int w, unsigned int h, unsigned int bpp) {
         return false;
     }
 
+    // A frame that fits the buffers already shared with HIP reuses them with
+    // the new layout: no allocation and no new shared handle. In game,
+    // CreateSharedHandle failed (E_INVALIDARG) on quick successive resizes
+    // (OptiScaler's model-resolution slider, a window resize), always on the
+    // way down; whatever the driver objects to, a shrink no longer asks it.
+    const StagingLayoutValues L = StagingLayout(w, h, bpp);
+    if (s.bufIn && s.bufOut && s.bpp == bpp && L.bytes <= s.allocBytes &&
+        (!s.bufMv || L.mvBytes <= s.mvAllocBytes)) {
+        s.w = w;
+        s.h = h;
+        s.pitch = L.pitch;
+        s.bytes = L.bytes;
+        if (s.bufMv) {
+            s.mvPitch = L.mvPitch;
+            s.depthPitch = L.depthPitch;
+            s.depthOffset = L.depthOffset;
+            s.albedoOffset = L.albedoOffset;
+            s.mvBytes = L.mvBytes;
+        }
+        s.motionStaged = s.depthStaged = s.albedoStaged = false;
+        LOGI("hip: staging %ux%u x %ubpp, pitch %llu (reusing the %llu-byte buffers)", w, h, bpp,
+             (unsigned long long)s.pitch, (unsigned long long)s.allocBytes);
+        return true;
+    }
+
     DropStaging();
 
     GpuContext& g = Gpu();
     if (!g.valid) return false;
 
-    const UINT64 rowBytes = (UINT64)w * bpp;
-    s.pitch = (rowBytes + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) /
-              D3D12_TEXTURE_DATA_PITCH_ALIGNMENT *
-              D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
-    s.bytes = s.pitch * h;
+    s.pitch = L.pitch;
+    s.bytes = L.bytes;
+    s.allocBytes = StagingAllocBytes(s.bytes);
 
     D3D12_HEAP_PROPERTIES hp{};
     hp.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC bd{};
     bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    bd.Width = StagingAllocBytes(s.bytes);
+    bd.Width = s.allocBytes;
     bd.Height = 1;
     bd.DepthOrArraySize = 1;
     bd.MipLevels = 1;
@@ -602,7 +647,7 @@ bool EnsureStaging(unsigned int w, unsigned int h, unsigned int bpp) {
         hipExternalMemoryHandleDesc hd{};
         hd.type = hipExternalMemoryHandleTypeD3D12Resource;
         hd.handle.win32.handle = handle;
-        hd.size = StagingAllocBytes(s.bytes);
+        hd.size = s.allocBytes;
         hd.flags = hipExternalMemoryDedicated;
         if (s.ImportExternalMemory(&ext, &hd) != hipSuccess) {
             LOGE("hip: ImportExternalMemory failed");
@@ -610,7 +655,7 @@ bool EnsureStaging(unsigned int w, unsigned int h, unsigned int bpp) {
         }
         hipExternalMemoryBufferDesc gd{};
         gd.offset = 0;
-        gd.size = StagingAllocBytes(s.bytes);
+        gd.size = s.allocBytes;
         if (s.ExternalMemoryGetMappedBuffer(&ptr, ext, &gd) != hipSuccess ||
             !ptr) {
             LOGE("hip: GetMappedBuffer failed");
@@ -626,19 +671,15 @@ bool EnsureStaging(unsigned int w, unsigned int h, unsigned int bpp) {
     // Motion staging: float2 per pixel. Optional -- without it the engine
     // simply does not carry its map along the motion.
     {
-        const UINT64 mvRow = (UINT64)w * 8;
-        s.mvPitch = (mvRow + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) /
-                    D3D12_TEXTURE_DATA_PITCH_ALIGNMENT * D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
-        // Depth rows (R32F) follow at a placement-aligned offset.
-        s.depthPitch = ((UINT64)w * 4 + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) /
-                       D3D12_TEXTURE_DATA_PITCH_ALIGNMENT * D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
-        s.depthOffset = (s.mvPitch * h + D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1) /
-                        D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT * D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT;
-        s.albedoOffset = (s.depthOffset + s.depthPitch * h + D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1) /
-                         D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT * D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT;
-        s.mvBytes = s.albedoOffset + s.depthPitch * h;
+        // Depth rows (R32F) follow at a placement-aligned offset, then albedo.
+        s.mvPitch = L.mvPitch;
+        s.depthPitch = L.depthPitch;
+        s.depthOffset = L.depthOffset;
+        s.albedoOffset = L.albedoOffset;
+        s.mvBytes = L.mvBytes;
+        s.mvAllocBytes = StagingAllocBytes(s.mvBytes);
         D3D12_RESOURCE_DESC md = bd;
-        md.Width = StagingAllocBytes(s.mvBytes);
+        md.Width = s.mvAllocBytes;
         hipExternalMemoryHandleDesc hd{};
         hipExternalMemoryBufferDesc gd{};
         bool ok = SUCCEEDED(g.device->CreateCommittedResource(
@@ -649,10 +690,10 @@ bool EnsureStaging(unsigned int w, unsigned int h, unsigned int bpp) {
         if (ok) {
             hd.type = hipExternalMemoryHandleTypeD3D12Resource;
             hd.handle.win32.handle = s.hMv;
-            hd.size = StagingAllocBytes(s.mvBytes);
+            hd.size = s.mvAllocBytes;
             hd.flags = hipExternalMemoryDedicated;
             gd.offset = 0;
-            gd.size = StagingAllocBytes(s.mvBytes);
+            gd.size = s.mvAllocBytes;
             ok = s.ImportExternalMemory(&s.extMv, &hd) == hipSuccess &&
                  s.ExternalMemoryGetMappedBuffer(&s.ptrMv, s.extMv, &gd) == hipSuccess && s.ptrMv;
         }
@@ -661,7 +702,7 @@ bool EnsureStaging(unsigned int w, unsigned int h, unsigned int bpp) {
             if (s.extMv) s.DestroyExternalMemory(s.extMv);
             s.extMv = nullptr; s.ptrMv = nullptr;
             if (s.hMv) CloseHandle(s.hMv);
-            s.hMv = nullptr; s.bufMv.Reset(); s.mvPitch = s.mvBytes = 0;
+            s.hMv = nullptr; s.bufMv.Reset(); s.mvPitch = s.mvBytes = s.mvAllocBytes = 0;
             s.depthOffset = s.depthPitch = 0;
             s.albedoOffset = 0;
         }
