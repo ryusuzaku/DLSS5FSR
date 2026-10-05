@@ -983,7 +983,7 @@ bool GpuNeuralChain(ID3D12GraphicsCommandList* cl, ID3D12Resource* output,
     ID3D12Resource* motionSrv = nullptr;
     if (hipModel && g.hipMapMode && model == hipModel->res.Get()) {
         const uint64_t lag = mapLag;
-        const float carry = (float)(lag < 4 ? lag : 4);
+        const float carry = (float)(lag < 6 ? lag : 6);
         c.Pad1 = 1;
         float invGate = g.hipMapParams[2];
         memcpy(&c.Pad2, &invGate, sizeof(float));
@@ -1110,7 +1110,7 @@ struct PendingHipResult {
 
 struct PrepTimers {
     PrepStat counter, hip, copy;
-    unsigned int frames = 0, stillRunning = 0;
+    unsigned int frames = 0, stillRunning = 0, fedAhead = 0;
     void report() {
         if (++frames < 600) return;
         LARGE_INTEGER f;
@@ -1118,9 +1118,9 @@ struct PrepTimers {
         const double ms = 1000.0 / (double)f.QuadPart;
         auto mean = [&](const PrepStat& s) { return s.n ? (double)s.sum * ms / s.n : 0.0; };
         LOGI("nr: prepare blocking over %u frames (mean/worst ms): counter %.3f/%.3f, hip %.3f/%.3f, copy %.3f/%.3f;"
-             " HIP result not ready yet on %u",
+             " HIP result not ready yet on %u (fed ahead %u)",
              frames, mean(counter), (double)counter.worst * ms, mean(hip), (double)hip.worst * ms,
-             mean(copy), (double)copy.worst * ms, stillRunning);
+             mean(copy), (double)copy.worst * ms, stillRunning, fedAhead);
         *this = PrepTimers{};
     }
 };
@@ -1226,9 +1226,14 @@ bool GpuPrepareHipModel(uint64_t n, const Config& cfg) {
     // staging slot; this frame's list writes slot n % slots, and skips that
     // (and the counter) only in the rare case it is the running job's slot.
     static PendingHipResult pending;
+    // S331: every new staged frame is fed to the engine (its motion keeps the
+    // carry chain whole) even while a compose is still running; only the
+    // compose and the model copy wait for it. A frame is fed once.
+    static long long lastFed = -1;
+    static unsigned int lastFedSlot = ~0u;
     g.hipWriteSlot = (unsigned int)(n % HipStagingSlots());
     const bool jobRunning = HipResultPending() && !HipResultReady();
-    g.hipStagingBusy = jobRunning && g.hipWriteSlot == pending.readSlot;
+    g.hipStagingBusy = g.hipWriteSlot == lastFedSlot && !HipInputsReady();
 
     // S187: DO NOT CLEAR THIS HERE. It was `g.hipFrameReady = false;` and that
     // single line is why the model texture has never been bound: the prepare
@@ -1278,8 +1283,19 @@ bool GpuPrepareHipModel(uint64_t n, const Config& cfg) {
         return false;
     }
 
+    const bool fresh = (long long)counter != lastFed;
     if (jobRunning) {
         ++PrepTimes().stillRunning;
+        if (fresh && HipCanFeedAhead() && !cfg.residentEngineConfig.empty()) {
+            HipSetReadSlot(counter % HipStagingSlots());
+            const LONGLONG tFeed = PrepNow();
+            if (HipResidentEngineSubmit()) {
+                lastFed = (long long)counter;
+                lastFedSlot = counter % HipStagingSlots();
+                ++PrepTimes().fedAhead;
+            }
+            PrepTimes().hip.add(PrepNow() - tFeed);
+        }
         PrepTimes().report();
         return false;
     }
@@ -1299,7 +1315,11 @@ bool GpuPrepareHipModel(uint64_t n, const Config& cfg) {
     // engine's map is only queued here and collected later.
     const LONGLONG tHip = PrepNow();
     if (!HipRunModel()) return false;
-    if (!cfg.residentEngineConfig.empty() && !HipResidentEngineSubmit()) {
+    if (fresh && !cfg.residentEngineConfig.empty()) {
+        lastFed = (long long)counter;
+        lastFedSlot = job.readSlot;
+    }
+    if (fresh && !cfg.residentEngineConfig.empty() && !HipResidentEngineSubmit()) {
         static bool engineFailureLogged = false;
         if (!engineFailureLogged) {
             engineFailureLogged = true;

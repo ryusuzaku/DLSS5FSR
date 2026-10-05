@@ -156,6 +156,7 @@ struct State {
     // Optional (S328): queue the map compose without waiting, poll it later.
     int (*EngineComposeMapAsync)(void*, unsigned long long, int, int, float*) = nullptr;
     int (*EngineComposeReady)() = nullptr;
+    int (*EngineInputsReady)() = nullptr;  // optional (S331): the fed buffers were copied
     bool asyncPending = false;    // the last prepare's compose is still queued
     unsigned int session = 0;     // bumped by Shutdown: older pending results are void
     bool identitySkipped = false; // RunModel left sharedOut to the engine's map
@@ -467,6 +468,7 @@ void Shutdown() {
     s.asyncPending = s.identitySkipped = false;
     s.EngineComposeMapAsync = nullptr;
     s.EngineComposeReady = nullptr;
+    s.EngineInputsReady = nullptr;
     ++s.session;
     DropStaging();
     if (s.candidateInputRgb) {
@@ -1011,6 +1013,7 @@ static bool EngineReady() {
     s.EngineComposeMapAsync = (int (*)(void*, unsigned long long, int, int, float*))
         GetProcAddress(s.engineDll, "re_compose_map_async");
     s.EngineComposeReady = (int (*)())GetProcAddress(s.engineDll, "re_compose_ready");
+    s.EngineInputsReady = (int (*)())GetProcAddress(s.engineDll, "re_inputs_ready");
     s.EngineComposeMap = (int (*)(void*, unsigned long long, int, int, float*))
         GetProcAddress(s.engineDll, "re_compose_map_device");
     s.EngineMapParams = (int (*)(float*))GetProcAddress(s.engineDll, "re_luma_map_params");
@@ -11118,6 +11121,15 @@ bool ResultReady() {
     return r != 0;
 }
 bool ResultPending() { return S().asyncPending; }
+// Without the export every fed buffer is assumed still in use until the
+// compose is collected (the old behaviour).
+bool InputsReady() {
+    State& s = S();
+    if (!s.engineDll || s.engineState <= 0) return true;
+    if (!s.EngineInputsReady) return !s.asyncPending;
+    return s.EngineInputsReady() != 0;
+}
+bool CanFeedAhead() { State& s = S(); return s.engineState > 0 && s.EngineInputsReady != nullptr; }
 unsigned int Session() { return S().session; }
 UINT64 StagingSlotOffset(unsigned int slot, bool motion) {
     return (UINT64)(slot % kStagingSlots) * (motion ? S().mvStride : S().inStride);
@@ -11183,6 +11195,8 @@ bool HipLumaMap(float params[4]) { return hipb::LumaMap(params); }
 bool HipMotionIsUv() { return hipb::MotionIsUv(); }
 bool HipResultReady() { return hipb::ResultReady(); }
 bool HipResultPending() { return hipb::ResultPending(); }
+bool HipInputsReady() { return hipb::InputsReady(); }
+bool HipCanFeedAhead() { return hipb::CanFeedAhead(); }
 unsigned int HipSession() { return hipb::Session(); }
 UINT64 HipStagingSlotOffset(unsigned int slot, bool motion) { return hipb::StagingSlotOffset(slot, motion); }
 void HipSetReadSlot(unsigned int slot) { hipb::SetReadSlot(slot); }

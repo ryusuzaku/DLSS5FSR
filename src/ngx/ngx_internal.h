@@ -659,6 +659,11 @@ bool HipMotionIsUv();
 bool HipResultReady();
 // The last prepare's work was queued without waiting (collect it next time).
 bool HipResultPending();
+// The buffers last fed to the engine (staging slot, motion, depth) were
+// copied, so that slot may be rewritten. Never blocks.
+bool HipInputsReady();
+// The engine can take frames while a compose is still running (re_inputs_ready).
+bool HipCanFeedAhead();
 // Bumped whenever the backend shuts down (results from before are void).
 unsigned int HipSession();
 // Staging slots: frame n's list writes slot n % HipStagingSlots() at these

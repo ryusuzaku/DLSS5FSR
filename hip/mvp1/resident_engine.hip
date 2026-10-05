@@ -753,6 +753,10 @@ struct Engine {
     // Recorded after an asynchronous compose (re_compose_map_async); the
     // caller polls it with re_compose_ready instead of blocking.
     hipEvent_t compose_done = nullptr;
+    // Recorded after a submit's copies of the caller's buffers (re_motion,
+    // re_depth, re_albedo and re_submit_full all copy on compose_stream):
+    // re_inputs_ready says when the caller may rewrite them.
+    hipEvent_t inputs_done = nullptr;
 
     // Worker state.
     std::mutex mutex;
@@ -902,6 +906,7 @@ struct Engine {
         HIP_CHECK(hipEventCreate(&start)); HIP_CHECK(hipEventCreate(&stop));
         HIP_CHECK(hipEventCreateWithFlags(&inputs_ready, hipEventDisableTiming));
         HIP_CHECK(hipEventCreateWithFlags(&compose_done, hipEventDisableTiming));
+        HIP_CHECK(hipEventCreateWithFlags(&inputs_done, hipEventDisableTiming));
         HIP_CHECK(hipDeviceSynchronize());
         worker = std::thread([this] { loop(); });
     }
@@ -918,6 +923,7 @@ struct Engine {
         if (stop) (void)hipEventDestroy(stop);
         if (inputs_ready) (void)hipEventDestroy(inputs_ready);
         if (compose_done) (void)hipEventDestroy(compose_done);
+        if (inputs_done) (void)hipEventDestroy(inputs_done);
         if (pinned) (void)hipHostFree(pinned);
         if (compose_pinned) (void)hipHostFree(compose_pinned);
         if (compose_stream) (void)hipStreamSynchronize(compose_stream);
@@ -1461,6 +1467,22 @@ struct Engine {
     }
     // 1 the last asynchronous compose (and everything queued before it on
     // compose_stream) finished, 0 still running, -1 error.
+    int mark_inputs() {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (failed) return -1;
+        if (hipEventRecord(inputs_done, compose_stream) != hipSuccess) {
+            failed = true; error = "inputs event record failed"; return -1;
+        }
+        return 1;
+    }
+    int inputs_copied() {
+        hipError_t e = hipEventQuery(inputs_done);
+        if (e == hipSuccess) return 1;
+        if (e == hipErrorNotReady) return 0;
+        std::lock_guard<std::mutex> lock(mutex);
+        failed = true; error = "inputs event query failed"; return -1;
+    }
+
     int compose_ready() {
         hipError_t e = hipEventQuery(compose_done);
         if (e == hipSuccess) return 1;
@@ -1593,7 +1615,8 @@ __declspec(dllexport) int re_submit(const void* staging, int width, int height, 
 __declspec(dllexport) int re_submit_full(const void* staging, int width, int height, int pitch, int bpp, int gain) {
     std::lock_guard<std::mutex> lock(g_mutex);
     if (!g_engine) return -1;
-    return g_engine->submit(staging, width, height, pitch, bpp, false, gain);
+    const int r = g_engine->submit(staging, width, height, pitch, bpp, false, gain);
+    return r < 0 ? r : g_engine->mark_inputs() < 0 ? -1 : r;
 }
 
 // Crop mode: 1 new preview written, 0 nothing new, -1 failed/disabled.
@@ -1643,6 +1666,15 @@ __declspec(dllexport) int re_compose_map_async(void* dst, unsigned long long pit
     std::lock_guard<std::mutex> lock(g_mutex);
     if (!g_engine) return -1;
     return g_engine->compose_map_async(dst, size_t(pitch), width, height, device_ms);
+}
+
+// Non-blocking: 1 the caller's buffers handed to the engine so far (motion,
+// depth, albedo, staging) have been copied, so they may be rewritten; 0 not
+// yet; -1 error. re_submit_full marks the point.
+__declspec(dllexport) int re_inputs_ready() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!g_engine) return -1;
+    return g_engine->inputs_copied();
 }
 
 // Non-blocking: 1 the last re_compose_map_async finished, 0 not yet, -1 error.
