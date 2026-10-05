@@ -118,7 +118,7 @@ Texture2D<float4>   gSource   : register(t0);  // encode: the frame. resolve: th
 Texture2D<float4>   gModel    : register(t1);  // resolve: what the model returned.
 Texture2D<float4>   gOriginal : register(t2);  // resolve: the untouched frame.
 Texture2D<float4>   gMotion   : register(t3);  // resolve, accumulating: the game's motion vectors.
-Texture2D<float4>   gPrevEdit : register(t4);  // resolve, accumulating: last frame's edit.
+Texture2D<float4>   gPrevEdit : register(t4);  // resolve, map mode: the motion history (8 frames stacked in rows).
 RWTexture2D<float4> gTarget   : register(u0);  // encode: the proxy. resolve: the frame.
 RWTexture2D<float4> gKeep     : register(u1);  // encode: the untouched copy. resolve: the edit history.
 SamplerState        gLinear   : register(s0);  // so the edit can be read at a different size
@@ -313,10 +313,29 @@ void main(uint3 id : SV_DispatchThreadID)
     if (gMapMode != 0)
     {
         const float2 size = float2(gWidth, gHeight);
-        const int2 at = min(int2(cmpUv * size), int2(size) - 1);
-        float2 mv = gMotion.Load(int3(at, 0)).xy * float2(gMvScaleX, gMvScaleY);
-        if (any(isnan(mv)) || any(isinf(mv))) mv = float2(0.0, 0.0);
-        const float2 mapUv = cmpUv + mv / size;
+        float2 mapUv;
+        if (gGuideWidth > 0)
+        {
+            // Walk back one frame at a time through the motion history (newest
+            // slot gGuideHeight), each step with that frame's own vector.
+            float2 pos = cmpUv * size;
+            for (uint i = 0; i < gGuideWidth; ++i)
+            {
+                const uint slot = (gGuideHeight + 8u - i) % 8u;
+                const int2 at = clamp(int2(pos), int2(0, 0), int2(size) - 1);
+                float2 mv = gPrevEdit.Load(int3(at.x, at.y + int(slot * gHeight), 0)).xy * float2(gMvScaleX, gMvScaleY);
+                if (any(isnan(mv)) || any(isinf(mv))) mv = float2(0.0, 0.0);
+                pos += mv;
+            }
+            mapUv = pos / size;
+        }
+        else
+        {
+            const int2 at = min(int2(cmpUv * size), int2(size) - 1);
+            float2 mv = gMotion.Load(int3(at, 0)).xy * float2(gMvScaleX, gMvScaleY);
+            if (any(isnan(mv)) || any(isinf(mv))) mv = float2(0.0, 0.0);
+            mapUv = cmpUv + mv / size;
+        }
         const float2 m = gModel.SampleLevel(gLinear, mapUv, 0).xy;
         const bool inside = all(mapUv >= 0.0) && all(mapUv <= 1.0);
         const float peak = max(proxySample.r, max(proxySample.g, proxySample.b));

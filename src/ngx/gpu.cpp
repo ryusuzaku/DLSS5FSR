@@ -818,6 +818,24 @@ bool GpuNeuralChain(ID3D12GraphicsCommandList* cl, ID3D12Resource* output,
                 if (!busy) cl->CopyTextureRegion(&mdst, 0, 0, 0, &msrc, nullptr);
                 motionStaged = true;
                 motionTex = mvTex;
+                // This frame's motion into its history slot.
+                const unsigned int k = GpuContext::kMotionHistory;
+                PooledTexture* hist = GpuAcquireTexture(L"motion history", DXGI_FORMAT_R32G32_FLOAT,
+                                                        outRect.w, outRect.h * k);
+                if (hist) {
+                    if (g.motionHistoryW != outRect.w || g.motionHistoryH != outRect.h) {
+                        for (auto& f : g.motionHistoryFrame) f = -1;
+                        g.motionHistoryW = outRect.w; g.motionHistoryH = outRect.h;
+                    }
+                    const unsigned int slot = (unsigned int)(g.hipEvaluate % k);
+                    GpuSetState(cl, *hist, D3D12_RESOURCE_STATE_COPY_DEST);
+                    D3D12_TEXTURE_COPY_LOCATION hdst{};
+                    hdst.pResource = hist->res.Get();
+                    hdst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                    hdst.SubresourceIndex = 0;
+                    cl->CopyTextureRegion(&hdst, 0, slot * outRect.h, 0, &msrc, nullptr);
+                    g.motionHistoryFrame[slot] = (long long)g.hipEvaluate;
+                }
             }
         }
     }
@@ -981,28 +999,52 @@ bool GpuNeuralChain(ID3D12GraphicsCommandList* cl, ID3D12Resource* output,
     // frames before this one: the resolve samples it where this frame's pixel
     // was then (lag x this frame's motion) and gates it on luminance here.
     ID3D12Resource* motionSrv = nullptr;
+    ID3D12Resource* historySrv = nullptr;
     if (hipModel && g.hipMapMode && model == hipModel->res.Get()) {
         const uint64_t lag = mapLag;
         const float carry = (float)(lag < 6 ? lag : 6);
+        // Frames n, n-1, ... back to the map's frame, while their motion is
+        // in the history (frame f's vectors take a pixel from f to f-1).
+        const unsigned int k = GpuContext::kMotionHistory;
+        unsigned int steps = 0;
+        PooledTexture* hist = nullptr;
+        if (motionTex && g.motionHistoryW == outRect.w && g.motionHistoryH == outRect.h &&
+            (hist = GpuAcquireTexture(L"motion history", DXGI_FORMAT_R32G32_FLOAT, outRect.w, outRect.h * k))) {
+            const uint64_t n = g.hipEvaluate;
+            while (steps < lag && steps < k - 1 && steps <= n &&
+                   g.motionHistoryFrame[(n - steps) % k] == (long long)(n - steps))
+                ++steps;
+        }
         c.Pad1 = 1;
         float invGate = g.hipMapParams[2];
         memcpy(&c.Pad2, &invGate, sizeof(float));
         c.MvScaleX = c.MvScaleY = 0.0f;
+        c.GuideWidth = 0;
         if (motionTex) {
             GpuSetState(cl, *motionTex, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             motionSrv = motionTex->res.Get();
             c.MvScaleX = g.hipMapParams[0] * carry;
             c.MvScaleY = g.hipMapParams[1] * carry;
+            if (steps > 0 && steps >= (lag < k - 1 ? lag : k - 1)) {
+                // Map mode reuses the guide fields: steps, and the newest slot.
+                GpuSetState(cl, *hist, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                historySrv = hist->res.Get();
+                c.GuideWidth = steps;
+                c.GuideHeight = (unsigned int)(g.hipEvaluate % k);
+                c.MvScaleX = g.hipMapParams[0];
+                c.MvScaleY = g.hipMapParams[1];
+            }
         }
         static unsigned long long mapLog = 0;
         if ((mapLog++ % 600) == 0)
-            LOGI("nr: map resolve: lag %llu frame(s), carry scale %g,%g, motion %s",
-                 (unsigned long long)lag, c.MvScaleX, c.MvScaleY, motionSrv ? "bound" : "missing");
+            LOGI("nr: map resolve: lag %llu frame(s), %s, scale %g,%g, motion %s",
+                 (unsigned long long)lag, c.GuideWidth ? "walked through the motion history" : "linear carry",
+                 c.MvScaleX, c.MvScaleY, motionSrv ? "bound" : "missing");
     }
     // `keep` as the second UAV would make it both an input and an output of
     // the same dispatch, so the stand-in is left to fall back to the target.
     if (!GpuNrDispatch(cl, c, proxy->res.Get(), model, keep->res.Get(), motionSrv,
-                       nullptr, output, nullptr)) {
+                       historySrv, output, nullptr)) {
         LOGE("nr: resolve dispatch failed");
         return false;
     }

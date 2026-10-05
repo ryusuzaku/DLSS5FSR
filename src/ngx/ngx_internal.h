@@ -492,6 +492,12 @@ struct GpuContext {
     // (x, y), 1/gate, luma flag (re_luma_map_params).
     bool hipMapMode = false;
     float hipMapParams[4] = {};
+    // S331: the last kMotionHistory frames' motion (frame pixels per unit,
+    // R32G32, frame f in rows (f % k)*h ..), so a map resolve can walk back
+    // frame by frame instead of extrapolating this frame's vector by the lag.
+    static constexpr unsigned int kMotionHistory = 8;
+    long long motionHistoryFrame[kMotionHistory] = {-1, -1, -1, -1, -1, -1, -1, -1};
+    unsigned int motionHistoryW = 0, motionHistoryH = 0;
     uint64_t hipEvaluate = 0, hipStagingFrame = 0;
     // A HIP job started by a prepare has not finished yet: it may still be
     // reading the shared staging, so this frame's list must not rewrite it
