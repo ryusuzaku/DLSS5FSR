@@ -394,7 +394,18 @@ bool Startup() {
     snprintf(s.deviceName, sizeof(s.deviceName), "%s", prop.name);
     s.SetDevice(0);
 
-    if (s.StreamCreate(&s.stream) != hipSuccess) {
+    // High priority where the runtime offers it: the game's render thread
+    // waits on this stream every frame, under a GPU saturated by the game.
+    // Default (blocking) flags: the shim relies on its ordering against the
+    // null stream (hipMemcpy uploads before launches on this stream).
+    typedef hipError_t (*PriorityRangeFn)(int*, int*);
+    typedef hipError_t (*CreatePriorityFn)(hipStream_t*, unsigned int, int);
+    auto priorityRange = (PriorityRangeFn)GetProcAddress(s.hipDll, "hipDeviceGetStreamPriorityRange");
+    auto createPriority = (CreatePriorityFn)GetProcAddress(s.hipDll, "hipStreamCreateWithPriority");
+    int least = 0, greatest = 0;
+    if (!(priorityRange && createPriority && priorityRange(&least, &greatest) == hipSuccess &&
+          createPriority(&s.stream, hipStreamDefault, greatest) == hipSuccess) &&
+        s.StreamCreate(&s.stream) != hipSuccess) {
         LOGW("hip: stream create failed; the model stays the identity");
         return false;
     }

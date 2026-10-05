@@ -995,14 +995,18 @@ struct Engine {
                 raw_input.reset(new Buffer((bytes+3)/4));
                 raw_bytes = raw_input->count*sizeof(float);
             }
-            HIP_CHECK(hipMemcpyAsync(raw_input->data, staging, bytes, hipMemcpyDeviceToDevice, stream));
-            HIP_CHECK(hipStreamSynchronize(stream));
+            // The job's inputs are copied on the high-priority compose stream: the
+            // caller (the game's render thread) waits for them, and the network's
+            // low-priority stream is starved under a path-traced frame (S326: the
+            // shim's prepare blocked 47 ms mean, 625 ms worst, on these syncs).
+            HIP_CHECK(hipMemcpyAsync(raw_input->data, staging, bytes, hipMemcpyDeviceToDevice, compose_stream));
+            HIP_CHECK(hipStreamSynchronize(compose_stream));
             job_depth_valid = false;
             if (!crop && depth_fresh && depth_w == w && depth_h == h) {
                 if (!job_depth || job_depth->count < size_t(w)*h) job_depth.reset(new Buffer(size_t(w)*h));
                 HIP_CHECK(hipMemcpyAsync(job_depth->data, depth_next->data, size_t(w)*h*sizeof(float),
-                                         hipMemcpyDeviceToDevice, stream));
-                HIP_CHECK(hipStreamSynchronize(stream));
+                                         hipMemcpyDeviceToDevice, compose_stream));
+                HIP_CHECK(hipStreamSynchronize(compose_stream));
                 job_depth_valid = true;
             }
             depth_fresh = false;
@@ -1010,8 +1014,8 @@ struct Engine {
             if (!crop && albedo_fresh && albedo_w == w && albedo_h == h) {
                 if (!job_albedo || job_albedo->count < size_t(w)*h) job_albedo.reset(new Buffer(size_t(w)*h));
                 HIP_CHECK(hipMemcpyAsync(job_albedo->data, albedo_next->data, size_t(w)*h*sizeof(float),
-                                         hipMemcpyDeviceToDevice, stream));
-                HIP_CHECK(hipStreamSynchronize(stream));
+                                         hipMemcpyDeviceToDevice, compose_stream));
+                HIP_CHECK(hipStreamSynchronize(compose_stream));
                 job_albedo_valid = true;
             }
             albedo_fresh = false;
