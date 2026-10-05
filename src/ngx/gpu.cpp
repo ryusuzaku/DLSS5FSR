@@ -938,7 +938,9 @@ bool GpuNeuralChain(ID3D12GraphicsCommandList* cl, ID3D12Resource* output,
     // the frame: carried along motion it paints an old picture's shading over
     // the new one (S326, windowed: the gate starved for thousands of frames and
     // left a shadow image). Past kMaxMapLag the frame passes through unedited.
-    static const uint64_t kMaxMapLag = 8;
+    // S331: 12 (was 8): in game the lag spikes past 8, and dropping the edit for
+    // a frame read as flicker; the motion-history walk carries 7 frames.
+    static const uint64_t kMaxMapLag = 12;
     const uint64_t mapLag =
         g.hipEvaluate > g.hipStagingFrame ? g.hipEvaluate - g.hipStagingFrame : 0;
     const bool mapStale = g.hipMapMode && mapLag > kMaxMapLag;
@@ -947,6 +949,25 @@ bool GpuNeuralChain(ID3D12GraphicsCommandList* cl, ID3D12Resource* output,
     if (g.hipFrameReady && !mapStale) {
         hipModel = GpuAcquireTexture(HipModelTag(g.hipModelParity), g.hipFmt,
                                      g.hipW, g.hipH);
+        if (hipModel && g.publishCopy.active && g.publishCopy.evaluate == g.hipEvaluate) {
+            // This evaluate published a result: copy its output slot in now.
+            g.publishCopy.active = false;
+            D3D12_TEXTURE_COPY_LOCATION dst{};
+            dst.pResource = hipModel->res.Get();
+            dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            dst.SubresourceIndex = 0;
+            D3D12_TEXTURE_COPY_LOCATION src{};
+            src.pResource = HipStagingOut();
+            src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            src.PlacedFootprint.Offset = HipStagingSlotOffset(g.publishCopy.outSlot, false);
+            src.PlacedFootprint.Footprint.Format = g.hipFmt;
+            src.PlacedFootprint.Footprint.Width = g.hipW;
+            src.PlacedFootprint.Footprint.Height = g.hipH;
+            src.PlacedFootprint.Footprint.Depth = 1;
+            src.PlacedFootprint.Footprint.RowPitch = (UINT)HipStagingRowPitch();
+            GpuSetState(cl, *hipModel, D3D12_RESOURCE_STATE_COPY_DEST);
+            cl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        }
         if (bindLog && !hipModel)
             LOGW("nr: chain model bind: hipFrameReady set but texture did NOT "
                  "acquire -- falling back to proxy");
@@ -1147,6 +1168,7 @@ struct PendingHipResult {
     float mapParams[4] = {};
     uint64_t stagingFrame = 0;
     unsigned int readSlot = 0;
+    unsigned int outSlot = 0;
     unsigned int session = 0;
 };
 
@@ -1182,69 +1204,15 @@ PrepTimers& PrepTimes() {
 // executed.
 static bool PublishHipModel(GpuContext& g, uint64_t n, const PendingHipResult& r) {
     const unsigned int parity = (unsigned int)(n % kHipModelSlots);
-    PooledTexture* m =
-        GpuAcquireTexture(HipModelTag(parity), g.hipFmt, g.hipW, g.hipH);
-    if (!m) return false;
-
-    const LONGLONG tCopy = PrepNow();
-    // A slot left in another state (a resolve that bailed out early) goes
-    // through the direct queue once, which transitions it back to COMMON.
-    const bool viaCopyQueue = g.copyQueue != nullptr && m->state == D3D12_RESOURCE_STATE_COMMON;
-    ID3D12GraphicsCommandList* list = viaCopyQueue ? g.copyList.Get() : g.scratchList.Get();
-    if (viaCopyQueue ? FAILED(g.copyList->Reset(g.copyAlloc.Get(), nullptr))
-                     : FAILED(g.scratchList->Reset(g.alloc.Get(), nullptr)))
-        return false;
-
-    D3D12_TEXTURE_COPY_LOCATION dst{};
-    dst.pResource = m->res.Get();
-    dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    dst.SubresourceIndex = 0;
-    D3D12_TEXTURE_COPY_LOCATION src{};
-    src.pResource = HipStagingOut();
-    src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    src.PlacedFootprint.Offset = 0;
-    src.PlacedFootprint.Footprint.Format = g.hipFmt;
-    src.PlacedFootprint.Footprint.Width = g.hipW;
-    src.PlacedFootprint.Footprint.Height = g.hipH;
-    src.PlacedFootprint.Footprint.Depth = 1;
-    src.PlacedFootprint.Footprint.RowPitch = (UINT)HipStagingRowPitch();
-
-    if (viaCopyQueue) {
-        // The slot is in COMMON (the resolve hands it back so); a copy queue
-        // promotes it to COPY_DEST and it decays to COMMON when the copy ends.
-        g.copyList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-        g.copyList->Close();
-        ID3D12CommandList* lists[] = {g.copyList.Get()};
-        g.copyQueue->ExecuteCommandLists(1, lists);
-        g.copyQueue->Signal(g.copyFence.Get(), ++g.copyFenceValue);
-        g.copyFence->SetEventOnCompletion(g.copyFenceValue, g.copyEvent);
-        WaitForSingleObject(g.copyEvent, 2000);
-        g.copyAlloc->Reset();
-        m->state = D3D12_RESOURCE_STATE_COMMON;
-    } else {
-        GpuSetState(list, *m, D3D12_RESOURCE_STATE_COPY_DEST);
-        list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-        GpuSetState(list, *m, D3D12_RESOURCE_STATE_COMMON);
-        list->Close();
-        ID3D12CommandList* lists[] = {list};
-        g.queue->ExecuteCommandLists(1, lists);
-        g.queue->Signal(g.fence.Get(), ++g.fenceValue);
-        g.fence->SetEventOnCompletion(g.fenceValue, g.fenceEvent);
-        WaitForSingleObject(g.fenceEvent, 2000);
-        g.alloc->Reset();  // the list stays closed for the next user
-    }
-    PrepTimes().copy.add(PrepNow() - tCopy);
-
-    // S186 PROBE 2: CopyTextureRegion returns void, so a silent failure would
-    // be invisible. A device-level error is the one thing it does leave behind.
-    {
-        static unsigned long long cr = 0;
-        if ((++cr % 60) == 1) {
-            HRESULT rr = g.device->GetDeviceRemovedReason();
-            LOGI("nr: texture copy done; device reason=0x%08X (%s)", (unsigned)rr,
-                 SUCCEEDED(rr) ? "ok" : "DEVICE ERROR");
-        }
-    }
+    // The chain of this same evaluate copies output slot r.outSlot into model
+    // slot `parity` on the game's list, right before the resolve reads it: no
+    // CPU wait (the copy-queue round trip cost the game's thread 0.3-1.3 ms).
+    // The HIP result is complete (its event was polled), and the output slot
+    // is not rewritten until this evaluate's list has executed (outReader).
+    g.publishCopy.active = true;
+    g.publishCopy.outSlot = r.outSlot;
+    g.publishCopy.evaluate = n;
+    g.outReader[r.outSlot % 4] = (long long)n;
 
     // The resolve for frame n binds this slot; the map sits on the staged
     // frame the job read (Cyberpunk keeps one list in flight, so usually
@@ -1346,8 +1314,28 @@ bool GpuPrepareHipModel(uint64_t n, const Config& cfg) {
         if (pending.session == HipSession()) PublishHipModel(g, n, pending);
     }
 
+    // The result goes to an output slot no list still has to read (its
+    // reader's list executed: the counter proves it) and that is not the
+    // pending result's.
+    unsigned int outSlot = ~0u;
+    {
+        static unsigned int lastOut = 0;
+        for (unsigned int i = 1; i <= 4; ++i) {
+            const unsigned int s = (lastOut + i) % 4;
+            if (pending.active && pending.outSlot == s) continue;
+            if (g.outReader[s] < 0 || (long long)counter >= g.outReader[s]) { outSlot = s; break; }
+        }
+        if (outSlot == ~0u) {
+            PrepTimes().report();
+            return false;  // every output slot is still being read: try next frame
+        }
+        lastOut = outSlot;
+        HipSetOutSlot(outSlot);
+    }
+
     // The newest staged frame is the counter's; its list wrote its slot.
     PendingHipResult job;
+    job.outSlot = outSlot;
     job.readSlot = counter % HipStagingSlots();
     job.stagingFrame = counter;
     job.session = HipSession();

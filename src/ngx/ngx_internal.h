@@ -505,6 +505,11 @@ struct GpuContext {
     bool hipStagingBusy = false;
     // The slot this evaluate's list writes (hipEvaluate % slots).
     unsigned int hipWriteSlot = 0;
+    // S331: a published result is copied into its model slot on the game's own
+    // list (in the chain of the same evaluate), not on our copy queue with a
+    // CPU wait. outReader[s] = the evaluate whose list reads output slot s.
+    struct { bool active = false; unsigned int outSlot = 0; uint64_t evaluate = 0; } publishCopy;
+    long long outReader[4] = {-1, -1, -1, -1};
 
     // Held by unique_ptr so a pointer to a pooled texture stays valid when the
     // pool grows. GpuNeuralChain holds `proxy` across the acquisition of
@@ -677,6 +682,9 @@ unsigned int HipSession();
 // reads the slot set with HipSetReadSlot.
 UINT64 HipStagingSlotOffset(unsigned int slot, bool motion);
 void HipSetReadSlot(unsigned int slot);
+// The model output (HipStagingOut) has the same slots; the next HIP result is
+// written to this one (byte offset HipStagingSlotOffset(slot, false)).
+void HipSetOutSlot(unsigned int slot);
 unsigned int HipStagingSlots();
 bool HipCandidateInputCapture();  // one-shot or triggered-repeat staged-proxy capture
 UINT64 HipStagingRowPitch();

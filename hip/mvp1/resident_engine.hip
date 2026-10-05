@@ -1024,7 +1024,12 @@ struct Engine {
                     composed.reset(new Buffer((bytes+3)/4));
                     current_bytes = current->count*sizeof(float);
                 }
-                if (options.motion == 2) {
+                // motion=auto votes until it has decided: a game's convention
+                // does not change, and the vote costs a frame copy and a
+                // kernel per frame plus a blocking readback every 30 frames
+                // (S331: 5-10 ms spikes on the game's thread).
+                const bool voting = options.motion == 2 && motion_choice < 0;
+                if (voting) {
                     if (!previous_frame || previous_frame->count < current->count) {
                         previous_frame.reset(new Buffer(current->count));
                         previous_valid = false;
@@ -1039,7 +1044,7 @@ struct Engine {
                 HIP_CHECK(hipMemcpyAsync(current->data, staging, bytes, hipMemcpyDeviceToDevice, compose_stream));
                 // This frame's motion (re_motion came first) against the previous frame.
                 const int slot = int(frame_counter % kRing);
-                if (options.motion == 2 && previous_valid && mv_w == w && mv_h == h && ring_frame[slot] == frame_counter) {
+                if (voting && previous_valid && mv_w == w && mv_h == h && ring_frame[slot] == frame_counter) {
                     if (!vote) { HIP_CHECK(hipMalloc(&vote, 10*sizeof(float))); HIP_CHECK(hipMemsetAsync(vote, 0, 10*sizeof(float), compose_stream)); }
                     const int samples = ((w+5)/6)*((h+5)/6);
                     hipLaunchKernelGGL(k_motion_vote, dim3((samples+255)/256), dim3(256), 0, compose_stream,

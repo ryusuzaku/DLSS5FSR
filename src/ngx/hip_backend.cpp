@@ -53,6 +53,7 @@ struct State {
     const char* (*GetErrorString)(hipError_t) = nullptr;
     hipError_t (*StreamCreate)(hipStream_t*) = nullptr;
     hipError_t (*StreamSynchronize)(hipStream_t) = nullptr;
+    hipError_t (*DeviceSynchronize)() = nullptr;  // optional: staging changes while async work runs
     hipError_t (*StreamDestroy)(hipStream_t) = nullptr;
     hipError_t (*ModuleLoadData)(hipModule_t*, const void*) = nullptr;
     hipError_t (*ModuleGetFunction)(hipFunction_t*, hipModule_t, const char*) = nullptr;
@@ -97,7 +98,8 @@ struct State {
     // point at the slot the next HIP job reads (SetReadSlot). A job queued
     // without waiting can then read its slot while later frames' lists write
     // the others.
-    void *ptrInBase = nullptr, *ptrMvBase = nullptr;
+    void *ptrInBase = nullptr, *ptrMvBase = nullptr, *ptrOutBase = nullptr;
+    unsigned int outSlot = 0;  // the slot of bufOut the next result is written to
     UINT64 inStride = 0, mvStride = 0;
     unsigned int readSlot = 0;
     ComPtr<ID3D12Resource> bufIn, bufOut;
@@ -269,7 +271,7 @@ void DropStaging() {
     s.albedoOffset = 0;
     s.albedoStaged = false;
     s.ptrIn = s.ptrOut = nullptr;
-    s.ptrInBase = s.ptrMvBase = nullptr;
+    s.ptrInBase = s.ptrMvBase = s.ptrOutBase = nullptr;
     s.inStride = s.mvStride = 0;
     if (s.hIn) CloseHandle(s.hIn);
     if (s.hOut) CloseHandle(s.hOut);
@@ -399,6 +401,7 @@ bool Startup() {
     HIP_RES(s.hipDll, "hipGetErrorString", GetErrorString);
     HIP_RES(s.hipDll, "hipStreamCreate", StreamCreate);
     HIP_RES(s.hipDll, "hipStreamSynchronize", StreamSynchronize);
+    s.DeviceSynchronize = (decltype(s.DeviceSynchronize))GetProcAddress(s.hipDll, "hipDeviceSynchronize");
     HIP_RES(s.hipDll, "hipStreamDestroy", StreamDestroy);
     HIP_RES(s.hipDll, "hipModuleLoadData", ModuleLoadData);
     HIP_RES(s.hipDll, "hipModuleGetFunction", ModuleGetFunction);
@@ -594,6 +597,7 @@ static UINT64 SlotStride(UINT64 bytes) { return (bytes + 0xFFFF) & ~(UINT64)0xFF
 
 static void PointAtReadSlot() {
     State& s = S();
+    s.ptrOut = s.ptrOutBase ? (unsigned char*)s.ptrOutBase + (size_t)s.outSlot * s.inStride : nullptr;
     s.ptrIn = s.ptrInBase ? (unsigned char*)s.ptrInBase + (size_t)s.readSlot * s.inStride : nullptr;
     s.ptrMv = s.ptrMvBase ? (unsigned char*)s.ptrMvBase + (size_t)s.readSlot * s.mvStride : nullptr;
 }
@@ -611,6 +615,15 @@ bool EnsureStaging(unsigned int w, unsigned int h, unsigned int bpp) {
     if (g_failSkip && g_failW == w && g_failH == h && g_failBpp == bpp) {
         --g_failSkip;
         return false;
+    }
+    // The engine's copies and composes are queued without waiting (S328b):
+    // before the staging is re-laid out or freed, everything that may still
+    // read or write it has to finish. A resize is rare (the model-resolution
+    // slider, a window resize); one blocking wait there is fine.
+    // A result still pending was made for the old layout: void it.
+    if (s.bufIn) {
+        if (s.DeviceSynchronize) s.DeviceSynchronize();
+        ++s.session;
     }
 
     // A frame that fits the buffers already shared with HIP reuses them with
@@ -703,6 +716,7 @@ bool EnsureStaging(unsigned int w, unsigned int h, unsigned int bpp) {
         !import(s.hOut, s.bufOut, s.extOut, s.ptrOut))
         return StagingFailed(w, h, bpp, "HIP import", E_FAIL);
     s.ptrInBase = s.ptrIn;
+    s.ptrOutBase = s.ptrOut;
     g_failSkip = 0; g_failLogs = 0;
 
     // Motion staging: float2 per pixel. Optional -- without it the engine
@@ -11138,6 +11152,10 @@ void SetReadSlot(unsigned int slot) {
     S().readSlot = slot % kStagingSlots;
     PointAtReadSlot();
 }
+void SetOutSlot(unsigned int slot) {
+    S().outSlot = slot % kStagingSlots;
+    PointAtReadSlot();
+}
 bool MotionIsUv() {
     State& s = S();
     if (s.engineState <= 0 || !s.EngineMotionMode) return false;
@@ -11200,6 +11218,7 @@ bool HipCanFeedAhead() { return hipb::CanFeedAhead(); }
 unsigned int HipSession() { return hipb::Session(); }
 UINT64 HipStagingSlotOffset(unsigned int slot, bool motion) { return hipb::StagingSlotOffset(slot, motion); }
 void HipSetReadSlot(unsigned int slot) { hipb::SetReadSlot(slot); }
+void HipSetOutSlot(unsigned int slot) { hipb::SetOutSlot(slot); }
 unsigned int HipStagingSlots() { return hipb::kStagingSlots; }
 bool HipResidentEngineSubmit() { return hipb::ResidentEngineSubmit(); }
 bool HipCandidateInputCapture() { return hipb::CandidateInputCapture(); }
