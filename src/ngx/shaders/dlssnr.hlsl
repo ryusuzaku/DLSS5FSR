@@ -347,8 +347,12 @@ void main(uint3 id : SV_DispatchThreadID)
         const float proxyLinearLuma = gPassthrough != 0 ? dot(SrgbToLinear(saturate(proxySample.rgb)), kLuma)
                                                         : dot(proxy, kLuma);
         float weight = 0.0;
+        // gMapInvGate < 0: the relative gate, -1/tolerance in log2 luminance
+        // (the engine's rel_gate); otherwise 1/the absolute linear tolerance.
         if (inside && m.y >= 0.0)
-            weight = fade * exp(-abs(proxyLinearLuma - m.y) * gMapInvGate);
+            weight = fade * (gMapInvGate < 0.0
+                ? exp(-abs(log2((proxyLinearLuma + 0.005) / (m.y + 0.005))) * -gMapInvGate)
+                : exp(-abs(proxyLinearLuma - m.y) * gMapInvGate));
         float r = 1.0 + (m.x - 1.0) * weight;
         if (gPassthrough != 0 && proxyLinearLuma > 1e-5)
         {

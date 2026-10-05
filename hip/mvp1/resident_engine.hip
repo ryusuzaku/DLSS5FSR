@@ -202,6 +202,11 @@ struct OutputOptions {
     float additive = 0.0f;  // additive=A: luma edit as the network's luminance change added to the
                             // frame (A=1) instead of a ratio (A=0): a ratio cannot light a black pixel
     float limit = 0.0f, smooth = 0.0f, sigma = 0.02f, strength = 1.0f, gate = 0.03f;
+    // S331: relative forms of sigma and gate, in log2 luminance units (0 = the
+    // absolute forms). An absolute linear tolerance barely separates a dark
+    // object from a dim background (a weapon's old edit kept ~30% weight on
+    // the road behind it, several swings stacked through the smoothing).
+    float rel_sigma = 0.0f, rel_gate = 0.0f;
     int gain = -1;
 };
 
@@ -337,7 +342,11 @@ __global__ void k_ratio_map(const float* linear, const float* color, const unsig
     if (o.limit > 0.0f) ratio = fminf(1.0f + o.limit, fmaxf(1.0f - o.limit, ratio));
     if (previous && previous_valid && o.smooth > 0.0f) {
         float2 h = previous[i];
-        float wgt = o.smooth * expf(-fabsf(yin - h.y) / o.sigma);
+        float wgt;
+        if (o.rel_sigma > 0.0f)
+            wgt = h.y < 0.0f ? 0.0f : o.smooth * expf(-fabsf(log2f((yin + 0.005f) / (h.y + 0.005f))) / o.rel_sigma);
+        else
+            wgt = o.smooth * expf(-fabsf(yin - h.y) / o.sigma);
         ratio = ratio + (h.x - ratio)*wgt;
     }
     // A non-finite network output anywhere (softmax overflow on an unusual
@@ -857,6 +866,8 @@ struct Engine {
             else if (key == "scale") options.scale = std::stof(value);
             else if (key == "budget") options.budget = std::stof(value);
             else if (key == "additive") options.additive = std::stof(value);
+            else if (key == "rel_sigma") options.rel_sigma = std::stof(value);
+            else if (key == "rel_gate") options.rel_gate = std::stof(value);
             else if (key == "extent" && (value == "compact" || value == "legacy")) options.compact = value == "compact";
             else if (key == "tone") options.tone = std::stof(value);
             else if (key == "encoded") options.encoded = std::stoi(value);
@@ -887,6 +898,7 @@ struct Engine {
             options.scale < 0.25f || options.scale > 1.0f || (options.scale < 1.0f && !options.luma) ||
             options.budget < 0.0f || (options.budget > 0.0f && (options.budget < 64.0f*64.0f || !options.luma)) ||
             options.additive < 0.0f || options.additive > 1.0f || (options.additive > 0.0f && !options.luma) ||
+            options.rel_sigma < 0.0f || options.rel_gate < 0.0f ||
             options.tone < 0.0f || options.tone > 1.0f || (options.tone > 0.0f && !options.luma) ||
             options.encoded < 0 || options.encoded > 1 || (options.encoded && !options.luma) ||
             options.temporal < 0.0f || options.temporal > 1.0f || (options.temporal > 0.0f && !options.luma))
@@ -1695,7 +1707,8 @@ __declspec(dllexport) int re_luma_map_params(float* params) {
     const bool on = e.options.motion != 0;
     params[0] = !on ? 0.0f : e.options.motion == 2 ? e.motion_mx : float(e.options.motion_sign);
     params[1] = !on ? 0.0f : e.options.motion == 2 ? e.motion_my : float(e.options.motion_sign);
-    params[2] = 1.0f / e.options.gate;
+    // A negative value asks the resolve for the relative (log2) gate.
+    params[2] = e.options.rel_gate > 0.0f ? -1.0f / e.options.rel_gate : 1.0f / e.options.gate;
     params[3] = e.options.luma ? 1.0f : 0.0f;
     return 1;
 }
