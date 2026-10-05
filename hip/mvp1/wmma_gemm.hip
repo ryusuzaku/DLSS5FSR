@@ -155,6 +155,130 @@ __global__ __launch_bounds__(256) void k_wmma_gemm(
             }
 }
 
+// FP8 form of k_wmma_gemm (S331): the operands as E4M3 bytes (they are FP8
+// values, so the conversion is exact), gfx12 FP8 WMMA (16x16x16, f32
+// accumulate), weights from an E4M3 copy (half the bytes of the f16 copy:
+// the ViT and C512 GEMMs at small token counts mostly stream weights). The
+// slice/partition/epilogue structure is k_wmma_gemm's. RESIDENT_GEMM_F16=1
+// keeps the f16 kernel. Operand layout: fp8_wmma_layout_test.hip.
+constexpr int LDS8 = KS + 16;  // padded LDS row (bytes)
+typedef float acc8v __attribute__((ext_vector_type(8)));
+typedef int op8v __attribute__((ext_vector_type(2)));
+__device__ inline unsigned char to_e4m3(float x) {
+    x = fminf(448.0f, fmaxf(-448.0f, x));
+    return (unsigned char)(__builtin_amdgcn_cvt_pk_fp8_f32(x, 0.0f, 0, false) & 0xFF);
+}
+__global__ void k_to_e4m3(const float* in, unsigned char* out, size_t n) {
+    size_t i = blockIdx.x*(size_t)blockDim.x + threadIdx.x;
+    if (i < n) out[i] = to_e4m3(in[i]);
+}
+
+template<class P, int EPI, bool RESIDUAL, int BT, int BO, int FM, int FN>
+__global__ __launch_bounds__(256) void k_wmma_gemm8(
+        const float* __restrict__ X, int ldx, const unsigned char* __restrict__ W, int K,
+        const float* __restrict__ R, int ldr, const float* __restrict__ S,
+        float* out, float* out2, int ldo, int T, int O,
+        long long gx, long long gw, long long go, int parts, float* partial) {
+    constexpr int WR = BT/16/FM, WC = BO/16/FN;
+    static_assert(WR*WC == 8, "8 waves per block");
+    __shared__ __attribute__((aligned(16))) unsigned char xs[2][BT*LDS8];
+    __shared__ __attribute__((aligned(16))) unsigned char ws[2][BO*LDS8];
+    constexpr int XN = (BT*KS + 255)/256, WN = (BO*(KS/16) + 255)/256;
+    const int tid = threadIdx.x, wave = tid/32, lane = tid%32;
+    const int lr = lane/16*8, lc = lane%16, koff = (lane/16)*8;
+    const int t0 = blockIdx.y*BT, o0 = blockIdx.x*BO;
+    const int wt = t0 + (wave/WC)*FM*16, wo = o0 + (wave%WC)*FN*16;
+    const int part = partial ? blockIdx.z : 0, group = partial ? 0 : blockIdx.z;
+    X += group*gx; W += group*gw;
+    if (out) out += group*go;
+    if (out2) out2 += group*go;
+    if (RESIDUAL) R += group*go;
+    const int span = K / parts, kbegin = partial ? part*span : 0, kend = partial ? kbegin+span : K;
+    float acc[FM][FN][8], total[FM][FN][8], res[FM][FN][8];
+    for (int i = 0; i < FM; ++i)
+        for (int j = 0; j < FN; ++j)
+            for (int e = 0; e < 8; ++e) {
+                int t = wt+i*16+lr+e, o = wo+j*16+lc;
+                acc[i][j][e] = 0.0f; res[i][j][e] = 0.0f; total[i][j][e] = 0.0f;
+                if (RESIDUAL && part == 0 && t < T && o < O) {
+                    float product = R[size_t(t)*ldr+o]*S[o];
+                    if (EPI == DOUBLE_RES) res[i][j][e] = P::half(product);
+                    else acc[i][j][e] = P::half(product);
+                }
+            }
+    float xr[XN];
+    uint4 wr[WN];
+    auto fetch = [&](int k0) {
+        for (int j = 0; j < XN; ++j) {
+            int i = tid + j*256;
+            if (i < BT*KS) {
+                int row = i / KS, col = i % KS, t = t0+row;
+                xr[j] = t < T ? P::load(X[size_t(t)*ldx+k0+col]) : 0.0f;
+            }
+        }
+        for (int j = 0; j < WN; ++j) {
+            int v = tid + j*256;
+            wr[j] = uint4{0,0,0,0};
+            if (v < BO*(KS/16)) {
+                int row = v / (KS/16), piece = v % (KS/16), o = o0+row;
+                if (o < O) wr[j] = *reinterpret_cast<const uint4*>(W + size_t(o)*K + k0 + piece*16);
+            }
+        }
+    };
+    auto stash = [&](int b) {
+        for (int j = 0; j < XN; ++j) {
+            int i = tid + j*256;
+            if (i < BT*KS) xs[b][(i/KS)*LDS8 + i%KS] = to_e4m3(split512_half(xr[j]));
+        }
+        for (int j = 0; j < WN; ++j) {
+            int v = tid + j*256;
+            if (v < BO*(KS/16)) *reinterpret_cast<uint4*>(ws[b] + (v/(KS/16))*LDS8 + (v%(KS/16))*16) = wr[j];
+        }
+    };
+    fetch(kbegin);
+    stash(0);
+    __syncthreads();
+    int cur = 0;
+    for (int k0 = kbegin; k0 < kend; k0 += KS) {
+        const bool more = k0+KS < kend;
+        if (more) fetch(k0+KS);
+        op8v a[2][FM], b[2][FN];
+        for (int h = 0; h < 2; ++h) {
+            for (int i = 0; i < FM; ++i)
+                a[h][i] = *reinterpret_cast<const op8v*>(xs[cur] + (wt-t0+i*16+lane%16)*LDS8 + h*16 + koff);
+            for (int j = 0; j < FN; ++j)
+                b[h][j] = *reinterpret_cast<const op8v*>(ws[cur] + (wo-o0+j*16+lane%16)*LDS8 + h*16 + koff);
+        }
+        for (int i = 0; i < FM; ++i)
+            for (int j = 0; j < FN; ++j) {
+                acc8v slice = {};
+                slice = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(a[0][i], b[0][j], slice);
+                slice = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(a[1][i], b[1][j], slice);
+                for (int e = 0; e < 8; ++e)
+                    acc[i][j][e] = EPI == DOUBLE_RES ? slice[e] : P::half(acc[i][j][e] + slice[e]);
+            }
+        if (EPI != DOUBLE_RES && (k0+KS) % span == 0) {
+            for (int i = 0; i < FM; ++i)
+                for (int j = 0; j < FN; ++j)
+                    for (int e = 0; e < 8; ++e) {
+                        total[i][j][e] = k0+KS == kbegin+span ? acc[i][j][e] : P::half(total[i][j][e] + acc[i][j][e]);
+                        acc[i][j][e] = 0.0f;
+                    }
+        }
+        if (more) stash(cur ^ 1);
+        __syncthreads();
+        cur ^= 1;
+    }
+    for (int i = 0; i < FM; ++i)
+        for (int j = 0; j < FN; ++j)
+            for (int e = 0; e < 8; ++e) {
+                int t = wt+i*16+lr+e, o = wo+j*16+lc;
+                if (t >= T || o >= O) continue;
+                if (partial) { partial[(size_t(part)*T + t)*O + o] = total[i][j][e]; continue; }
+                store<P,EPI>(EPI == DOUBLE_RES ? acc[i][j][e] : total[i][j][e], res[i][j][e], size_t(t)*ldo+o, out, out2);
+            }
+}
+
 // Partition totals in order: total = half(total + part), then the epilogue.
 template<class P, int EPI>
 __global__ void k_wmma_combine(const float* partial, int parts, int T, int O, float* out, float* out2, int ldo) {
@@ -169,12 +293,15 @@ __global__ void k_wmma_combine(const float* partial, int parts, int T, int O, fl
 // stay resident for an engine's lifetime; clear() when they are freed.
 struct State {
     std::map<const float*, std::pair<h16*, size_t>> weights;
+    std::map<const float*, std::pair<unsigned char*, size_t>> weights8;  // E4M3 copies
     float* partial = nullptr;  // split-K partition totals
     size_t partial_count = 0;
     ~State() { clear(); }
     void clear() {
         for (auto& w : weights) (void)hipFree(w.second.first);
         weights.clear();
+        for (auto& w : weights8) (void)hipFree(w.second.first);
+        weights8.clear();
         if (partial) (void)hipFree(partial);
         partial = nullptr; partial_count = 0;
     }
@@ -182,6 +309,23 @@ struct State {
 inline State& state() { static State s; return s; }
 // RESIDENT_WMMA=0 disables this path; exact_math always does.
 inline bool enabled = [] { const char* v = getenv("RESIDENT_WMMA"); return !(v && *v == '0'); }();
+// RESIDENT_GEMM_F16=1 keeps the f16 WMMA kernel instead of the FP8 one.
+inline bool fp8 = [] { const char* v = getenv("RESIDENT_GEMM_F16"); return !(v && *v == '1'); }();
+
+// Cached E4M3 copy of `count` weights at W (converted once on `stream`).
+inline const unsigned char* fp8_weights(hipStream_t stream, const float* W, size_t count) {
+    auto& s = state();
+    auto found = s.weights8.find(W);
+    if (found == s.weights8.end() || found->second.second != count) {
+        unsigned char* packed = nullptr;
+        HIP_CHECK(hipMalloc(&packed, count));
+        hipLaunchKernelGGL(k_to_e4m3, dim3((count+255)/256), dim3(256), 0, stream, W, packed, count);
+        if (found != s.weights8.end()) (void)hipFree(found->second.first);
+        s.weights8[W] = {packed, count};
+        return packed;
+    }
+    return found->second.first;
+}
 
 // Cached half copy of `count` weights at W (converted once on `stream`).
 inline const h16* half_weights(hipStream_t stream, const float* W, size_t count) {
@@ -204,7 +348,10 @@ inline bool gemm(hipStream_t stream, const float* X, int ldx, const float* W, in
                  int T, int O, int groups, long long gx, long long gw, long long go, int parts) {
     // 16-byte weight rows/slices; K whole slices in every partition.
     if (K % 32 || (K/parts) % 32 || gw % 8) return false;
-    const h16* hw = half_weights(stream, W, size_t(groups-1)*gw + size_t(O)*K);
+    const size_t wcount = size_t(groups-1)*gw + size_t(O)*K;
+    const bool use8 = fp8 && gw % 16 == 0;  // 16-byte E4M3 weight rows
+    const h16* hw = use8 ? nullptr : half_weights(stream, W, wcount);
+    const unsigned char* w8 = use8 ? fp8_weights(stream, W, wcount) : nullptr;
     // Few tiles and a partitioned K (the ViT contract/projection): run the
     // partitions as separate blocks and combine them in order afterwards.
     float* partial = nullptr;
@@ -222,8 +369,12 @@ inline bool gemm(hipStream_t stream, const float* X, int ldx, const float* W, in
     }
     const int zdim = partial ? parts : groups;
 #define WMMA_LAUNCH(BT, BO, FM, FN) \
-    hipLaunchKernelGGL((k_wmma_gemm<P,EPI,RESIDUAL,BT,BO,FM,FN>), dim3((O+BO-1)/BO, (T+BT-1)/BT, zdim), dim3(256), 0, \
-                       stream, X, ldx, hw, K, R, ldr, S, out, out2, ldo, T, O, gx, gw, go, parts, partial)
+    do { \
+        if (use8) hipLaunchKernelGGL((k_wmma_gemm8<P,EPI,RESIDUAL,BT,BO,FM,FN>), dim3((O+BO-1)/BO, (T+BT-1)/BT, zdim), \
+                                     dim3(256), 0, stream, X, ldx, w8, K, R, ldr, S, out, out2, ldo, T, O, gx, gw, go, parts, partial); \
+        else hipLaunchKernelGGL((k_wmma_gemm<P,EPI,RESIDUAL,BT,BO,FM,FN>), dim3((O+BO-1)/BO, (T+BT-1)/BT, zdim), \
+                                dim3(256), 0, stream, X, ldx, hw, K, R, ldr, S, out, out2, ldo, T, O, gx, gw, go, parts, partial); \
+    } while (0)
     // Few blocks with the usual tile (small token counts): 32x64 tiles give
     // four times as many; the per-output arithmetic is the same.
     const size_t blocks = size_t((O+bo-1)/bo)*((T+bt-1)/bt)*zdim;
