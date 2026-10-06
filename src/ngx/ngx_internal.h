@@ -694,6 +694,7 @@ void HipSetReadSlot(unsigned int slot);
 void HipSetOutSlot(unsigned int slot);
 unsigned int HipStagingSlots();
 bool HipCandidateInputCapture();  // one-shot or triggered-repeat staged-proxy capture
+bool HipSequenceCapture(unsigned long long counter);  // "<capture path>.seq": consecutive frames + motion
 UINT64 HipStagingRowPitch();
 UINT64 HipStagingBytes();
 ID3D12Resource* HipStagingIn();

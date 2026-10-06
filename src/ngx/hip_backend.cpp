@@ -997,6 +997,100 @@ bool CandidateInputCapture() {
     return gpuOk;
 }
 
+// S332: a sequence capture for offline replays of the in-game pipeline. While
+// "<CandidateInputCapturePath>.seq" exists (its text: the frame count, default
+// 120), every newly staged frame is written to "<path>.seq.<tick>\<counter>.bin":
+// the D5INP001 capture, the D5DEP001 depth trailer, then "D5MOV001", width,
+// height and the staged motion (float2 rows, as the engine receives them).
+// The readback blocks the game's thread: the game runs slower while it lasts.
+// The trigger is deleted when the count is reached.
+bool SequenceCapture(unsigned long long counter) {
+    State& s = S();
+    const Config& cfg = Cfg();
+    if (cfg.candidateInputCapturePath.empty()) return true;
+    static std::wstring dir;
+    static int left = 0;
+    static unsigned long long last = 0;
+    const std::wstring trigger = cfg.candidateInputCapturePath + L".seq";
+    if (left == 0) {
+        if (GetFileAttributesW(trigger.c_str()) == INVALID_FILE_ATTRIBUTES) return true;
+        int count = 120;
+        if (FILE* t = _wfopen(trigger.c_str(), L"rb")) {
+            int v = 0;
+            if (fscanf(t, "%d", &v) == 1 && v > 0 && v <= 2000) count = v;
+            fclose(t);
+        }
+        dir = cfg.candidateInputCapturePath + L".seq." + std::to_wstring(GetTickCount64());
+        if (!CreateDirectoryW(dir.c_str(), nullptr)) {
+            LOGE("hip: sequence capture cannot create %ls", dir.c_str());
+            DeleteFileW(trigger.c_str());
+            return false;
+        }
+        left = count;
+        last = 0;
+        LOGI("hip: sequence capture of %d frames into %ls", count, dir.c_str());
+    }
+    if (!s.usable || !s.ptrIn || !s.ptrMv || !s.mvPitch || !s.motionStaged || !s.w || !s.h ||
+        (s.bpp != 4 && s.bpp != 8) || s.bytes != s.pitch * s.h) {
+        LOGW("hip: sequence capture skipped frame %llu (staging incomplete)", counter);
+        return true;
+    }
+    if (last && counter != last + 1)
+        LOGW("hip: sequence capture gap: frame %llu after %llu", counter, last);
+    last = counter;
+    std::vector<unsigned char> pixels((size_t)s.bytes);
+    std::vector<float> depth, motion((size_t)s.w * s.h * 2);
+    hipError_t e = s.Memcpy(pixels.data(), s.ptrIn, pixels.size(), hipMemcpyDeviceToHost);
+    for (unsigned int y = 0; y < s.h && e == hipSuccess; ++y)
+        e = s.Memcpy(motion.data() + (size_t)y * s.w * 2, (const unsigned char*)s.ptrMv + (size_t)y * s.mvPitch,
+                     (size_t)s.w * 8, hipMemcpyDeviceToHost);
+    if (s.depthStaged && s.depthPitch) {
+        depth.resize((size_t)s.w * s.h);
+        for (unsigned int y = 0; y < s.h && e == hipSuccess; ++y)
+            e = s.Memcpy(depth.data() + (size_t)y * s.w,
+                         (const unsigned char*)s.ptrMv + s.depthOffset + (size_t)y * s.depthPitch,
+                         (size_t)s.w * 4, hipMemcpyDeviceToHost);
+    }
+    if (e == hipSuccess) e = s.StreamSynchronize(s.stream);
+    if (e != hipSuccess) {
+        LOGE("hip: sequence capture readback failed: %s", s.GetErrorString(e));
+        left = 0;
+        DeleteFileW(trigger.c_str());
+        return false;
+    }
+    unsigned char header[36]{};
+    memcpy(header, "D5INP001", 8);
+    const unsigned int fields[6] = {s.w, s.h, s.bpp, (unsigned int)s.pitch,
+                                    (unsigned int)(cfg.passthrough != 0), (unsigned int)cfg.proxyMode};
+    memcpy(header + 8, fields, sizeof(fields));
+    memcpy(header + 32, &cfg.whitePoint, sizeof(float));
+    wchar_t name[32];
+    swprintf(name, 32, L"\\%08llu.bin", counter);
+    const std::wstring path = dir + name;
+    FILE* f = _wfopen(path.c_str(), L"wb");
+    const unsigned int dims[2] = {s.w, s.h};
+    bool ok = f && fwrite(header, 1, sizeof(header), f) == sizeof(header) &&
+              fwrite(pixels.data(), 1, pixels.size(), f) == pixels.size();
+    if (ok && !depth.empty())
+        ok = fwrite("D5DEP001", 1, 8, f) == 8 && fwrite(dims, 4, 2, f) == 2 &&
+             fwrite(depth.data(), 4, depth.size(), f) == depth.size();
+    if (ok)
+        ok = fwrite("D5MOV001", 1, 8, f) == 8 && fwrite(dims, 4, 2, f) == 2 &&
+             fwrite(motion.data(), 4, motion.size(), f) == motion.size();
+    if (f && fclose(f) != 0) ok = false;
+    if (!ok) {
+        LOGE("hip: sequence capture write failed at %ls", path.c_str());
+        left = 0;
+        DeleteFileW(trigger.c_str());
+        return false;
+    }
+    if (--left == 0) {
+        DeleteFileW(trigger.c_str());
+        LOGI("hip: sequence capture finished at frame %llu", counter);
+    }
+    return true;
+}
+
 // Load and create the resident engine once; any failure disables it for the
 // session and leaves the normal model path untouched.
 static bool EngineReady() {
@@ -11222,6 +11316,7 @@ void HipSetOutSlot(unsigned int slot) { hipb::SetOutSlot(slot); }
 unsigned int HipStagingSlots() { return hipb::kStagingSlots; }
 bool HipResidentEngineSubmit() { return hipb::ResidentEngineSubmit(); }
 bool HipCandidateInputCapture() { return hipb::CandidateInputCapture(); }
+bool HipSequenceCapture(unsigned long long counter) { return hipb::SequenceCapture(counter); }
 UINT64 HipStagingRowPitch() { return hipb::StagingRowPitch(); }
 UINT64 HipStagingBytes() { return hipb::StagingBytes(); }
 ID3D12Resource* HipStagingIn() { return hipb::StagingIn(); }

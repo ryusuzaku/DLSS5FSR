@@ -326,6 +326,8 @@ void main(uint3 id : SV_DispatchThreadID)
         // distance either way. Walking 5 m/s moves the ground 2 m ahead by ~4%
         // per frame: up to 10% passes, 25% and more rejects.
         float depthWeight = 1.0;
+        bool filled = false;
+        float2 fillValue = float2(1.0, -1.0);
         if (gGuideWidth > 0)
         {
             // Walk back one frame at a time through the motion history (newest
@@ -356,6 +358,44 @@ void main(uint3 id : SV_DispatchThreadID)
                 }
             }
             mapUv = pos / size;
+            // Disocclusion fill (S332): a pixel whose depth differs from the
+            // map frame's at the walked position was hidden then. Rejecting
+            // its entry leaves it unedited among edited neighbours: a light
+            // band behind everything that moves (the in-game "ghost
+            // outline"). Take instead the nearest map entry around that
+            // position that has this pixel's depth -- the background beside
+            // the occluder. Offline (tools/seq_replay.py, a walker at lag
+            // 2/6) this cut the error on uncovered pixels 230/246 -> 119/146.
+            if ((gMapMode & 2u) != 0)
+            {
+                const uint oldest = (gGuideHeight + 8u - gGuideWidth) % 8u;
+                const int2 here = clamp(int2(cmpUv * size), int2(0, 0), last);
+                const int2 to = clamp(int2(pos), int2(0, 0), last);
+                const float dCur = gDepthHist.Load(int3(here.x, here.y + int(gGuideHeight * gHeight), 0)).x;
+                const float dMap = gDepthHist.Load(int3(to.x, to.y + int(oldest * gHeight), 0)).x;
+                if (abs(dCur - dMap) / max(max(dCur, dMap), 1e-7) > 0.25)
+                {
+                    float best = 0.1;  // a candidate's depth within 10% of this pixel's
+                    [loop] for (uint ring = 0; ring < 5 && !filled; ++ring)
+                    {
+                        const float radius = 3.0 * float(1u << ring);
+                        [unroll] for (uint k = 0; k < 8; ++k)
+                        {
+                            const float angle = 0.78539816 * float(k);
+                            const int2 q = clamp(to + int2(round(radius * float2(cos(angle), sin(angle)))),
+                                                 int2(0, 0), last);
+                            const float dq = gDepthHist.Load(int3(q.x, q.y + int(oldest * gHeight), 0)).x;
+                            const float r = abs(dCur - dq) / max(max(dCur, dq), 1e-7);
+                            if (r < best)
+                            {
+                                const float2 c = gModel.Load(int3(q, 0)).xy;
+                                if (c.y >= 0.0) { best = r; fillValue = c; filled = true; }
+                            }
+                        }
+                    }
+                    if (filled) depthWeight = 1.0;  // the fill replaces the depth rejection
+                }
+            }
         }
         else
         {
@@ -364,7 +404,7 @@ void main(uint3 id : SV_DispatchThreadID)
             if (any(isnan(mv)) || any(isinf(mv))) mv = float2(0.0, 0.0);
             mapUv = cmpUv + mv / size;
         }
-        const float2 m = gModel.SampleLevel(gLinear, mapUv, 0).xy;
+        const float2 m = filled ? fillValue : gModel.SampleLevel(gLinear, mapUv, 0).xy;
         const bool inside = all(mapUv >= 0.0) && all(mapUv <= 1.0);
         const float peak = max(proxySample.r, max(proxySample.g, proxySample.b));
         const float fade = saturate((1.0 - peak) / 0.05);
@@ -383,7 +423,13 @@ void main(uint3 id : SV_DispatchThreadID)
         // the edit along every edge (outlines everywhere). A value inside the
         // neighbourhood's range passes; a dark weapon's old edit over a bright
         // road lies far outside it. Otherwise 1/the absolute linear tolerance.
-        if (inside && m.y >= 0.0)
+        // A filled entry comes from a neighbour: its luminance is not this
+        // pixel's, so the luminance gate would reject it again.
+        if (filled)
+        {
+            weight = fade;
+        }
+        else if (inside && m.y >= 0.0)
         {
             if (gMapInvGate < 0.0)
             {

@@ -1821,6 +1821,14 @@ __declspec(dllexport) int re_latest_extent(int* width, int* height) {
     return g_engine->completed ? 1 : 0;
 }
 
+// Network results finished so far (a replay waits for each run).
+__declspec(dllexport) unsigned long long re_completed() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!g_engine) return 0;
+    std::lock_guard<std::mutex> inner(g_engine->mutex);
+    return g_engine->completed;
+}
+
 __declspec(dllexport) const char* re_last_error() {
     std::lock_guard<std::mutex> lock(g_mutex);
     if (g_engine) {

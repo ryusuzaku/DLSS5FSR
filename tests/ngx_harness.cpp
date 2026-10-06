@@ -1580,9 +1580,50 @@ int main(int argc, char** argv) {
         }
         ID3D12Resource* engineColor = engineMap ? color16.Get() : color.Get();
         ID3D12Resource* engineOutput = engineMap ? output16.Get() : output.Get();
+        // DLSS5_SEQUENCE_CAPTURE=<path> (with FULL): arm the shim's sequence
+        // capture ("<path>.seq", 5 frames) for this pass and check its files.
+        const char* seqEnv = getenv("DLSS5_SEQUENCE_CAPTURE");
+        const std::string seqPath = seqEnv && engineFull ? seqEnv : "";
+        if (!seqPath.empty()) {
+            engine.candidateInputCapturePath = seqPath;
+            engine.candidateInputCaptureTrigger = 1;  // the one-shot capture waits for its own .go
+            if (FILE* t = fopen((seqPath + ".seq").c_str(), "wb")) { fputs("5", t); fclose(t); }
+        }
         PassResult ep = RunPass(ngx, d, iniDir, engine, engineColor, engineOutput,
                                 SRC_W, SRC_H, DST_W, DST_H, engineFull ? 150 : 120, mv.Get());
         Check(ep.evalFailures == 0, "resident engine frames evaluate");
+        if (!seqPath.empty()) {
+            const size_t cut = seqPath.find_last_of("\\/");
+            const std::string parent = cut == std::string::npos ? std::string() : seqPath.substr(0, cut + 1);
+            std::string dir;
+            WIN32_FIND_DATAA fd;
+            HANDLE h = FindFirstFileA((seqPath + ".seq.*").c_str(), &fd);
+            if (h != INVALID_HANDLE_VALUE) {
+                do {
+                    if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) dir = parent + fd.cFileName;
+                } while (FindNextFileA(h, &fd));
+                FindClose(h);
+            }
+            int frames = 0, withMotion = 0;
+            if (!dir.empty() && (h = FindFirstFileA((dir + "\\*.bin").c_str(), &fd)) != INVALID_HANDLE_VALUE) {
+                do {
+                    ++frames;
+                    if (FILE* f = fopen((dir + "\\" + fd.cFileName).c_str(), "rb")) {
+                        unsigned int hdr[9]{};
+                        char tag[8]{};
+                        if (fread(hdr, 4, 9, f) == 9 && _fseeki64(f, 36 + (long long)hdr[5] * hdr[3], SEEK_SET) == 0 &&
+                            fread(tag, 1, 8, f) == 8 && !memcmp(tag, "D5MOV001", 8))
+                            ++withMotion;
+                        fclose(f);
+                    }
+                } while (FindNextFileA(h, &fd));
+                FindClose(h);
+            }
+            printf("  sequence capture: %d frame file(s), %d with motion, in %s\n", frames, withMotion, dir.c_str());
+            Check(frames == 5 && withMotion == 5 &&
+                  GetFileAttributesA((seqPath + ".seq").c_str()) == INVALID_FILE_ATTRIBUTES,
+                  "sequence capture writes 5 consecutive frames with motion and consumes its trigger");
+        }
         if (engineMap) {
             IniValues identity = engine;
             identity.residentEngineConfig.clear();

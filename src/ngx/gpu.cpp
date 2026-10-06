@@ -1332,6 +1332,7 @@ bool GpuPrepareHipModel(uint64_t n, const Config& cfg) {
         ++PrepTimes().stillRunning;
         if (fresh && HipCanFeedAhead() && !cfg.residentEngineConfig.empty()) {
             HipSetReadSlot(counter % HipStagingSlots());
+            HipSequenceCapture(counter);
             const LONGLONG tFeed = PrepNow();
             if (HipResidentEngineSubmit()) {
                 lastFed = (long long)counter;
@@ -1378,6 +1379,7 @@ bool GpuPrepareHipModel(uint64_t n, const Config& cfg) {
     // The staged proxy bytes are the model's input; on the game's path the
     // engine's map is only queued here and collected later.
     const LONGLONG tHip = PrepNow();
+    if (fresh) HipSequenceCapture(counter);
     if (!HipRunModel()) return false;
     if (fresh && !cfg.residentEngineConfig.empty()) {
         lastFed = (long long)counter;
