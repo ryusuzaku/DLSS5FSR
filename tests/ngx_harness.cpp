@@ -1598,6 +1598,9 @@ int main(int argc, char** argv) {
                                 SRC_W, SRC_H, DST_W, DST_H, engineFull ? 150 : 120, mv.Get());
         Check(ep.evalFailures == 0, "resident engine frames evaluate");
         if (!seqPath.empty()) {
+            // The frames are written in the background; the trigger goes last.
+            for (int t = 0; t < 300 && GetFileAttributesA((seqPath + ".seq").c_str()) != INVALID_FILE_ATTRIBUTES; ++t)
+                Sleep(100);
             const size_t cut = seqPath.find_last_of("\\/");
             const std::string parent = cut == std::string::npos ? std::string() : seqPath.substr(0, cut + 1);
             std::string dir;

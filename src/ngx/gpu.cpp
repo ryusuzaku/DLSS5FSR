@@ -1582,6 +1582,7 @@ struct SyncState {
     ID3D12Device* device = nullptr;
     uint64_t frame = 0;          // evaluates since start (fence values are frame + 1)
     long long accepted = -1;     // newest frame whose engine job will signal `result`
+    long long acceptedBefore = -1;  // the accepted frame before it (sequence capture)
     uint64_t pendingWait = 0;    // `result` value this evaluate's list waits for
     uint64_t registered = 0;     // highest `staged` value registered
     uint64_t hooked = 0;         // registered lists the hook has seen
@@ -1774,24 +1775,25 @@ bool GpuSyncPrepare(const Config& cfg) {
     job.mapMode = HipSyncMapParams(job.mapParams);
     s.pendingWait = job.stagingFrame + 1;
     if (job.mapMode) PublishHipModel(g, frame, job);
-    // Sequence capture (only while one is armed: it waits on the CPU, and the
-    // game stutters while it records anyway): the published job's frame, once
-    // its job ran -- its staging was written and nothing rewrites that slot
-    // before this evaluate's list has executed.
-    if (!cfg.candidateInputCapturePath.empty() && HipSequenceArmed()) {
-        const uint64_t want = job.stagingFrame + 1;
-        bool ready = s.result->GetCompletedValue() >= want;
+    // Sequence capture (only while one is armed): the accepted frame before
+    // the newest, normally two back, whose job has almost always finished, so
+    // the game keeps its frame rate while it records. Its slot is rewritten
+    // only by the list four frames on, not yet recorded.
+    if (!cfg.candidateInputCapturePath.empty() && HipSequenceArmed() && s.acceptedBefore >= 0 &&
+        (uint64_t)s.acceptedBefore + 3 >= frame) {
+        const uint64_t f = (uint64_t)s.acceptedBefore;
+        bool ready = s.result->GetCompletedValue() >= f + 1;
         if (!ready) {
             HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-            if (ev && SUCCEEDED(s.result->SetEventOnCompletion(want, ev)))
+            if (ev && SUCCEEDED(s.result->SetEventOnCompletion(f + 1, ev)))
                 ready = WaitForSingleObject(ev, 1000) == WAIT_OBJECT_0;
             if (ev) CloseHandle(ev);
         }
-        static uint64_t lastCaptured = ~0ull;  // a skipped job publishes the same frame again
-        if (ready && job.stagingFrame != lastCaptured) {
-            lastCaptured = job.stagingFrame;
-            HipSetReadSlot(job.outSlot);
-            HipSequenceCapture(job.stagingFrame);
+        static uint64_t lastCaptured = ~0ull;  // a skipped job leaves the same frame two back
+        if (ready && f != lastCaptured) {
+            lastCaptured = f;
+            HipSetReadSlot((unsigned int)(f % HipStagingSlots()));
+            HipSequenceCapture(f);
         }
     }
     static unsigned long long published = 0;
@@ -1849,6 +1851,7 @@ void GpuSyncAfterEvaluate(ID3D12GraphicsCommandList* cl, const Config& cfg) {
     if (!active) return;
     const int r = HipSyncSubmit(frame, frame + 1, frame + 1);
     if (r == 1) {
+        s.acceptedBefore = s.accepted;
         s.accepted = (long long)frame;
     } else {
         ++s.skipped;

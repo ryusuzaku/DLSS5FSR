@@ -23,6 +23,11 @@
 #include <cstdio>
 #include <cstring>
 #include <vector>
+#include <condition_variable>
+#include <deque>
+#include <memory>
+#include <mutex>
+#include <thread>
 
 // Types only. The functions themselves are never referenced through these
 // declarations (nothing links amdhip64.lib here); every call goes through
@@ -1021,17 +1026,65 @@ bool SequenceArmed() {
            GetFileAttributesW((cfg.candidateInputCapturePath + L".seq").c_str()) != INVALID_FILE_ATTRIBUTES;
 }
 
+// Writes recorded sequence frames to disk off the game's thread: at full
+// frame rate a recording produces far more than a disk takes, so the frames
+// queue in memory (90 frames at 1510x850: ~2.3 GB at the peak) and the
+// trigger file is removed only when the last one is on disk.
+struct SeqWriter {
+    std::mutex mutex;
+    std::condition_variable wake;
+    std::deque<std::pair<std::wstring, std::shared_ptr<std::vector<unsigned char>>>> queue;
+    bool started = false;
+    std::wstring trigger;
+    bool busy = false, closing = false;
+    unsigned int written = 0, failed = 0;
+};
+static SeqWriter& Seq() {
+    static SeqWriter w;
+    return w;
+}
+static void SeqWriterLoop() {
+    SeqWriter& w = Seq();
+    for (;;) {
+        std::pair<std::wstring, std::shared_ptr<std::vector<unsigned char>>> item;
+        {
+            std::unique_lock<std::mutex> lock(w.mutex);
+            w.wake.wait(lock, [&] { return !w.queue.empty() || w.closing; });
+            if (w.queue.empty()) {
+                // closing and drained: the recording is complete on disk
+                DeleteFileW(w.trigger.c_str());
+                LOGI("hip: sequence capture written (%u frames, %u failed)", w.written, w.failed);
+                w.closing = false;
+                w.busy = false;
+                continue;
+            }
+            item = std::move(w.queue.front());
+            w.queue.pop_front();
+        }
+        FILE* f = _wfopen(item.first.c_str(), L"wb");
+        const bool ok = f && fwrite(item.second->data(), 1, item.second->size(), f) == item.second->size();
+        if (f) fclose(f);
+        std::lock_guard<std::mutex> lock(w.mutex);
+        if (ok) ++w.written; else ++w.failed;
+    }
+}
+
 bool SequenceCapture(unsigned long long counter) {
     State& s = S();
     const Config& cfg = Cfg();
     if (cfg.candidateInputCapturePath.empty()) return true;
+    SeqWriter& wr = Seq();
     std::wstring& dir = g_seqDir;
     int& left = g_seqLeft;
     unsigned long long& last = g_seqLast;
     const std::wstring trigger = cfg.candidateInputCapturePath + L".seq";
     if (left == 0) {
         if (GetFileAttributesW(trigger.c_str()) == INVALID_FILE_ATTRIBUTES) return true;
-        int count = 120;
+        {
+            std::lock_guard<std::mutex> lock(wr.mutex);
+            if (wr.busy) return true;  // the previous recording is still being written
+        }
+        int count = 90;
         if (FILE* t = _wfopen(trigger.c_str(), L"rb")) {
             int v = 0;
             if (fscanf(t, "%d", &v) == 1 && v > 0 && v <= 2000) count = v;
@@ -1045,6 +1098,17 @@ bool SequenceCapture(unsigned long long counter) {
         }
         left = count;
         last = 0;
+        {
+            std::lock_guard<std::mutex> lock(wr.mutex);
+            wr.busy = true;
+            wr.trigger = trigger;
+            wr.written = wr.failed = 0;
+        }
+        if (!wr.started) {
+            // Detached: it only ever waits on its queue; process exit ends it.
+            std::thread(SeqWriterLoop).detach();
+            wr.started = true;
+        }
         LOGI("hip: sequence capture of %d frames into %ls", count, dir.c_str());
     }
     if (!s.usable || !s.ptrIn || !s.ptrMv || !s.mvPitch || !s.motionStaged || !s.w || !s.h ||
@@ -1055,56 +1119,53 @@ bool SequenceCapture(unsigned long long counter) {
     if (last && counter != last + 1)
         LOGW("hip: sequence capture gap: frame %llu after %llu", counter, last);
     last = counter;
-    std::vector<unsigned char> pixels((size_t)s.bytes);
-    std::vector<float> depth, motion((size_t)s.w * s.h * 2);
-    hipError_t e = s.Memcpy(pixels.data(), s.ptrIn, pixels.size(), hipMemcpyDeviceToHost);
-    for (unsigned int y = 0; y < s.h && e == hipSuccess; ++y)
-        e = s.Memcpy(motion.data() + (size_t)y * s.w * 2, (const unsigned char*)s.ptrMv + (size_t)y * s.mvPitch,
-                     (size_t)s.w * 8, hipMemcpyDeviceToHost);
-    if (s.depthStaged && s.depthPitch) {
-        depth.resize((size_t)s.w * s.h);
+    // The whole file in memory: header, rows, depth and motion trailers. Only
+    // the readback blocks here (a few ms); a background thread writes it.
+    const size_t rows = (size_t)s.bytes;
+    const size_t plane = (size_t)s.w * s.h;
+    const bool withDepth = s.depthStaged && s.depthPitch;
+    auto blob = std::make_shared<std::vector<unsigned char>>(
+        36 + rows + (withDepth ? 16 + plane * 4 : 0) + 16 + plane * 8);
+    unsigned char* o = blob->data();
+    memcpy(o, "D5INP001", 8);
+    const unsigned int fields[6] = {s.w, s.h, s.bpp, (unsigned int)s.pitch,
+                                    (unsigned int)(cfg.passthrough != 0), (unsigned int)cfg.proxyMode};
+    memcpy(o + 8, fields, sizeof(fields));
+    memcpy(o + 32, &cfg.whitePoint, sizeof(float));
+    hipError_t e = s.Memcpy(o + 36, s.ptrIn, rows, hipMemcpyDeviceToHost);
+    size_t at = 36 + rows;
+    const unsigned int dims[2] = {s.w, s.h};
+    if (withDepth) {
+        memcpy(o + at, "D5DEP001", 8); memcpy(o + at + 8, dims, 8);
+        float* dd = reinterpret_cast<float*>(o + at + 16);
         for (unsigned int y = 0; y < s.h && e == hipSuccess; ++y)
-            e = s.Memcpy(depth.data() + (size_t)y * s.w,
-                         (const unsigned char*)s.ptrMv + s.depthOffset + (size_t)y * s.depthPitch,
+            e = s.Memcpy(dd + (size_t)y * s.w, (const unsigned char*)s.ptrMv + s.depthOffset + (size_t)y * s.depthPitch,
                          (size_t)s.w * 4, hipMemcpyDeviceToHost);
+        at += 16 + plane * 4;
     }
+    memcpy(o + at, "D5MOV001", 8); memcpy(o + at + 8, dims, 8);
+    float* mm = reinterpret_cast<float*>(o + at + 16);
+    for (unsigned int y = 0; y < s.h && e == hipSuccess; ++y)
+        e = s.Memcpy(mm + (size_t)y * s.w * 2, (const unsigned char*)s.ptrMv + (size_t)y * s.mvPitch,
+                     (size_t)s.w * 8, hipMemcpyDeviceToHost);
     if (e == hipSuccess) e = s.StreamSynchronize(s.stream);
     if (e != hipSuccess) {
         LOGE("hip: sequence capture readback failed: %s", s.GetErrorString(e));
         left = 0;
-        DeleteFileW(trigger.c_str());
+        std::lock_guard<std::mutex> lock(wr.mutex);
+        wr.closing = true;  // the writer finishes what it has and removes the trigger
+        wr.wake.notify_all();
         return false;
     }
-    unsigned char header[36]{};
-    memcpy(header, "D5INP001", 8);
-    const unsigned int fields[6] = {s.w, s.h, s.bpp, (unsigned int)s.pitch,
-                                    (unsigned int)(cfg.passthrough != 0), (unsigned int)cfg.proxyMode};
-    memcpy(header + 8, fields, sizeof(fields));
-    memcpy(header + 32, &cfg.whitePoint, sizeof(float));
     wchar_t name[32];
     swprintf(name, 32, L"\\%08llu.bin", counter);
-    const std::wstring path = dir + name;
-    FILE* f = _wfopen(path.c_str(), L"wb");
-    const unsigned int dims[2] = {s.w, s.h};
-    bool ok = f && fwrite(header, 1, sizeof(header), f) == sizeof(header) &&
-              fwrite(pixels.data(), 1, pixels.size(), f) == pixels.size();
-    if (ok && !depth.empty())
-        ok = fwrite("D5DEP001", 1, 8, f) == 8 && fwrite(dims, 4, 2, f) == 2 &&
-             fwrite(depth.data(), 4, depth.size(), f) == depth.size();
-    if (ok)
-        ok = fwrite("D5MOV001", 1, 8, f) == 8 && fwrite(dims, 4, 2, f) == 2 &&
-             fwrite(motion.data(), 4, motion.size(), f) == motion.size();
-    if (f && fclose(f) != 0) ok = false;
-    if (!ok) {
-        LOGE("hip: sequence capture write failed at %ls", path.c_str());
-        left = 0;
-        DeleteFileW(trigger.c_str());
-        return false;
+    {
+        std::lock_guard<std::mutex> lock(wr.mutex);
+        wr.queue.emplace_back(dir + name, blob);
+        if (--left == 0) wr.closing = true;
+        wr.wake.notify_all();
     }
-    if (--left == 0) {
-        DeleteFileW(trigger.c_str());
-        LOGI("hip: sequence capture finished at frame %llu", counter);
-    }
+    if (left == 0) LOGI("hip: sequence capture recorded up to frame %llu; writing in the background", counter);
     return true;
 }
 
