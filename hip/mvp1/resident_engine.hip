@@ -811,6 +811,9 @@ struct Engine {
     // Recorded after an asynchronous compose (re_compose_map_async); the
     // caller polls it with re_compose_ready instead of blocking.
     hipEvent_t compose_done = nullptr;
+    // Synchronous jobs: recorded on the network's stream after the ratio map;
+    // compose_stream waits on it on the device (run(false) never blocks).
+    hipEvent_t net_done = nullptr;
     // Recorded after a submit's copies of the caller's buffers (re_motion,
     // re_depth, re_albedo and re_submit_full all copy on compose_stream):
     // re_inputs_ready says when the caller may rewrite them.
@@ -971,6 +974,7 @@ struct Engine {
         HIP_CHECK(hipEventCreate(&start)); HIP_CHECK(hipEventCreate(&stop));
         HIP_CHECK(hipEventCreateWithFlags(&inputs_ready, hipEventDisableTiming));
         HIP_CHECK(hipEventCreateWithFlags(&compose_done, hipEventDisableTiming));
+        HIP_CHECK(hipEventCreateWithFlags(&net_done, hipEventDisableTiming));
         HIP_CHECK(hipEventCreateWithFlags(&inputs_done, hipEventDisableTiming));
         HIP_CHECK(hipDeviceSynchronize());
         worker = std::thread([this] { loop(); });
@@ -988,6 +992,7 @@ struct Engine {
         if (stop) (void)hipEventDestroy(stop);
         if (inputs_ready) (void)hipEventDestroy(inputs_ready);
         if (compose_done) (void)hipEventDestroy(compose_done);
+        if (net_done) (void)hipEventDestroy(net_done);
         if (inputs_done) (void)hipEventDestroy(inputs_done);
         if (pinned) (void)hipHostFree(pinned);
         if (compose_pinned) (void)hipHostFree(compose_pinned);
@@ -1177,11 +1182,13 @@ struct Engine {
         }
     }
 
-    // Worker thread: one re_sync_submit job, start to finish. The caller's
-    // queue waits for the signal at the end, so it is sent whatever happens.
-    // Everything that may synchronize the device (allocations, a network
-    // rebuild after a resize) runs here, after the previous job's signal and
-    // behind only this job's own wait, which the caller's queue satisfies.
+    // Worker thread: queues one re_sync_submit job, start to finish, on the
+    // device; no host wait for the GPU (the worker returns long before the
+    // job runs). The caller's queue waits for the signal at the end, so it is
+    // queued whatever happens. An allocation or network rebuild after a resize
+    // may synchronize the device: it then waits behind the previous job's
+    // signal and this job's own wait, both of which the caller's queue
+    // satisfies, so it stalls the worker, never the game.
     void run_sync(const ReSyncJob& j) {
         bool ok = false;
         try {
@@ -1195,7 +1202,12 @@ struct Engine {
             const int r = submit(j.staging, j.w, j.h, j.pitch, j.bpp, false, j.gain);
             sync_inline = false;
             if (r != 1) throw std::runtime_error(r < 0 ? error : std::string("sync job not accepted"));
-            run();
+            // Queued, never waited for: the map write and the signal follow
+            // the network on the device (net_done), and the next job's inputs
+            // are copied on compose_stream behind them, so it cannot overwrite
+            // what this one still reads.
+            run(false);
+            HIP_CHECK(hipStreamWaitEvent(compose_stream, net_done, 0));
             if (compose_map_async(j.out, size_t(j.out_pitch), j.w, j.h, nullptr) != 1)
                 throw std::runtime_error("sync job: map compose failed");
             ok = true;
@@ -1228,7 +1240,9 @@ struct Engine {
         return 1;
     }
 
-    void run() {
+    // wait=false (synchronous jobs): a luma run is only queued -- nothing on
+    // the host waits for the device; net_done marks the end of the ratio map.
+    void run(bool wait = true) {
         HIP_CHECK(hipStreamWaitEvent(stream, inputs_ready, 0));
         int W = 256, H = 256;
         // Luma mode may run the network on a downscale of the frame (scale).
@@ -1359,9 +1373,15 @@ struct Engine {
                                    job_depth_valid ? job_depth->data : nullptr,
                                    job_albedo_valid ? job_albedo->data : nullptr);
                 HIP_CHECK(hipGetLastError());
-                HIP_CHECK(hipStreamSynchronize(stream));
-                float elapsed = 0.0f;
-                HIP_CHECK(hipEventElapsedTime(&elapsed, start, stop));
+                float elapsed = last_ms;
+                if (wait) {
+                    HIP_CHECK(hipStreamSynchronize(stream));
+                    HIP_CHECK(hipEventElapsedTime(&elapsed, start, stop));
+                } else {
+                    // Published now: everything that reads it (the next job's
+                    // carry, the map write) is queued behind net_done.
+                    HIP_CHECK(hipEventRecord(net_done, stream));
+                }
                 std::lock_guard<std::mutex> lock(mutex);
                 published = next; map_w = frame_w; map_h = frame_h;
                 map_frame[next] = job_frame; ++published_generation;
