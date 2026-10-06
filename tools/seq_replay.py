@@ -95,7 +95,7 @@ class Replay:
                 del self.cache[k]
         return self.cache[i]
 
-    def resolve(self, n, lag, scale, tol=0.3, depth_mode='3x3', fill=False, fill_gate=True):
+    def resolve(self, n, lag, scale, tol=0.3, depth_mode='3x3', fill=False, fill_gate=True, dsample=0.0):
         """The shim's map resolve of frame n with the map of frame n-lag (passthrough input)."""
         proxy, _, _, _ = self.frame(n)
         h, w = proxy.shape[:2]
@@ -121,7 +121,26 @@ class Replay:
                         best = np.minimum(best, np.abs(d - dp) / np.maximum(np.maximum(d, dp), 1e-7))
                 depth_w = np.minimum(depth_w, np.clip((0.25 - best) / 0.15, 0, 1))
         _, d_map, _, mp = self.frame(n - lag)
-        m = bilinear(mp, px, py)
+        if dsample and lag > 0 and d_map is not None and self.frame(n)[1] is not None:
+            # Depth-aware bilinear: each of the four taps weighted by how
+            # close its depth (map frame) is to this pixel's, so a sample on a
+            # silhouette does not mix the occluder's edit with the background's.
+            d_cur = self.frame(n)[1]
+            fx, fy = px - 0.5, py - 0.5
+            x0, y0 = np.floor(fx).astype(int), np.floor(fy).astype(int)
+            tx, ty = fx - x0, fy - y0
+            acc = np.zeros((h, w, 2), np.float32)
+            wsum = np.zeros((h, w), np.float32)
+            for dx, dy, wb in ((0, 0, (1 - tx) * (1 - ty)), (1, 0, tx * (1 - ty)), (0, 1, (1 - tx) * ty), (1, 1, tx * ty)):
+                qx, qy = np.clip(x0 + dx, 0, w - 1), np.clip(y0 + dy, 0, h - 1)
+                dq = d_map[qy, qx]
+                rel = np.abs(dq - d_cur) / np.maximum(np.maximum(dq, d_cur), 1e-7)
+                wt = wb * np.exp(-(rel / dsample) ** 2) + 1e-6 * wb
+                acc += mp[qy, qx] * wt[..., None]
+                wsum += wt
+            m = acc / np.maximum(wsum, 1e-12)[..., None]
+        else:
+            m = bilinear(mp, px, py)
         inside = (px >= 0) & (px <= w) & (py >= 0) & (py <= h)
         filled = np.zeros((h, w), bool)
         self.hidden = np.zeros((h, w), bool)
@@ -192,6 +211,7 @@ def main():
     ap.add_argument('--count', type=int, default=100000)
     ap.add_argument('--depth', default='3x3')
     ap.add_argument('--tol', type=float, default=0.3)
+    ap.add_argument('--dsample', type=float, default=0.0, help='depth-aware map sampling: relative depth scale (0 = plain bilinear)')
     ap.add_argument('--fill', default='off', help='off | gate | nogate: disocclusion fill (luminance gate on filled pixels or not)')
     ap.add_argument('--scale', default='uv', help='uv (vectors x frame size) or px')
     ap.add_argument('--sheet', type=int, default=-1, help='frame index for an image sheet')
@@ -215,7 +235,7 @@ def main():
         moving = np.hypot(mv[..., 0] * scale[0], mv[..., 1] * scale[1]) > 0.5
         moving = neighbourhood(moving.astype(np.float32), lambda s: s.max(0)) > 0
         for L in lags:
-            out = truth if L == 0 else rp.resolve(n, L, scale, a.tol, a.depth, a.fill != 'off', a.fill == 'gate')
+            out = truth if L == 0 else rp.resolve(n, L, scale, a.tol, a.depth, a.fill != 'off', a.fill == 'gate', a.dsample)
             e = np.log2(lum(out) + E) - np.log2(yin + E)
             err = np.abs(e - e_truth)
             st = stats[L]

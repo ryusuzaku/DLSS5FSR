@@ -209,6 +209,12 @@ struct OutputOptions {
     // object from a dim background (a weapon's old edit kept ~30% weight on
     // the road behind it, several swings stacked through the smoothing).
     float rel_sigma = 0.0f, rel_gate = 0.0f;
+    // smooth_depth=1 (S332): the smoothing also rejects the history where this
+    // pixel's depth differs from the previous frame's at the motion-carried
+    // position (passes below 10%, gone at 25%). Luminance alone let a dark
+    // weapon's edit trail over a dark street (tools/seq_replay.py, recorded
+    // sequence). Only with a one-frame-old history and staged depth.
+    int smooth_depth = 0;
     int gain = -1;
 };
 
@@ -297,7 +303,9 @@ __device__ inline float net_delta(const float* linear, const float* color, int x
 __global__ void k_ratio_map(const float* linear, const float* color, const unsigned char* src, int pitch, int bpp,
                             const float2* previous, int previous_valid, OutputOptions o, float2* map,
                             int frame_w, int frame_h, int sw, int sh, int W, const float* tone = nullptr,
-                            const float* depth = nullptr, const float* albedo = nullptr) {
+                            const float* depth = nullptr, const float* albedo = nullptr,
+                            const float* prev_depth = nullptr, const float2* motion = nullptr,
+                            float mx = 0.0f, float my = 0.0f) {
     int i = blockIdx.x*blockDim.x + threadIdx.x;
     if (i >= frame_w*frame_h) return;
     int x = i % frame_w, y = i / frame_w;
@@ -364,6 +372,15 @@ __global__ void k_ratio_map(const float* linear, const float* color, const unsig
         }
         else
             wgt = o.smooth * expf(-fabsf(yin - h.y) / o.sigma);
+        if (depth && prev_depth && motion) {
+            // smooth_depth: was this pixel the same surface a frame ago?
+            const float2 mv = motion[i];
+            const int px = min(max(int(x + 0.5f + mv.x*mx), 0), frame_w-1);
+            const int py = min(max(int(y + 0.5f + mv.y*my), 0), frame_h-1);
+            const float d = depth[i], dp = prev_depth[size_t(py)*frame_w + px];
+            const float rel = fabsf(d - dp) / fmaxf(fmaxf(d, dp), 1e-7f);
+            if (isfinite(rel)) wgt *= fminf(fmaxf((0.25f - rel) / 0.15f, 0.0f), 1.0f);
+        }
         ratio = ratio + (h.x - ratio)*wgt;
     }
     // A non-finite network output anywhere (softmax overflow on an unusual
@@ -893,6 +910,9 @@ struct Engine {
     // re_depth: the newest submitted frame's depth (frame pixels) and the
     // job's copy, taken when the job starts.
     std::unique_ptr<Buffer> depth_next, job_depth;
+    // smooth_depth: the previous job's depth and its frame.
+    std::unique_ptr<Buffer> prev_depth;
+    long long prev_depth_frame = -1;
     int depth_w = 0, depth_h = 0;
     bool depth_fresh = false, job_depth_valid = false;
     // re_albedo: the same for the RR diffuse albedo's luminance.
@@ -924,6 +944,7 @@ struct Engine {
             else if (key == "additive") options.additive = std::stof(value);
             else if (key == "rel_sigma") options.rel_sigma = std::stof(value);
             else if (key == "rel_gate") options.rel_gate = std::stof(value);
+            else if (key == "smooth_depth") options.smooth_depth = std::stoi(value);
             else if (key == "extent" && (value == "compact" || value == "legacy")) options.compact = value == "compact";
             else if (key == "tone") options.tone = std::stof(value);
             else if (key == "encoded") options.encoded = std::stoi(value);
@@ -1362,6 +1383,21 @@ struct Engine {
                 bool previous_valid = published >= 0 && map_w == frame_w && map_h == frame_h;
                 for (auto& m : maps)
                     if (!m || m->count < size_t(frame_w)*frame_h*2) m.reset(new Buffer(size_t(frame_w)*frame_h*2));
+                // smooth_depth: the history is the previous frame's map, both
+                // frames have depth, and this frame's motion is in the ring.
+                const float* prev_d = nullptr;
+                const float2* job_mv = nullptr;
+                float2 ms = make_float2(0.0f, 0.0f);
+                const int mslot = int(job_frame % kRing);
+                if (options.smooth_depth && previous_valid && job_depth_valid && prev_depth &&
+                    prev_depth_frame == job_frame - 1 && map_frame[published] == job_frame - 1 &&
+                    mv_w == frame_w && mv_h == frame_h && ring_frame[mslot] == job_frame) {
+                    ms = motion_scale(frame_w, frame_h);
+                    if (ms.x != 0.0f || ms.y != 0.0f) {
+                        prev_d = prev_depth->data;
+                        job_mv = reinterpret_cast<const float2*>(ring[mslot]->data);
+                    }
+                }
                 hipLaunchKernelGGL(k_ratio_map, dim3((frame_w*frame_h+255)/256), dim3(256), 0, stream,
                                    linear, net->color->data,
                                    reinterpret_cast<const unsigned char*>(raw_input->data), frame_pitch, frame_bpp,
@@ -1371,8 +1407,21 @@ struct Engine {
                                    int(previous_valid), job_options(job_strength), reinterpret_cast<float2*>(maps[next]->data),
                                    frame_w, frame_h, sw, sh, W, tone,
                                    job_depth_valid ? job_depth->data : nullptr,
-                                   job_albedo_valid ? job_albedo->data : nullptr);
+                                   job_albedo_valid ? job_albedo->data : nullptr,
+                                   job_mv ? prev_d : nullptr, job_mv, ms.x, ms.y);
                 HIP_CHECK(hipGetLastError());
+                if (options.smooth_depth) {
+                    // Keep this job's depth for the next one (same stream, in order).
+                    if (job_depth_valid) {
+                        if (!prev_depth || prev_depth->count < size_t(frame_w)*frame_h)
+                            prev_depth.reset(new Buffer(size_t(frame_w)*frame_h));
+                        HIP_CHECK(hipMemcpyAsync(prev_depth->data, job_depth->data, size_t(frame_w)*frame_h*sizeof(float),
+                                                 hipMemcpyDeviceToDevice, stream));
+                        prev_depth_frame = job_frame;
+                    } else {
+                        prev_depth_frame = -1;
+                    }
+                }
                 float elapsed = last_ms;
                 if (wait) {
                     HIP_CHECK(hipStreamSynchronize(stream));
