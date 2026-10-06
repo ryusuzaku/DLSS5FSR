@@ -217,7 +217,9 @@ NVSDK_NGX_Result DoEvaluateD3D12(ID3D12GraphicsCommandList* cl,
     // refreshes. Inside, the frame counter proves the previous list
     // executed -- it never blocks on the game and degrades to the identity
     // model when the proof is missing.
-    GpuPrepareHipModel(n, c);
+    // S332 SyncMode: the previous frame's map through GPU fences instead.
+    if (c.syncMode && GpuSyncActive()) GpuSyncPrepare(c);
+    else GpuPrepareHipModel(n, c);
 
     if (!GpuBlit(cl, color, colorRect, output, outRect)) {
         LOGE("evaluate: resample failed");
@@ -301,6 +303,7 @@ NVSDK_NGX_Result DoEvaluateD3D12(ID3D12GraphicsCommandList* cl,
     // The frame counter goes LAST: the next evaluate trusts that seeing this
     // value means every shim op above -- including the resolve -- executed.
     if (c.nrPasses && c.hipBackend && !Gpu().hipStagingBusy) GpuWriteFrameCounter(cl, n);
+    if (c.nrPasses && c.hipBackend) GpuSyncAfterEvaluate(cl, c);
 
     GpuDrainDumps(n, false);
 

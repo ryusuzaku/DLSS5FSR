@@ -203,6 +203,14 @@ struct Config {
     // 1: run the whole frame at its padded network extent and write it back
     // at full size; 0: the 256x256 centre-crop preview.
     bool residentEngineFull = false;
+    // S332: SyncMode=1 -- the synchronous path. The game's queue signals a
+    // fence after each list with our evaluate; the engine waits for it on the
+    // GPU, runs the network on that frame and signals a second fence; the next
+    // frame's list waits for that one on the GPU. The map is one frame old
+    // (the asynchronous path's is 4-7) at the cost of the network's time in
+    // the frame. Needs the game's ExecuteCommandLists (vtable hook); falls
+    // back to the asynchronous path when the hook never sees our lists.
+    bool syncMode = false;
     // Luma engines: hand the resolve the engine's ratio map (carried along this
     // frame's motion and gated on its luminance there) instead of a frame
     // composed on the older frame the engine saw. 0 restores the composed frame.
@@ -694,7 +702,19 @@ void HipSetReadSlot(unsigned int slot);
 void HipSetOutSlot(unsigned int slot);
 unsigned int HipStagingSlots();
 bool HipCandidateInputCapture();  // one-shot or triggered-repeat staged-proxy capture
-bool HipSequenceCapture(unsigned long long counter);  // "<capture path>.seq": consecutive frames + motion
+bool HipSequenceCapture(unsigned long long counter);
+// S332 synchronous path (SyncMode=1): the two shared fences as HIP external
+// semaphores, one engine job per frame (staging slot frame % slots, output
+// slot the same), the engine's map parameters.
+bool HipSyncImport(HANDLE staged, HANDLE result);
+void HipSyncRelease();  // destroys the imported semaphores (before HipShutdown)
+int HipSyncSubmit(unsigned long long frame, unsigned long long waitValue, unsigned long long signalValue);
+bool HipSyncMapParams(float params[4]);
+// gpu.cpp: the synchronous path around an evaluate.
+bool GpuSyncActive();                        // SyncMode and the hook proven
+bool GpuSyncPrepare(const Config& cfg);      // instead of GpuPrepareHipModel
+void GpuSyncBeforeStaging(unsigned int w, unsigned int h, DXGI_FORMAT fmt);
+void GpuSyncAfterEvaluate(ID3D12GraphicsCommandList* cl, const Config& cfg);  // "<capture path>.seq": consecutive frames + motion
 UINT64 HipStagingRowPitch();
 UINT64 HipStagingBytes();
 ID3D12Resource* HipStagingIn();

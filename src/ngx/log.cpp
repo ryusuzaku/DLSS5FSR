@@ -182,6 +182,7 @@ void ConfigLoad(const std::wstring& dir) {
             else if (key == L"ResidentEngineGain") c.residentEngineGain = std::stoi(val);
             else if (key == L"ResidentEngineInterval") c.residentEngineInterval = std::stoi(val);
             else if (key == L"ResidentEngineFull") c.residentEngineFull = (std::stoi(val) != 0);
+            else if (key == L"SyncMode") c.syncMode = (std::stoi(val) != 0);
             else if (key == L"ResidentEngineMap") c.residentEngineMap = (std::stoi(val) != 0);
             else if (key == L"WhitePoint")       c.whitePoint = std::stof(val);
             else if (key == L"ProxyMode")        c.proxyMode = std::stoi(val);
@@ -233,6 +234,8 @@ void ConfigLoad(const std::wstring& dir) {
              c.residentEngineDll.c_str(), c.residentEngineConfig.c_str(),
              c.residentEngineGain ? "public" : "native", c.residentEngineInterval,
              c.residentEngineFull ? "full frame" : "256 centre crop", c.debugView);
+    if (c.syncMode)
+        LOGI("config: SyncMode=1 (one-frame map through GPU fences; needs ResidentEngineFull and a luma engine)");
     if (!c.candidateInputGpuPath.empty())
         LOGI("config: same-frame candidate GPU input tensor at %ls (requires capture path)",
              c.candidateInputGpuPath.c_str());

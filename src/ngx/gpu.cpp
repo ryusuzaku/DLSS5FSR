@@ -1,7 +1,10 @@
 #include "ngx_internal.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <mutex>
+#include <thread>
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -409,9 +412,14 @@ bool GpuInit(ID3D12Device* dev) {
     return true;
 }
 
+static void GpuSyncShutdown();
+
 void GpuShutdown() {
     GpuContext& g = Gpu();
     if (!g.valid) return;
+    // The engine jobs of the synchronous path wait for fences only the game's
+    // queue signals: release and finish them before HIP goes.
+    GpuSyncShutdown();
     // HIP first: its imports and stream must be dropped while the D3D12
     // resources they reference are still alive.
     HipShutdown();
@@ -746,6 +754,7 @@ bool GpuNeuralChain(ID3D12GraphicsCommandList* cl, ID3D12Resource* output,
     // rewritten; the motion pass below still runs for this frame's resolve.
     const bool busy = g.hipStagingBusy;
     if (cfg.hipBackend && HipStartup()) {
+        if (!busy) GpuSyncBeforeStaging(outRect.w, outRect.h, fmt);
         staged = busy ? (g.hipW == outRect.w && g.hipH == outRect.h && g.hipFmt == fmt)
                       : HipEnsureStaging(outRect.w, outRect.h, BytesPerPixel(fmt));
         if (staged && !busy) {
@@ -1548,6 +1557,291 @@ bool GpuPrepareHipModel(uint64_t n, const Config& cfg) {
     }
     PrepTimes().report();
     return true;
+}
+
+// ------------------------------------------------- synchronous path (S332) --
+// The asynchronous path applies a map 4-7 frames old; on a recorded sequence
+// (tools/seq_replay.py) half the effect fell out of place whenever the camera
+// moved. Here the map is one frame old: the game's queue signals `staged`
+// (value frame+1) after the list with our evaluate executed, the engine
+// waits for it on the GPU, runs the network on that frame's staging and
+// signals `result` (frame+1); the next list waits for `result` on the GPU
+// before it runs. Only that list waits: the rest of the frame overlaps the
+// network. ExecuteCommandLists is reached through a vtable hook, which only
+// acts on lists we registered. A watchdog releases both fences from the CPU
+// and switches the path off if the game's queue waits for more than two
+// seconds, so a mistake here costs the effect, never a hung game.
+namespace {
+
+struct SyncEntry { uint64_t wait = 0, signal = 0; };
+
+struct SyncState {
+    std::mutex mutex;
+    std::vector<std::pair<ID3D12CommandList*, SyncEntry>> lists;  // registered, not yet submitted
+    ComPtr<ID3D12Fence> staged, result;
+    ID3D12Device* device = nullptr;
+    uint64_t frame = 0;          // evaluates since start (fence values are frame + 1)
+    long long accepted = -1;     // newest frame whose engine job will signal `result`
+    uint64_t pendingWait = 0;    // `result` value this evaluate's list waits for
+    uint64_t registered = 0;     // highest `staged` value registered
+    uint64_t hooked = 0;         // registered lists the hook has seen
+    uint64_t queuedWait = 0;     // highest `result` value a queue was made to wait for
+    ULONGLONG queuedWaitAt = 0;
+    void** vtable = nullptr;
+    bool installed = false, ready = false, disabled = false;
+    std::thread watchdog;
+    std::atomic<bool> stop{false};
+    uint64_t waits = 0, skipped = 0;
+};
+
+SyncState& Sync() {
+    static SyncState s;
+    return s;
+}
+
+using ExecuteFn = void (STDMETHODCALLTYPE*)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*);
+ExecuteFn g_realExecute = nullptr;
+
+void STDMETHODCALLTYPE SyncExecute(ID3D12CommandQueue* q, UINT count, ID3D12CommandList* const* lists) {
+    SyncState& s = Sync();
+    uint64_t wait = 0, signal = 0;
+    bool disabled = true;
+    {
+        std::lock_guard<std::mutex> lock(s.mutex);
+        for (UINT i = 0; i < count && !s.lists.empty(); ++i) {
+            for (size_t k = 0; k < s.lists.size(); ++k) {
+                if (s.lists[k].first != lists[i]) continue;
+                wait = std::max(wait, s.lists[k].second.wait);
+                signal = std::max(signal, s.lists[k].second.signal);
+                s.lists.erase(s.lists.begin() + (ptrdiff_t)k);
+                ++s.hooked;
+                break;
+            }
+        }
+        disabled = s.disabled;
+        if (wait && !disabled && wait > s.queuedWait) {
+            s.queuedWait = wait;
+            s.queuedWaitAt = GetTickCount64();
+        }
+    }
+    if (wait && !disabled) q->Wait(s.result.Get(), wait);
+    g_realExecute(q, count, lists);
+    // Signalled even when disabled: an engine job may still wait for it.
+    if (signal) q->Signal(s.staged.Get(), signal);
+}
+
+void SyncWatchdog() {
+    SyncState& s = Sync();
+    while (!s.stop.load()) {
+        Sleep(20);
+        std::lock_guard<std::mutex> lock(s.mutex);
+        if (s.disabled || !s.queuedWait || !s.result) continue;
+        if (s.result->GetCompletedValue() >= s.queuedWait) continue;
+        if (GetTickCount64() - s.queuedWaitAt < 2000) continue;
+        s.disabled = true;
+        s.result->Signal(s.queuedWait);
+        if (s.registered) s.staged->Signal(s.registered);
+        LOGE("nr: sync: the game's queue waited over 2 s for the engine (result %llu, want %llu);"
+             " released both fences, synchronous path off",
+             (unsigned long long)s.result->GetCompletedValue(), (unsigned long long)s.queuedWait);
+    }
+}
+
+// Releases every engine job (also those waiting for lists not yet executed:
+// their staging may be half written, so their results are dropped) and
+// waits for the last one. On a resize and at shutdown, before the staging
+// is re-laid out or the engine destroyed.
+void SyncDrain(const char* why) {
+    SyncState& s = Sync();
+    if (!s.staged || s.accepted < 0) return;
+    {
+        std::lock_guard<std::mutex> lock(s.mutex);
+        if (s.registered) s.staged->Signal(s.registered);
+    }
+    const uint64_t want = (uint64_t)s.accepted + 1;
+    HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    bool done = s.result->GetCompletedValue() >= want;
+    if (!done && ev && SUCCEEDED(s.result->SetEventOnCompletion(want, ev)))
+        done = WaitForSingleObject(ev, 3000) == WAIT_OBJECT_0;
+    if (ev) CloseHandle(ev);
+    if (!done) {
+        std::lock_guard<std::mutex> lock(s.mutex);
+        s.disabled = true;
+        s.result->Signal(want);
+        LOGE("nr: sync: the engine did not finish within 3 s (%s); synchronous path off", why);
+    }
+    s.accepted = -1;
+    s.pendingWait = 0;
+}
+
+}  // namespace
+
+static void GpuSyncInit(GpuContext& g) {
+    SyncState& s = Sync();
+    if (s.installed || s.disabled) return;
+    if (!s.staged || s.device != g.device.Get()) {
+        HANDLE hs = nullptr, hr = nullptr;
+        if (FAILED(g.device->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&s.staged))) ||
+            FAILED(g.device->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&s.result))) ||
+            FAILED(g.device->CreateSharedHandle(s.staged.Get(), nullptr, GENERIC_ALL, nullptr, &hs)) ||
+            FAILED(g.device->CreateSharedHandle(s.result.Get(), nullptr, GENERIC_ALL, nullptr, &hr)) ||
+            !HipStartup() || !HipSyncImport(hs, hr)) {
+            if (hs) CloseHandle(hs);
+            if (hr) CloseHandle(hr);
+            s.staged.Reset(); s.result.Reset();
+            s.disabled = true;
+            LOGE("nr: sync: shared fences unavailable; asynchronous path");
+            return;
+        }
+        CloseHandle(hs); CloseHandle(hr);
+        s.device = g.device.Get();
+        s.frame = 0; s.registered = 0; s.accepted = -1; s.queuedWait = 0;
+    }
+    // ID3D12CommandQueue::ExecuteCommandLists is vtable slot 10 (IUnknown 3,
+    // ID3D12Object 4, ID3D12DeviceChild 1, UpdateTileMappings, CopyTileMappings).
+    // Every queue of this device shares the vtable; the hook only acts on
+    // lists registered below.
+    void** vt = *reinterpret_cast<void***>(g.queue.Get());
+    DWORD old = 0;
+    if (!VirtualProtect(&vt[10], sizeof(void*), PAGE_EXECUTE_READWRITE, &old)) {
+        s.disabled = true;
+        LOGE("nr: sync: cannot hook ExecuteCommandLists; asynchronous path");
+        return;
+    }
+    if (vt[10] != (void*)&SyncExecute) {
+        g_realExecute = (ExecuteFn)vt[10];
+        vt[10] = (void*)&SyncExecute;
+    }
+    VirtualProtect(&vt[10], sizeof(void*), old, &old);
+    s.vtable = vt;
+    s.installed = true;
+    s.stop = false;
+    s.watchdog = std::thread(SyncWatchdog);
+    LOGI("nr: sync: ExecuteCommandLists hooked; waiting to see our lists submitted");
+}
+
+static void GpuSyncShutdown() {
+    SyncState& s = Sync();
+    if (!s.installed) return;
+    SyncDrain("shutdown");
+    s.stop = true;
+    if (s.watchdog.joinable()) s.watchdog.join();
+    {
+        std::lock_guard<std::mutex> lock(s.mutex);
+        s.lists.clear();
+        if (s.registered && s.staged) s.staged->Signal(s.registered);
+    }
+    // Restore the slot if it is still ours (another hook may sit on top).
+    DWORD old = 0;
+    if (s.vtable && s.vtable[10] == (void*)&SyncExecute &&
+        VirtualProtect(&s.vtable[10], sizeof(void*), PAGE_EXECUTE_READWRITE, &old)) {
+        s.vtable[10] = (void*)g_realExecute;
+        VirtualProtect(&s.vtable[10], sizeof(void*), old, &old);
+    }
+    s.installed = false;
+    s.ready = false;
+    s.hooked = 0;
+    // The engine is idle (drained): drop the semaphores and fences; the next
+    // initialisation makes new ones.
+    HipSyncRelease();
+    s.staged.Reset();
+    s.result.Reset();
+    s.device = nullptr;
+}
+
+bool GpuSyncActive() {
+    SyncState& s = Sync();
+    return s.installed && s.ready && !s.disabled;
+}
+
+// Instead of GpuPrepareHipModel: publish the newest engine job (normally the
+// previous frame's) for this evaluate's resolve; its list waits for it.
+bool GpuSyncPrepare(const Config& cfg) {
+    GpuContext& g = Gpu();
+    SyncState& s = Sync();
+    const uint64_t frame = s.frame;
+    g.hipEvaluate = frame;
+    g.hipWriteSlot = (unsigned int)(frame % HipStagingSlots());
+    g.hipStagingBusy = false;  // the fences order every staging write after its reader
+    s.pendingWait = 0;
+    if (!cfg.hipBackend || !HipStartup()) return false;
+    if (s.accepted < 0) return true;
+    PendingHipResult job;
+    job.active = true;
+    job.stagingFrame = (uint64_t)s.accepted;
+    job.outSlot = (unsigned int)(job.stagingFrame % HipStagingSlots());
+    job.session = HipSession();
+    job.mapMode = HipSyncMapParams(job.mapParams);
+    s.pendingWait = job.stagingFrame + 1;
+    if (job.mapMode) PublishHipModel(g, frame, job);
+    static unsigned long long published = 0;
+    if (job.mapMode && (published++ % 600) == 0)
+        LOGI("nr: sync: frame %llu resolves the map of frame %llu (lag %llu)", (unsigned long long)frame,
+             (unsigned long long)job.stagingFrame, (unsigned long long)(frame - job.stagingFrame));
+    return true;
+}
+
+// Before the chain re-lays out the staging for a new size.
+void GpuSyncBeforeStaging(unsigned int w, unsigned int h, DXGI_FORMAT fmt) {
+    GpuContext& g = Gpu();
+    SyncState& s = Sync();
+    if (!s.installed || s.accepted < 0 || !g.hipW) return;
+    if (g.hipW == w && g.hipH == h && g.hipFmt == fmt) return;
+    SyncDrain("resize");
+    // The result published for this evaluate sits in the old layout.
+    g.publishCopy.active = false;
+    g.hipFrameReady = false;
+}
+
+// After everything is recorded: register the list (its submission signals
+// `staged`, after waiting for the published result) and queue the engine
+// job for this frame. Also runs before the path is proven, to prove it.
+void GpuSyncAfterEvaluate(ID3D12GraphicsCommandList* cl, const Config& cfg) {
+    GpuContext& g = Gpu();
+    SyncState& s = Sync();
+    if (!cfg.syncMode || cfg.residentEngineConfig.empty() || !cfg.residentEngineFull) return;
+    if (!s.installed && !s.disabled && g.valid) GpuSyncInit(g);
+    if (!s.installed) return;
+    const uint64_t frame = s.frame++;
+    const bool active = s.ready && !s.disabled;
+    {
+        std::lock_guard<std::mutex> lock(s.mutex);
+        // A list we registered but the hook never saw (the game recorded the
+        // evaluate into a list it dropped, or submits through a queue object
+        // the hook does not reach) must not pile up.
+        if (s.lists.size() > 16) s.lists.erase(s.lists.begin());
+        SyncEntry e;
+        e.wait = active ? s.pendingWait : 0;
+        e.signal = frame + 1;
+        s.lists.emplace_back(static_cast<ID3D12CommandList*>(cl), e);
+        s.registered = frame + 1;
+        if (!s.ready && s.hooked >= 30) {
+            s.ready = true;
+            LOGI("nr: sync: the hook saw %llu of our lists submitted; synchronous path on",
+                 (unsigned long long)s.hooked);
+        }
+    }
+    if (!s.ready && frame == 600 && !s.hooked) {
+        s.disabled = true;
+        LOGW("nr: sync: the hook never saw our lists submitted (600 evaluates); asynchronous path");
+        return;
+    }
+    if (!active) return;
+    const int r = HipSyncSubmit(frame, frame + 1, frame + 1);
+    if (r == 1) {
+        s.accepted = (long long)frame;
+    } else {
+        ++s.skipped;
+        if (r < 0) {
+            std::lock_guard<std::mutex> lock(s.mutex);
+            s.disabled = true;
+            LOGE("nr: sync: engine job failed; synchronous path off");
+        }
+    }
+    if ((frame % 600) == 0)
+        LOGI("nr: sync: frame %llu, newest job %lld, result %llu, staged %llu, jobs skipped %llu",
+             (unsigned long long)frame, s.accepted, (unsigned long long)s.result->GetCompletedValue(),
+             (unsigned long long)s.staged->GetCompletedValue(), (unsigned long long)s.skipped);
 }
 
 // ------------------------------------------------------------------ dumps --

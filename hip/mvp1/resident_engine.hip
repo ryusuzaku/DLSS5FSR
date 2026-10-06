@@ -783,6 +783,21 @@ struct Network {
     }
 };
 
+// re_sync_submit (S332): one frame for the synchronous path. The worker
+// queues everything on the device in order: wait for wait_sem >= wait_value
+// (the caller's queue signals it once the frame's staging is written), copy
+// motion, depth and colour, run the network, write the map (k_map_out,
+// RGBA16F ratio / Y_in) into out, then signal signal_sem = signal_value --
+// always, also after a failure, because the caller's queue waits on it.
+struct ReSyncJob {
+    const void* staging; int w, h, pitch, bpp, gain;
+    const void* motion; int motion_pitch;   // may be null
+    const void* depth; int depth_pitch;     // may be null
+    void* wait_sem; unsigned long long wait_value;      // hipExternalSemaphore_t
+    void* out; unsigned long long out_pitch;
+    void* signal_sem; unsigned long long signal_value;  // hipExternalSemaphore_t
+};
+
 struct Engine {
     std::vector<std::string> config;
     hipStream_t stream = nullptr;
@@ -806,6 +821,11 @@ struct Engine {
     std::condition_variable wake;
     std::thread worker;
     bool quit = false, pending = false, busy = false, failed = false;
+    // re_sync_submit: one queued synchronous job; sync_inline lets the worker
+    // reuse submit() for it without the asynchronous bookkeeping.
+    bool sync_pending = false, sync_inline = false;
+    ReSyncJob sync_job{};
+    unsigned long long sync_done = 0, sync_failed = 0;
     bool fresh_crop = false, fresh_frame = false;
     bool job_crop = true;
     int job_gain = 0;
@@ -1076,8 +1096,8 @@ struct Engine {
             cur_w = w; cur_h = h; cur_pitch = pitch; cur_bpp = bpp;
             ++frame_counter;
         }
-        if (busy || pending) return 0;
-        if (!crop && options.luma && options.interval > 1 && job_frame >= 0 &&
+        if (!sync_inline && (busy || pending)) return 0;
+        if (!sync_inline && !crop && options.luma && options.interval > 1 && job_frame >= 0 &&
             frame_counter - 1 - job_frame < options.interval) return 0;
         job_frame = frame_counter - 1;
         try {
@@ -1121,6 +1141,7 @@ struct Engine {
         }
         frame_w = w; frame_h = h; frame_pitch = pitch; frame_bpp = bpp;
         job_crop = crop; job_gain = gain ? 1 : 0;
+        if (sync_inline) return 1;  // the worker runs it right away
         pending = true;
         wake.notify_all();
         return 1;
@@ -1128,21 +1149,83 @@ struct Engine {
 
     void loop() {
         for (;;) {
+            bool sync = false;
+            ReSyncJob job{};
             {
                 std::unique_lock<std::mutex> lock(mutex);
-                wake.wait(lock, [this] { return quit || pending; });
+                wake.wait(lock, [this] { return quit || pending || sync_pending; });
                 if (quit) return;
-                pending = false; busy = true;
+                if (sync_pending) {
+                    sync = true; job = sync_job; sync_pending = false;
+                } else {
+                    pending = false;
+                }
+                busy = true;
             }
-            try {
-                run();
-            } catch (const std::exception& e) {
-                std::lock_guard<std::mutex> lock(mutex);
-                failed = true; error = e.what();
+            if (sync) {
+                run_sync(job);
+            } else {
+                try {
+                    run();
+                } catch (const std::exception& e) {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    failed = true; error = e.what();
+                }
             }
             std::lock_guard<std::mutex> lock(mutex);
             busy = false;
         }
+    }
+
+    // Worker thread: one re_sync_submit job, start to finish. The caller's
+    // queue waits for the signal at the end, so it is sent whatever happens.
+    // Everything that may synchronize the device (allocations, a network
+    // rebuild after a resize) runs here, after the previous job's signal and
+    // behind only this job's own wait, which the caller's queue satisfies.
+    void run_sync(const ReSyncJob& j) {
+        bool ok = false;
+        try {
+            hipExternalSemaphore_t wait = reinterpret_cast<hipExternalSemaphore_t>(j.wait_sem);
+            hipExternalSemaphoreWaitParams wp{};
+            wp.params.fence.value = j.wait_value;
+            HIP_CHECK(hipWaitExternalSemaphoresAsync(&wait, &wp, 1, compose_stream));
+            if (j.motion && motion(j.motion, j.w, j.h, j.motion_pitch) < 0) throw std::runtime_error(error);
+            if (j.depth && depth(j.depth, j.w, j.h, j.depth_pitch) < 0) throw std::runtime_error(error);
+            sync_inline = true;
+            const int r = submit(j.staging, j.w, j.h, j.pitch, j.bpp, false, j.gain);
+            sync_inline = false;
+            if (r != 1) throw std::runtime_error(r < 0 ? error : std::string("sync job not accepted"));
+            run();
+            if (compose_map_async(j.out, size_t(j.out_pitch), j.w, j.h, nullptr) != 1)
+                throw std::runtime_error("sync job: map compose failed");
+            ok = true;
+        } catch (const std::exception& e) {
+            sync_inline = false;
+            std::lock_guard<std::mutex> lock(mutex);
+            error = e.what();
+            ++sync_failed;
+        }
+        hipExternalSemaphore_t sig = reinterpret_cast<hipExternalSemaphore_t>(j.signal_sem);
+        hipExternalSemaphoreSignalParams sp{};
+        sp.params.fence.value = j.signal_value;
+        const hipError_t e = hipSignalExternalSemaphoresAsync(&sig, &sp, 1, compose_stream);
+        std::lock_guard<std::mutex> lock(mutex);
+        if (e != hipSuccess) { failed = true; error = "sync job: signal failed"; }
+        if (ok) ++sync_done;
+    }
+
+    int sync_submit(const ReSyncJob& j) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (failed) return -1;
+        if (!options.luma || !j.staging || !j.out || !j.wait_sem || !j.signal_sem || j.bpp != 8) {
+            error = "sync job needs luma mode, RGBA16F staging and both semaphores";
+            return -1;
+        }
+        if (sync_pending) return 0;  // one queued at a time: the caller keeps its last result
+        sync_job = j;
+        sync_pending = true;
+        wake.notify_all();
+        return 1;
     }
 
     void run() {
@@ -1726,6 +1809,25 @@ __declspec(dllexport) int re_compose_map_device(void* dst, unsigned long long pi
 // 0 nothing yet (nothing queued), -1 error. dst may only be read, and the
 // buffers handed to re_submit_full/re_motion/re_depth/re_albedo since the
 // last ready poll may only be rewritten, once re_compose_ready says 1.
+// Synchronous path (S332): queue one frame (ReSyncJob above). 1 accepted --
+// signal_value will be signalled, also if the job fails; 0 a job is still
+// queued (nothing will be signalled for this one); -1 error.
+__declspec(dllexport) int re_sync_submit(const ReSyncJob* job) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!g_engine || !job) return -1;
+    return g_engine->sync_submit(*job);
+}
+
+// Synchronous jobs finished and failed so far (failed ones still signalled).
+__declspec(dllexport) int re_sync_stats(unsigned long long* done, unsigned long long* failed) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!g_engine) return -1;
+    std::lock_guard<std::mutex> inner(g_engine->mutex);
+    if (done) *done = g_engine->sync_done;
+    if (failed) *failed = g_engine->sync_failed;
+    return 1;
+}
+
 __declspec(dllexport) int re_compose_map_async(void* dst, unsigned long long pitch, int width, int height,
                                                float* device_ms) {
     std::lock_guard<std::mutex> lock(g_mutex);

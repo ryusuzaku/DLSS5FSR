@@ -67,6 +67,11 @@ struct State {
     hipError_t (*ExternalMemoryGetMappedBuffer)(
         void**, hipExternalMemory_t, const hipExternalMemoryBufferDesc*) = nullptr;
     hipError_t (*DestroyExternalMemory)(hipExternalMemory_t) = nullptr;
+    // S332 synchronous path (optional exports, looked up on first use).
+    hipError_t (*ImportExternalSemaphore)(hipExternalSemaphore_t*, const hipExternalSemaphoreHandleDesc*) = nullptr;
+    hipError_t (*DestroyExternalSemaphore)(hipExternalSemaphore_t) = nullptr;
+    hipExternalSemaphore_t semStaged = nullptr, semResult = nullptr;
+    int (*EngineSyncSubmit)(const void*) = nullptr;
     hipError_t (*Malloc)(void**, size_t) = nullptr;
     hipError_t (*Free)(void*) = nullptr;
     hipError_t (*Memcpy)(void*, const void*, size_t, hipMemcpyKind) = nullptr;
@@ -1089,6 +1094,101 @@ bool SequenceCapture(unsigned long long counter) {
         LOGI("hip: sequence capture finished at frame %llu", counter);
     }
     return true;
+}
+
+// ------------------------------------------------ synchronous path (S332) --
+// Must match ReSyncJob in hip/mvp1/resident_engine.hip.
+struct ReSyncJob {
+    const void* staging; int w, h, pitch, bpp, gain;
+    const void* motion; int motion_pitch;
+    const void* depth; int depth_pitch;
+    void* wait_sem; unsigned long long wait_value;
+    void* out; unsigned long long out_pitch;
+    void* signal_sem; unsigned long long signal_value;
+};
+
+bool SyncImport(HANDLE staged, HANDLE result) {
+    State& s = S();
+    if (!s.hipDll) return false;
+    if (!s.ImportExternalSemaphore)
+        s.ImportExternalSemaphore = (decltype(s.ImportExternalSemaphore))GetProcAddress(s.hipDll, "hipImportExternalSemaphore");
+    if (!s.ImportExternalSemaphore) {
+        LOGE("hip: hipImportExternalSemaphore missing; no synchronous path");
+        return false;
+    }
+    auto import = [&](HANDLE h, hipExternalSemaphore_t& sem) {
+        hipExternalSemaphoreHandleDesc d{};
+        d.type = hipExternalSemaphoreHandleTypeD3D12Fence;
+        d.handle.win32.handle = h;
+        return s.ImportExternalSemaphore(&sem, &d) == hipSuccess && sem;
+    };
+    if (!import(staged, s.semStaged) || !import(result, s.semResult)) {
+        LOGE("hip: importing the sync fences failed");
+        s.semStaged = s.semResult = nullptr;
+        return false;
+    }
+    return true;
+}
+
+void SyncRelease() {
+    State& s = S();
+    if (!s.DestroyExternalSemaphore && s.hipDll)
+        s.DestroyExternalSemaphore = (decltype(s.DestroyExternalSemaphore))GetProcAddress(s.hipDll, "hipDestroyExternalSemaphore");
+    if (s.DestroyExternalSemaphore) {
+        if (s.semStaged) s.DestroyExternalSemaphore(s.semStaged);
+        if (s.semResult) s.DestroyExternalSemaphore(s.semResult);
+    }
+    s.semStaged = s.semResult = nullptr;
+}
+
+static bool EngineReady();
+
+int SyncSubmit(unsigned long long frame, unsigned long long waitValue, unsigned long long signalValue) {
+    State& s = S();
+    const Config& cfg = Cfg();
+    if (!s.usable || !s.semStaged || !s.semResult || !s.ptrInBase || !s.ptrOutBase || s.bpp != 8 ||
+        !cfg.residentEngineFull || !EngineReady())
+        return -1;
+    if (!s.EngineSyncSubmit) {
+        s.EngineSyncSubmit = (int (*)(const void*))GetProcAddress(s.engineDll, "re_sync_submit");
+        if (!s.EngineSyncSubmit) {
+            LOGE("hip: the resident engine has no re_sync_submit (S332 or later needed)");
+            return -1;
+        }
+    }
+    if (s.EngineControls) {
+        const NrControls& c = NrControlValues();
+        if (c.generation && c.generation != s.engineControlsGeneration) {
+            const float v[6] = {c.intensity, c.style, c.structure, c.tone, c.skin, c.mask};
+            const int used = s.EngineControls(v, 6);
+            if (used >= 0 && !s.engineControlsGeneration)
+                LOGI("hip: resident engine %s the caller's NR controls", used ? "follows" : "ignores (external_controls=0)");
+            s.engineControlsGeneration = c.generation;
+        }
+    }
+    const size_t slot = (size_t)(frame % kStagingSlots);
+    ReSyncJob j{};
+    j.staging = (const unsigned char*)s.ptrInBase + slot * s.inStride;
+    j.w = (int)s.w; j.h = (int)s.h; j.pitch = (int)s.pitch; j.bpp = (int)s.bpp; j.gain = cfg.residentEngineGain;
+    const unsigned char* mv = s.ptrMvBase ? (const unsigned char*)s.ptrMvBase + slot * s.mvStride : nullptr;
+    if (mv && s.motionStaged && s.mvPitch) { j.motion = mv; j.motion_pitch = (int)s.mvPitch; }
+    if (mv && s.depthStaged && s.depthPitch) { j.depth = mv + s.depthOffset; j.depth_pitch = (int)s.depthPitch; }
+    j.wait_sem = s.semStaged; j.wait_value = waitValue;
+    j.out = (unsigned char*)s.ptrOutBase + slot * s.inStride; j.out_pitch = s.pitch;
+    j.signal_sem = s.semResult; j.signal_value = signalValue;
+    const int r = s.EngineSyncSubmit(&j);
+    if (r < 0) {
+        LOGE("hip: resident engine rejected a sync job: %s", s.EngineError());
+        s.engineState = -1;
+    } else if (r == 1) {
+        ++s.engineSubmits;
+    }
+    return r;
+}
+
+bool SyncMapParams(float params[4]) {
+    State& s = S();
+    return s.EngineMapParams && s.EngineMapParams(params) == 1 && params[3] > 0.0f;
 }
 
 // Load and create the resident engine once; any failure disables it for the
@@ -11317,6 +11417,12 @@ unsigned int HipStagingSlots() { return hipb::kStagingSlots; }
 bool HipResidentEngineSubmit() { return hipb::ResidentEngineSubmit(); }
 bool HipCandidateInputCapture() { return hipb::CandidateInputCapture(); }
 bool HipSequenceCapture(unsigned long long counter) { return hipb::SequenceCapture(counter); }
+bool HipSyncImport(HANDLE staged, HANDLE result) { return hipb::SyncImport(staged, result); }
+void HipSyncRelease() { hipb::SyncRelease(); }
+int HipSyncSubmit(unsigned long long frame, unsigned long long waitValue, unsigned long long signalValue) {
+    return hipb::SyncSubmit(frame, waitValue, signalValue);
+}
+bool HipSyncMapParams(float params[4]) { return hipb::SyncMapParams(params); }
 UINT64 HipStagingRowPitch() { return hipb::StagingRowPitch(); }
 UINT64 HipStagingBytes() { return hipb::StagingBytes(); }
 ID3D12Resource* HipStagingIn() { return hipb::StagingIn(); }

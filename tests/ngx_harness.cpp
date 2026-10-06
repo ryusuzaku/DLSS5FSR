@@ -555,6 +555,7 @@ struct IniValues {
     std::string residentEngineConfig;
     int residentEngineGain = 0;
     int residentEngineFull = 0;
+    int syncMode = 0;
     int harnessFrameSleepMs = 0;  // harness-only: lets asynchronous work land
     // S231 step 3: the default is the SHIPPED reading (2, our map), so a green run
     // means the path the game runs is right. Only the c256f2 check consults this --
@@ -608,7 +609,8 @@ static bool WriteIni(const std::string& dir, const IniValues& v) {
             "ResidentEngineGain=%d\n"
             "ResidentEngineFull=%d\n"
             "HipFfnTranspose=%d\n"
-            "DumpField=%d\n",
+            "DumpField=%d\n"
+            "SyncMode=%d\n",
             v.nrPasses, v.hipBackend, v.hipWeightsDir.c_str(),
             v.hipRocwmmaInc.c_str(), v.hipRocInc.c_str(), v.hipFeBlock,
             v.hipFeWindX, v.hipFeWindY,
@@ -623,7 +625,7 @@ static bool WriteIni(const std::string& dir, const IniValues& v) {
             v.candidateInputGpuPath.c_str(),
             v.residentEngineDll.c_str(), v.residentEngineConfig.c_str(), v.residentEngineGain,
             v.residentEngineFull,
-            v.hipFfnTranspose, v.dumpField);
+            v.hipFfnTranspose, v.dumpField, v.syncMode);
     fclose(f);
     return true;
 }
@@ -1532,6 +1534,8 @@ int main(int argc, char** argv) {
         const char* fullEnv = getenv("DLSS5_RESIDENT_ENGINE_FULL");
         engineFull = fullEnv && *fullEnv == '1';
         engine.residentEngineFull = engineFull ? 1 : 0;
+        // DLSS5_SYNC=1: the synchronous path (SyncMode=1, S332).
+        engine.syncMode = EnvInt("DLSS5_SYNC", 0);
         engine.residentEngineGain = engineFull ? 1 : 0;  // public gain: a visible change
         engine.harnessFrameSleepMs = engineFull ? 40 : 25;
         // A constant motion field of (2.5, -1.0) render pixels in a typeless
@@ -1685,6 +1689,15 @@ int main(int argc, char** argv) {
                     Check(text.find("nr: map resolve: lag ") != std::string::npos &&
                               text.find("motion bound") != std::string::npos,
                           "map resolve carries along this frame's motion");
+                    if (EnvInt("DLSS5_SYNC", 0)) {
+                        Check(text.find("synchronous path on") != std::string::npos,
+                              "sync: the hook saw our lists submitted and the path switched on");
+                        Check(text.find("(lag 1)") != std::string::npos,
+                              "sync: a frame resolves the previous frame's map");
+                        Check(text.find("synchronous path off") == std::string::npos &&
+                                  text.find("asynchronous path") == std::string::npos,
+                              "sync: never fell back");
+                    }
                 }
                 if (engineFull) {
                     Check(text.find("hip: resident engine motion 1 at ") != std::string::npos,
