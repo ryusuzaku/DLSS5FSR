@@ -1774,6 +1774,26 @@ bool GpuSyncPrepare(const Config& cfg) {
     job.mapMode = HipSyncMapParams(job.mapParams);
     s.pendingWait = job.stagingFrame + 1;
     if (job.mapMode) PublishHipModel(g, frame, job);
+    // Sequence capture (only while one is armed: it waits on the CPU, and the
+    // game stutters while it records anyway): the published job's frame, once
+    // its job ran -- its staging was written and nothing rewrites that slot
+    // before this evaluate's list has executed.
+    if (!cfg.candidateInputCapturePath.empty() && HipSequenceArmed()) {
+        const uint64_t want = job.stagingFrame + 1;
+        bool ready = s.result->GetCompletedValue() >= want;
+        if (!ready) {
+            HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            if (ev && SUCCEEDED(s.result->SetEventOnCompletion(want, ev)))
+                ready = WaitForSingleObject(ev, 1000) == WAIT_OBJECT_0;
+            if (ev) CloseHandle(ev);
+        }
+        static uint64_t lastCaptured = ~0ull;  // a skipped job publishes the same frame again
+        if (ready && job.stagingFrame != lastCaptured) {
+            lastCaptured = job.stagingFrame;
+            HipSetReadSlot(job.outSlot);
+            HipSequenceCapture(job.stagingFrame);
+        }
+    }
     static unsigned long long published = 0;
     if (job.mapMode && (published++ % 600) == 0)
         LOGI("nr: sync: frame %llu resolves the map of frame %llu (lag %llu)", (unsigned long long)frame,

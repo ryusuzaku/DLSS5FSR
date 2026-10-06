@@ -1009,13 +1009,25 @@ bool CandidateInputCapture() {
 // height and the staged motion (float2 rows, as the engine receives them).
 // The readback blocks the game's thread: the game runs slower while it lasts.
 // The trigger is deleted when the count is reached.
+static std::wstring g_seqDir;
+static int g_seqLeft = 0;
+static unsigned long long g_seqLast = 0;
+
+// A sequence capture is running or its trigger file exists.
+bool SequenceArmed() {
+    const Config& cfg = Cfg();
+    if (cfg.candidateInputCapturePath.empty()) return false;
+    return g_seqLeft > 0 ||
+           GetFileAttributesW((cfg.candidateInputCapturePath + L".seq").c_str()) != INVALID_FILE_ATTRIBUTES;
+}
+
 bool SequenceCapture(unsigned long long counter) {
     State& s = S();
     const Config& cfg = Cfg();
     if (cfg.candidateInputCapturePath.empty()) return true;
-    static std::wstring dir;
-    static int left = 0;
-    static unsigned long long last = 0;
+    std::wstring& dir = g_seqDir;
+    int& left = g_seqLeft;
+    unsigned long long& last = g_seqLast;
     const std::wstring trigger = cfg.candidateInputCapturePath + L".seq";
     if (left == 0) {
         if (GetFileAttributesW(trigger.c_str()) == INVALID_FILE_ATTRIBUTES) return true;
@@ -11417,6 +11429,7 @@ unsigned int HipStagingSlots() { return hipb::kStagingSlots; }
 bool HipResidentEngineSubmit() { return hipb::ResidentEngineSubmit(); }
 bool HipCandidateInputCapture() { return hipb::CandidateInputCapture(); }
 bool HipSequenceCapture(unsigned long long counter) { return hipb::SequenceCapture(counter); }
+bool HipSequenceArmed() { return hipb::SequenceArmed(); }
 bool HipSyncImport(HANDLE staged, HANDLE result) { return hipb::SyncImport(staged, result); }
 void HipSyncRelease() { hipb::SyncRelease(); }
 int HipSyncSubmit(unsigned long long frame, unsigned long long waitValue, unsigned long long signalValue) {

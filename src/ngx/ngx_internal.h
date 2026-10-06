@@ -703,6 +703,7 @@ void HipSetOutSlot(unsigned int slot);
 unsigned int HipStagingSlots();
 bool HipCandidateInputCapture();  // one-shot or triggered-repeat staged-proxy capture
 bool HipSequenceCapture(unsigned long long counter);
+bool HipSequenceArmed();  // a sequence capture runs or its trigger exists
 // S332 synchronous path (SyncMode=1): the two shared fences as HIP external
 // semaphores, one engine job per frame (staging slot frame % slots, output
 // slot the same), the engine's map parameters.

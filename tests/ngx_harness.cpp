@@ -1588,10 +1588,11 @@ int main(int argc, char** argv) {
         // capture ("<path>.seq", 5 frames) for this pass and check its files.
         const char* seqEnv = getenv("DLSS5_SEQUENCE_CAPTURE");
         const std::string seqPath = seqEnv && engineFull ? seqEnv : "";
+        const int seqCount = EnvInt("DLSS5_SEQUENCE_COUNT", 5);
         if (!seqPath.empty()) {
             engine.candidateInputCapturePath = seqPath;
             engine.candidateInputCaptureTrigger = 1;  // the one-shot capture waits for its own .go
-            if (FILE* t = fopen((seqPath + ".seq").c_str(), "wb")) { fputs("5", t); fclose(t); }
+            if (FILE* t = fopen((seqPath + ".seq").c_str(), "wb")) { fprintf(t, "%d", seqCount); fclose(t); }
         }
         PassResult ep = RunPass(ngx, d, iniDir, engine, engineColor, engineOutput,
                                 SRC_W, SRC_H, DST_W, DST_H, engineFull ? 150 : 120, mv.Get());
@@ -1624,9 +1625,9 @@ int main(int argc, char** argv) {
                 FindClose(h);
             }
             printf("  sequence capture: %d frame file(s), %d with motion, in %s\n", frames, withMotion, dir.c_str());
-            Check(frames == 5 && withMotion == 5 &&
+            Check(frames == seqCount && withMotion == seqCount &&
                   GetFileAttributesA((seqPath + ".seq").c_str()) == INVALID_FILE_ATTRIBUTES,
-                  "sequence capture writes 5 consecutive frames with motion and consumes its trigger");
+                  "sequence capture writes its frames with motion and consumes its trigger");
         }
         if (engineMap) {
             IniValues identity = engine;
