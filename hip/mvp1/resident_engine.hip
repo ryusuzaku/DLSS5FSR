@@ -172,18 +172,20 @@ unsigned char srgb8(float linear) { return (unsigned char)nearbyintf(srgb_encode
 //                  (2R+1)^2 window, each neighbour weighted by how close its
 //                  input luminance is to the centre's (edge-aware; removes
 //                  the per-pixel grain of the ratio, keeps edges)
-//   motion=auto|1|0 luma mode: carry the ratio map along the game's motion
+//   motion=auto|1|uv|0 luma mode: carry the ratio map along the game's motion
 //                  vectors (re_motion) to the newest frame. auto (default)
 //                  detects the units (frame pixels or UV) and sign from how
-//                  well each predicts the frame from the previous one; 1
-//                  takes frame pixels with motion_sign; 0 disables.
+//                  well each predicts the frame from the previous one (it
+//                  needs real motion: nothing is carried until then); 1
+//                  takes frame pixels with motion_sign, uv UV with
+//                  motion_sign; 0 disables.
 //   motion_sign=-1 flips the vectors (games that store cur - prev)
 //   scale=S        luma mode: run the network on an S x downscale of the frame
 //                  (0.25..1) and upsample its ratio map (about S^2 the work)
 //   budget=N       luma mode: at most N network pixels; lowers the scale further
 //                  for large frames (5120x1440 ultrawide) so the cost stays put
 struct OutputOptions {
-    int luma = 0, denoise = 0, motion = 2, motion_sign = 1;  // motion 2 = auto
+    int luma = 0, denoise = 0, motion = 2, motion_sign = 1;  // motion 2 = auto, 3 = uv
     int compact = 0;  // extent=compact: smallest multiple-of-64 extent (fast path only)
     float tone = 0.0f;  // tone=K: luma mode network input through auto exposure (key K) + ACES
     float controls[5] = {0, 0, 0, 0, 0};  // controls=a,b,c,d,e: stem features 10..14
@@ -846,8 +848,7 @@ struct Engine {
     bool previous_valid = false;
     float* vote = nullptr;               // device: 5 error sums, 5 sample counts
     int vote_frames = 0;
-    float motion_mx = 0.0f, motion_my = 0.0f;  // chosen scale (0 = not decided yet)
-    int motion_choice = -1;
+    int motion_choice = -1;              // 0 pixels, 1 pixels negated, 2 UV, 3 UV negated; -1 undecided
     unsigned char* compose_pinned = nullptr;        // luma mode: host readback of the composed frame
     size_t compose_pinned_bytes = 0;
     unsigned char* pinned = nullptr;                // full mode: host readback of the frame bytes
@@ -893,8 +894,8 @@ struct Engine {
             else if (key == "strength") options.strength = std::stof(value);
             else if (key == "gate") options.gate = std::stof(value);
             else if (key == "denoise") options.denoise = std::stoi(value);
-            else if (key == "motion" && (value == "0" || value == "1" || value == "auto"))
-                options.motion = value == "auto" ? 2 : value == "1";
+            else if (key == "motion" && (value == "0" || value == "1" || value == "auto" || value == "uv"))
+                options.motion = value == "auto" ? 2 : value == "uv" ? 3 : value == "1";
             else if (key == "scale") options.scale = std::stof(value);
             else if (key == "budget") options.budget = std::stof(value);
             else if (key == "additive") options.additive = std::stof(value);
@@ -1065,8 +1066,7 @@ struct Engine {
                             if (sums[5+k] >= 0.5f*sums[9] && (best < 0 || mean[k] < mean[best])) best = k;
                         // Only with real motion in the window and a clear win over no motion.
                         if (best >= 0 && sums[9] > 100.0f && sums[4] > 1.0f && mean[best] < 0.85f*mean[4]) {
-                            const float ms[4][2] = {{1.0f, 1.0f}, {-1.0f, -1.0f}, {float(w), float(h)}, {-float(w), -float(h)}};
-                            motion_choice = best; motion_mx = ms[best][0]; motion_my = ms[best][1];
+                            motion_choice = best;
                         }
                     }
                 }
@@ -1342,7 +1342,8 @@ struct Engine {
     // motion (off, undecided or lost on the way) it stays the plain previous map.
     void carry_history(int w, int h) {
         if (published < 0 || map_w != w || map_h != h || map_frame[published] < 0) return;
-        const float mx = options.motion == 2 ? motion_mx : 1.0f, my = options.motion == 2 ? motion_my : 1.0f;
+        const float2 ms = motion_scale(w, h);
+        const float mx = ms.x, my = ms.y;
         if (!options.motion || (mx == 0.0f && my == 0.0f) || mv_w != w || mv_h != h) return;
         const long long from = map_frame[published];
         if (from >= job_frame) return;  // already on the job's frame: the plain map is right
@@ -1399,6 +1400,19 @@ struct Engine {
         return 1;
     }
 
+    // The staged motion vectors' scale to frame pixels at w x h (prev = cur +
+    // mv*scale), 0 while motion=auto is undecided. UV scales with the frame:
+    // a scale fixed when the vote decided went stale on every resize (S332:
+    // decided at 1510x850, still applied at 1587x893).
+    float2 motion_scale(int w, int h) const {
+        if (!options.motion) return make_float2(0.0f, 0.0f);
+        if (options.motion == 1) return make_float2(1.0f, 1.0f);  // the ring is already flipped
+        const int c = options.motion == 3 ? (options.motion_sign > 0 ? 2 : 3) : motion_choice;
+        if (c < 0) return make_float2(0.0f, 0.0f);
+        const float sign = (c & 1) ? -1.0f : 1.0f;
+        return c >= 2 ? make_float2(sign*w, sign*h) : make_float2(sign, sign);
+    }
+
     OutputOptions job_options(float strength) const {
         OutputOptions o = options;
         o.strength = strength;
@@ -1422,7 +1436,8 @@ struct Engine {
     void history_coords(int w, int h) {
         if (hist_frame < 0 || !hist_prev) return;
         if (hist_frame == job_frame) { coord_cur = 2; return; }
-        const float mx = options.motion == 2 ? motion_mx : 1.0f, my = options.motion == 2 ? motion_my : 1.0f;
+        const float2 ms = motion_scale(w, h);
+        const float mx = ms.x, my = ms.y;
         if (!options.motion || (mx == 0.0f && my == 0.0f) || mv_w != w || mv_h != h || hist_frame > job_frame) return;
         if (job_frame - hist_frame >= kRing) return;
         for (auto& b : coord)
@@ -1450,7 +1465,8 @@ struct Engine {
             dst_pitch < size_t(w)*bpp || out_pitch < size_t(w)*bpp) return 0;
         try {
             const float2* map = reinterpret_cast<const float2*>(maps[published]->data);
-            const float mx = options.motion == 2 ? motion_mx : 1.0f, my = options.motion == 2 ? motion_my : 1.0f;
+            const float2 ms = motion_scale(w, h);
+            const float mx = ms.x, my = ms.y;
             if (options.motion && (mx != 0.0f || my != 0.0f) && mv_w == w && mv_h == h && map_frame[published] >= 0) {
                 // Carry the map from its own frame (a new result) or from
                 // the last carried frame to the newest submitted frame.
@@ -1741,9 +1757,11 @@ __declspec(dllexport) int re_luma_map_params(float* params) {
     if (!g_engine || !params) return -1;
     auto& e = *g_engine;
     std::lock_guard<std::mutex> inner(e.mutex);
-    const bool on = e.options.motion != 0;
-    params[0] = !on ? 0.0f : e.options.motion == 2 ? e.motion_mx : float(e.options.motion_sign);
-    params[1] = !on ? 0.0f : e.options.motion == 2 ? e.motion_my : float(e.options.motion_sign);
+    // motion=1 flips the engine's own copy; the consumer reads the game's vectors.
+    const float2 ms = e.options.motion == 1 ? make_float2(float(e.options.motion_sign), float(e.options.motion_sign))
+                                            : e.motion_scale(e.cur_w, e.cur_h);
+    params[0] = ms.x;
+    params[1] = ms.y;
     // A negative value asks the resolve for the relative (log2) gate.
     params[2] = e.options.rel_gate > 0.0f ? -1.0f / e.options.rel_gate : 1.0f / e.options.gate;
     params[3] = e.options.luma ? 1.0f : 0.0f;
@@ -1756,7 +1774,8 @@ __declspec(dllexport) int re_motion_mode() {
     std::lock_guard<std::mutex> lock(g_mutex);
     if (!g_engine) return -1;
     std::lock_guard<std::mutex> inner(g_engine->mutex);
-    return g_engine->motion_choice;
+    const auto& e = *g_engine;
+    return e.options.motion == 3 ? (e.options.motion_sign > 0 ? 2 : 3) : e.motion_choice;
 }
 
 __declspec(dllexport) int re_poll_frame(unsigned char* dst, unsigned long long pitch, int width, int height,
