@@ -20,7 +20,7 @@ constexpr UINT kDescriptorCount = 2048;  // 1024 evaluates in flight before wrap
 // all of them. The spare slots are declared anyway: temporal accumulation of
 // the edit is designed but not implemented, and leaving them in the table
 // means adding it later does not change the root signature.
-constexpr UINT kNrSrvCount = 5;
+constexpr UINT kNrSrvCount = 6;
 constexpr UINT kNrUavCount = 2;
 constexpr UINT kNrDescriptors = kNrSrvCount + kNrUavCount;
 
@@ -619,7 +619,7 @@ bool GpuNrDispatch(ID3D12GraphicsCommandList* cl, const DlssNrConstants& c,
                    ID3D12Resource* source, ID3D12Resource* model,
                    ID3D12Resource* original, ID3D12Resource* motion,
                    ID3D12Resource* prevEdit, ID3D12Resource* target,
-                   ID3D12Resource* keep) {
+                   ID3D12Resource* keep, ID3D12Resource* depthHistory) {
     GpuContext& g = Gpu();
     if (!g.valid || !cl || !source || !target) return false;
 
@@ -632,6 +632,7 @@ bool GpuNrDispatch(ID3D12GraphicsCommandList* cl, const DlssNrConstants& c,
         original ? original : source,
         motion   ? motion   : source,
         prevEdit ? prevEdit : source,
+        depthHistory ? depthHistory : source,
     };
     ID3D12Resource* uavs[kNrUavCount] = {
         target,
@@ -845,7 +846,7 @@ bool GpuNeuralChain(ID3D12GraphicsCommandList* cl, ID3D12Resource* output,
     // Same buffer as the motion (its rows sit after the vectors), same list,
     // so the next evaluate's counter check covers it too.
     bool depthStaged = false;
-    if (!busy && motionStaged && motion->depth && motion->depthW && motion->depthH && HipStagingDepthRowPitch()) {
+    if (motionStaged && motion->depth && motion->depthW && motion->depthH) {
         PooledTexture* dTex = GpuAcquireTexture(L"depth", DXGI_FORMAT_R32_FLOAT, outRect.w, outRect.h);
         if (dTex && SupportsTypedUav(g.device.Get(), DXGI_FORMAT_R32_FLOAT)) {
             const D3D12_RESOURCE_STATES dIn = GpuGuessIncomingState(motion->depth);
@@ -873,8 +874,28 @@ bool GpuNeuralChain(ID3D12GraphicsCommandList* cl, ID3D12Resource* output,
                 dsrc.pResource = dTex->res.Get();
                 dsrc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
                 dsrc.SubresourceIndex = 0;
-                if (!busy) cl->CopyTextureRegion(&ddst, 0, 0, 0, &dsrc, nullptr);
-                depthStaged = true;
+                if (!busy && HipStagingDepthRowPitch()) {
+                    cl->CopyTextureRegion(&ddst, 0, 0, 0, &dsrc, nullptr);
+                    depthStaged = true;
+                }
+                // This frame's depth into its history slot, beside the motion's.
+                const unsigned int k = GpuContext::kMotionHistory;
+                PooledTexture* dh = GpuAcquireTexture(L"depth history", DXGI_FORMAT_R32_FLOAT,
+                                                      outRect.w, outRect.h * k);
+                if (dh) {
+                    if (g.depthHistoryW != outRect.w || g.depthHistoryH != outRect.h) {
+                        for (auto& f : g.depthHistoryFrame) f = -1;
+                        g.depthHistoryW = outRect.w; g.depthHistoryH = outRect.h;
+                    }
+                    const unsigned int slot = (unsigned int)(g.hipEvaluate % k);
+                    GpuSetState(cl, *dh, D3D12_RESOURCE_STATE_COPY_DEST);
+                    D3D12_TEXTURE_COPY_LOCATION hdst{};
+                    hdst.pResource = dh->res.Get();
+                    hdst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                    hdst.SubresourceIndex = 0;
+                    cl->CopyTextureRegion(&hdst, 0, slot * outRect.h, 0, &dsrc, nullptr);
+                    g.depthHistoryFrame[slot] = (long long)g.hipEvaluate;
+                }
             }
         }
     }
@@ -1021,6 +1042,7 @@ bool GpuNeuralChain(ID3D12GraphicsCommandList* cl, ID3D12Resource* output,
     // was then (lag x this frame's motion) and gates it on luminance here.
     ID3D12Resource* motionSrv = nullptr;
     ID3D12Resource* historySrv = nullptr;
+    ID3D12Resource* depthHistorySrv = nullptr;
     if (hipModel && g.hipMapMode && model == hipModel->res.Get()) {
         const uint64_t lag = mapLag;
         const float carry = (float)(lag < 6 ? lag : 6);
@@ -1054,18 +1076,30 @@ bool GpuNeuralChain(ID3D12GraphicsCommandList* cl, ID3D12Resource* output,
                 c.GuideHeight = (unsigned int)(g.hipEvaluate % k);
                 c.MvScaleX = g.hipMapParams[0];
                 c.MvScaleY = g.hipMapParams[1];
+                // Depth of frames n .. n-steps, for the disocclusion test.
+                const uint64_t n = g.hipEvaluate;
+                bool depthOk = g.depthHistoryW == outRect.w && g.depthHistoryH == outRect.h;
+                for (unsigned int i = 0; depthOk && i <= steps; ++i)
+                    depthOk = g.depthHistoryFrame[(n - i) % k] == (long long)(n - i);
+                PooledTexture* dh = nullptr;
+                if (depthOk && (dh = GpuAcquireTexture(L"depth history", DXGI_FORMAT_R32_FLOAT,
+                                                        outRect.w, outRect.h * k))) {
+                    GpuSetState(cl, *dh, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                    depthHistorySrv = dh->res.Get();
+                    c.Pad1 |= 2u;
+                }
             }
         }
         static unsigned long long mapLog = 0;
         if ((mapLog++ % 600) == 0)
-            LOGI("nr: map resolve: lag %llu frame(s), %s, scale %g,%g, motion %s",
+            LOGI("nr: map resolve: lag %llu frame(s), %s, scale %g,%g, motion %s, depth test %s",
                  (unsigned long long)lag, c.GuideWidth ? "walked through the motion history" : "linear carry",
-                 c.MvScaleX, c.MvScaleY, motionSrv ? "bound" : "missing");
+                 c.MvScaleX, c.MvScaleY, motionSrv ? "bound" : "missing", depthHistorySrv ? "on" : "off");
     }
     // `keep` as the second UAV would make it both an input and an output of
     // the same dispatch, so the stand-in is left to fall back to the target.
     if (!GpuNrDispatch(cl, c, proxy->res.Get(), model, keep->res.Get(), motionSrv,
-                       historySrv, output, nullptr)) {
+                       historySrv, output, nullptr, depthHistorySrv)) {
         LOGE("nr: resolve dispatch failed");
         return false;
     }

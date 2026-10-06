@@ -405,7 +405,8 @@ struct DlssNrConstants {
     // reversible roll above), 2 scale-and-encode only -- the default, and the
     // one the model should be shown. See the encode block in dlssnr.hlsl.
     unsigned int ProxyMode = 2;
-    // Resolve: 1 when the model texture is the engine's ratio map (Pad2 = 1/gate as float bits).
+    // Resolve: 1 when the model texture is the engine's ratio map (Pad2 = 1/gate as float bits),
+    // | 2 when t5 holds the depth history for the motion-history walk.
     unsigned int Pad1 = 0, Pad2 = 0;
 };
 // Must match the shader's `dcl_constantbuffer CB0[5]`. A mismatch here is
@@ -498,6 +499,12 @@ struct GpuContext {
     static constexpr unsigned int kMotionHistory = 8;
     long long motionHistoryFrame[kMotionHistory] = {-1, -1, -1, -1, -1, -1, -1, -1};
     unsigned int motionHistoryW = 0, motionHistoryH = 0;
+    // S332: the same frames' depth (R32, same layout), so the walk can tell
+    // a pixel that was hidden on the map's frame (its depth jumps on the way
+    // back) from one that was there: luminance alone let a pedestrian's edit
+    // stay on the pavement behind him.
+    long long depthHistoryFrame[kMotionHistory] = {-1, -1, -1, -1, -1, -1, -1, -1};
+    unsigned int depthHistoryW = 0, depthHistoryH = 0;
     uint64_t hipEvaluate = 0, hipStagingFrame = 0;
     // A HIP job started by a prepare has not finished yet: it may still be
     // reading the shared staging, so this frame's list must not rewrite it
@@ -587,7 +594,7 @@ bool GpuNrDispatch(ID3D12GraphicsCommandList* cl, const DlssNrConstants& c,
                    ID3D12Resource* source, ID3D12Resource* model,
                    ID3D12Resource* original, ID3D12Resource* motion,
                    ID3D12Resource* prevEdit, ID3D12Resource* target,
-                   ID3D12Resource* keep);
+                   ID3D12Resource* keep, ID3D12Resource* depthHistory = nullptr);
 
 // encode -> [model] -> resolve on the caller's command list, over a frame that
 // has already been resampled into `output`.

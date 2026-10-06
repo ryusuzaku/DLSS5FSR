@@ -22,7 +22,7 @@
 //   * The compare modes (side by side, wipe) are kept. They cost nothing and
 //     they are the only way to eyeball this on hardware before there is a model.
 //
-//   * t3 (motion) is read by the map-mode resolve; t4 (previous edit) is declared and bound but not read.
+//   * t3 (motion) is read by the map-mode resolve; t4 holds its motion history, t5 its depth history.
 //     The reference binds them for the same reason: temporal accumulation of the
 //     edit is designed but not implemented, and leaving the slots in the table
 //     means adding it later does not change the root signature.
@@ -119,6 +119,7 @@ Texture2D<float4>   gModel    : register(t1);  // resolve: what the model return
 Texture2D<float4>   gOriginal : register(t2);  // resolve: the untouched frame.
 Texture2D<float4>   gMotion   : register(t3);  // resolve, accumulating: the game's motion vectors.
 Texture2D<float4>   gPrevEdit : register(t4);  // resolve, map mode: the motion history (8 frames stacked in rows).
+Texture2D<float4>   gDepthHist : register(t5); // resolve, map mode | 2: the depth history (same layout).
 RWTexture2D<float4> gTarget   : register(u0);  // encode: the proxy. resolve: the frame.
 RWTexture2D<float4> gKeep     : register(u1);  // encode: the untouched copy. resolve: the edit history.
 SamplerState        gLinear   : register(s0);  // so the edit can be read at a different size
@@ -314,18 +315,45 @@ void main(uint3 id : SV_DispatchThreadID)
     {
         const float2 size = float2(gWidth, gHeight);
         float2 mapUv;
+        // Disocclusion (map mode | 2): at each step back, this frame's depth
+        // against the previous frame's around where the pixel lands. A pixel
+        // that was hidden then (the pavement a pedestrian just uncovered)
+        // lands on the occluder's depth; its map entry belongs to the
+        // occluder, whatever the luminances say. The closest of the 3x3
+        // previous depths is taken so a sub-pixel landing on a silhouette
+        // does not reject (that drew outlines with the per-pixel luminance
+        // test). Depth is reverse-Z; the relative difference is the relative
+        // distance either way. Walking 5 m/s moves the ground 2 m ahead by ~4%
+        // per frame: up to 10% passes, 25% and more rejects.
+        float depthWeight = 1.0;
         if (gGuideWidth > 0)
         {
             // Walk back one frame at a time through the motion history (newest
             // slot gGuideHeight), each step with that frame's own vector.
             float2 pos = cmpUv * size;
+            const int2 last = int2(size) - 1;
             for (uint i = 0; i < gGuideWidth; ++i)
             {
                 const uint slot = (gGuideHeight + 8u - i) % 8u;
-                const int2 at = clamp(int2(pos), int2(0, 0), int2(size) - 1);
+                const int2 at = clamp(int2(pos), int2(0, 0), last);
                 float2 mv = gPrevEdit.Load(int3(at.x, at.y + int(slot * gHeight), 0)).xy * float2(gMvScaleX, gMvScaleY);
                 if (any(isnan(mv)) || any(isinf(mv))) mv = float2(0.0, 0.0);
                 pos += mv;
+                if ((gMapMode & 2u) != 0)
+                {
+                    const uint prev = (slot + 7u) % 8u;
+                    const float d = gDepthHist.Load(int3(at.x, at.y + int(slot * gHeight), 0)).x;
+                    const int2 to = clamp(int2(pos), int2(0, 0), last);
+                    float best = 1e30;
+                    [unroll] for (int dy = -1; dy <= 1; ++dy)
+                    [unroll] for (int dx = -1; dx <= 1; ++dx)
+                    {
+                        const int2 q = clamp(to + int2(dx, dy), int2(0, 0), last);
+                        const float dp = gDepthHist.Load(int3(q.x, q.y + int(prev * gHeight), 0)).x;
+                        best = min(best, abs(d - dp) / max(max(d, dp), 1e-7));
+                    }
+                    depthWeight = min(depthWeight, saturate((0.25 - best) / 0.15));
+                }
             }
             mapUv = pos / size;
         }
@@ -377,6 +405,7 @@ void main(uint3 id : SV_DispatchThreadID)
                 weight = fade * exp(-abs(proxyLinearLuma - m.y) * gMapInvGate);
             }
         }
+        weight *= depthWeight;
         float r = 1.0 + (m.x - 1.0) * weight;
         if (gPassthrough != 0 && proxyLinearLuma > 1e-5)
         {
