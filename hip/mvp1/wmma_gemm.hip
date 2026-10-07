@@ -310,7 +310,11 @@ inline State& state() { static State s; return s; }
 // RESIDENT_WMMA=0 disables this path; exact_math always does.
 inline bool enabled = [] { const char* v = getenv("RESIDENT_WMMA"); return !(v && *v == '0'); }();
 // RESIDENT_GEMM_F16=1 keeps the f16 WMMA kernel instead of the FP8 one.
+#if defined(H70_NO_FP8)
+inline bool fp8 = false;  // half-activation build: f16 operands only
+#else
 inline bool fp8 = [] { const char* v = getenv("RESIDENT_GEMM_F16"); return !(v && *v == '1'); }();
+#endif
 
 // Cached E4M3 copy of `count` weights at W (converted once on `stream`).
 inline const unsigned char* fp8_weights(hipStream_t stream, const float* W, size_t count) {

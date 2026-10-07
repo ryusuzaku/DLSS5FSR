@@ -20,7 +20,12 @@ typedef unsigned char u8;
 typedef float acc8 __attribute__((ext_vector_type(8)));
 typedef int op8 __attribute__((ext_vector_type(2)));
 
+// The half-activation build (H70_NO_FP8) has no E4M3 operands: always the f16 kernels.
+#if defined(H70_NO_FP8)
+inline bool enabled = false;
+#else
 inline bool enabled = [] { const char* v = getenv("RESIDENT_SWIN_F16"); return !(v && *v == '1'); }();
+#endif
 
 // split512_fp8 as a byte (clamp to +-448, E4M3 nearest even).
 __device__ inline u8 q8(float x) {

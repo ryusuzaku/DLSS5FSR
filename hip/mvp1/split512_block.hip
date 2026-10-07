@@ -54,7 +54,10 @@ __device__ inline float split512_fp8_sw(float x) {
 // +-448; identical to split512_fp8_sw for every non-NaN float (exhaustive
 // check in build/fp8_equiv.hip).
 __device__ inline float split512_fp8(float x) {
-#if defined(__gfx1200__) || defined(__gfx1201__)
+#if defined(H70_NO_FP8)
+    // H70_NO_FP8: half precision instead of E4M3 (see h70_f in head70_normalized.hip).
+    return __half2float(__float2half_rn(fminf(448.0f, fmaxf(-448.0f, x))));
+#elif defined(__gfx1200__) || defined(__gfx1201__)
     x = fminf(448.0f, fmaxf(-448.0f, x));
     return __builtin_amdgcn_cvt_f32_fp8(__builtin_amdgcn_cvt_pk_fp8_f32(x, 0.0f, 0, false), 0);
 #else

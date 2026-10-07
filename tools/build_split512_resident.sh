@@ -13,6 +13,10 @@ MSYS_NO_PATHCONV=1 "$ROCM_ROOT/bin/hipcc.exe" -std=c++17 -O2 -ffp-contract=off -
   --offload-arch=gfx1201 -I ext/rocWMMA/library/include hip/mvp1/front_resident_test.hip -o build/front_resident_test.exe
 MSYS_NO_PATHCONV=1 "$ROCM_ROOT/bin/hipcc.exe" -std=c++17 -O2 -ffp-contract=off -D_CRT_SECURE_NO_WARNINGS \
   --offload-arch=gfx1201 -I ext/rocWMMA/library/include -shared hip/mvp1/resident_engine.hip -o build/resident_engine.dll
+# Half-precision activations (S332): the same network without E4M3 activation
+# rounding, far steadier frame to frame; the game's engine since S332.
+MSYS_NO_PATHCONV=1 "$ROCM_ROOT/bin/hipcc.exe" -std=c++17 -O2 -ffp-contract=off -D_CRT_SECURE_NO_WARNINGS -DH70_NO_FP8 \
+  --offload-arch=gfx1201 -I ext/rocWMMA/library/include -shared hip/mvp1/resident_engine.hip -o build/resident_engine_hp.dll
 MSYS_NO_PATHCONV=1 "$ROCM_ROOT/bin/hipcc.exe" -std=c++17 -O2 -D_CRT_SECURE_NO_WARNINGS \
   --offload-arch=gfx1201 -I ext/rocWMMA/library/include hip/mvp1/resident_engine_test.hip -o build/resident_engine_test.exe
 MSYS_NO_PATHCONV=1 "$ROCM_ROOT/bin/hipcc.exe" -std=c++17 -O2 -D_CRT_SECURE_NO_WARNINGS \

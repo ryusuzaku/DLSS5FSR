@@ -215,6 +215,13 @@ struct OutputOptions {
     // weapon's edit trail over a dark street (tools/seq_replay.py, recorded
     // sequence). Only with a one-frame-old history and staged depth.
     int smooth_depth = 0;
+    // input_temporal=A (S332): a TAA pass on the network's input only -- the
+    // frame blended with the previous network input carried along the motion
+    // by A, the history clamped to the frame's 3x3 range and dropped where the
+    // depth changed. The network then sees a steadier picture (its answer
+    // follows input noise several-fold); the edit is still applied to the
+    // real frame. RGBA16F staging, one-frame-old history.
+    float input_temporal = 0.0f;
     int gain = -1;
 };
 
@@ -387,6 +394,53 @@ __global__ void k_ratio_map(const float* linear, const float* color, const unsig
     // frame) must not reach the resolve, which would turn it black.
     if (!isfinite(ratio) || !isfinite(yin)) { ratio = 1.0f; yin = -1.0f; }
     map[i] = make_float2(ratio, yin);
+}
+
+// input_temporal: the network's input, stabilised (see OutputOptions). cur
+// and hist are RGBA16F frames (rows of pitch bytes); hist is the previous
+// stabilised input, sampled where this pixel was (prev = cur + mv*scale).
+__global__ void k_input_stabilize(const unsigned char* cur, const unsigned char* hist, unsigned char* out,
+                                  int pitch, int w, int h, const float2* motion, float mx, float my,
+                                  const float* depth, const float* prev_depth, float a) {
+    int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= w*h) return;
+    int x = i % w, y = i / w;
+    const _Float16* c = reinterpret_cast<const _Float16*>(cur + size_t(y)*pitch + size_t(x)*8);
+    _Float16* o = reinterpret_cast<_Float16*>(out + size_t(y)*pitch + size_t(x)*8);
+    float v[3], lo[3], hi[3];
+    for (int k = 0; k < 3; ++k) { v[k] = float(c[k]); lo[k] = hi[k] = v[k]; }
+    for (int dy = -1; dy <= 1; ++dy)
+        for (int dx = -1; dx <= 1; ++dx) {
+            const int nx = min(max(x+dx, 0), w-1), ny = min(max(y+dy, 0), h-1);
+            const _Float16* q = reinterpret_cast<const _Float16*>(cur + size_t(ny)*pitch + size_t(nx)*8);
+            for (int k = 0; k < 3; ++k) { const float f = float(q[k]); lo[k] = fminf(lo[k], f); hi[k] = fmaxf(hi[k], f); }
+        }
+    const float2 mv = motion[i];
+    const float sx = x + mv.x*mx, sy = y + mv.y*my;  // pixel coordinates of the same point a frame ago
+    float wgt = a;
+    if (!(sx >= 0.0f && sy >= 0.0f && sx <= w-1 && sy <= h-1) || !isfinite(sx) || !isfinite(sy)) wgt = 0.0f;
+    if (wgt > 0.0f && depth && prev_depth) {
+        const int px = min(max(int(sx + 0.5f), 0), w-1), py = min(max(int(sy + 0.5f), 0), h-1);
+        const float d = depth[i], dp = prev_depth[size_t(py)*w + px];
+        const float rel = fabsf(d - dp) / fmaxf(fmaxf(d, dp), 1e-7f);
+        wgt *= isfinite(rel) ? fminf(fmaxf((0.25f - rel) / 0.15f, 0.0f), 1.0f) : 0.0f;
+    }
+    if (wgt > 0.0f) {
+        const int x0 = min(int(sx), w-2 < 0 ? 0 : w-2), y0 = min(int(sy), h-2 < 0 ? 0 : h-2);
+        const float fx = sx - x0, fy = sy - y0;
+        const _Float16* p00 = reinterpret_cast<const _Float16*>(hist + size_t(y0)*pitch + size_t(x0)*8);
+        const _Float16* p10 = reinterpret_cast<const _Float16*>(hist + size_t(y0)*pitch + size_t(x0+1)*8);
+        const _Float16* p01 = reinterpret_cast<const _Float16*>(hist + size_t(y0+1)*pitch + size_t(x0)*8);
+        const _Float16* p11 = reinterpret_cast<const _Float16*>(hist + size_t(y0+1)*pitch + size_t(x0+1)*8);
+        for (int k = 0; k < 3; ++k) {
+            float hk = (float(p00[k])*(1.0f-fx) + float(p10[k])*fx)*(1.0f-fy) + (float(p01[k])*(1.0f-fx) + float(p11[k])*fx)*fy;
+            if (!isfinite(hk)) { hk = v[k]; }
+            hk = fminf(fmaxf(hk, lo[k]), hi[k]);
+            v[k] += (hk - v[k])*wgt;
+        }
+    }
+    for (int k = 0; k < 3; ++k) o[k] = (_Float16)v[k];
+    o[3] = c[3];
 }
 
 // Luma mode with motion: the map at frame t from the map at t-1, sampled
@@ -913,6 +967,10 @@ struct Engine {
     // smooth_depth: the previous job's depth and its frame.
     std::unique_ptr<Buffer> prev_depth;
     long long prev_depth_frame = -1;
+    // input_temporal: the stabilised network input, ping-pong, and its frame.
+    std::unique_ptr<Buffer> in_stab[2];
+    int in_stab_cur = 0, in_stab_w = 0, in_stab_h = 0, in_stab_pitch = 0;
+    long long in_stab_frame = -1;
     int depth_w = 0, depth_h = 0;
     bool depth_fresh = false, job_depth_valid = false;
     // re_albedo: the same for the RR diffuse albedo's luminance.
@@ -945,6 +1003,7 @@ struct Engine {
             else if (key == "rel_sigma") options.rel_sigma = std::stof(value);
             else if (key == "rel_gate") options.rel_gate = std::stof(value);
             else if (key == "smooth_depth") options.smooth_depth = std::stoi(value);
+            else if (key == "input_temporal") options.input_temporal = std::stof(value);
             else if (key == "extent" && (value == "compact" || value == "legacy")) options.compact = value == "compact";
             else if (key == "tone") options.tone = std::stof(value);
             else if (key == "encoded") options.encoded = std::stoi(value);
@@ -976,6 +1035,7 @@ struct Engine {
             options.budget < 0.0f || (options.budget > 0.0f && (options.budget < 64.0f*64.0f || !options.luma)) ||
             options.additive < 0.0f || options.additive > 1.0f || (options.additive > 0.0f && !options.luma) ||
             options.rel_sigma < 0.0f || options.rel_gate < 0.0f ||
+            options.input_temporal < 0.0f || options.input_temporal > 0.98f ||
             options.tone < 0.0f || options.tone > 1.0f || (options.tone > 0.0f && !options.luma) ||
             options.encoded < 0 || options.encoded > 1 || (options.encoded && !options.luma) ||
             options.temporal < 0.0f || options.temporal > 1.0f || (options.temporal > 0.0f && !options.luma))
@@ -1334,7 +1394,34 @@ struct Engine {
         net->front->history = use_history ? hist_cur->data : nullptr;
         net->front->noise_seed = temporal ? temporal_seed : 0;
         HIP_CHECK(hipEventRecord(start, stream));
-        net->run(reinterpret_cast<const unsigned char*>(raw_input->data), frame_w, frame_h, frame_pitch,
+        const unsigned char* net_src = reinterpret_cast<const unsigned char*>(raw_input->data);
+        if (!job_crop && options.luma && options.input_temporal > 0.0f && frame_bpp == 8) {
+            const size_t bytes = size_t(frame_pitch)*frame_h;
+            for (auto& b : in_stab)
+                if (!b || b->count*sizeof(float) < bytes) { b.reset(new Buffer((bytes+3)/4)); in_stab_frame = -1; }
+            const int dst = in_stab_cur ^ 1;
+            const int mslot = int(job_frame % kRing);
+            const float2 ms = motion_scale(frame_w, frame_h);
+            const bool hist_ok = in_stab_frame == job_frame - 1 && in_stab_w == frame_w && in_stab_h == frame_h &&
+                                 in_stab_pitch == frame_pitch && mv_w == frame_w && mv_h == frame_h &&
+                                 ring_frame[mslot] == job_frame && (ms.x != 0.0f || ms.y != 0.0f);
+            const bool depth_ok = job_depth_valid && prev_depth && prev_depth_frame == job_frame - 1;
+            auto* out = reinterpret_cast<unsigned char*>(in_stab[dst]->data);
+            if (hist_ok) {
+                hipLaunchKernelGGL(k_input_stabilize, dim3((frame_w*frame_h+255)/256), dim3(256), 0, stream,
+                                   net_src, reinterpret_cast<const unsigned char*>(in_stab[in_stab_cur]->data), out,
+                                   frame_pitch, frame_w, frame_h, reinterpret_cast<const float2*>(ring[mslot]->data),
+                                   ms.x, ms.y, depth_ok ? job_depth->data : nullptr,
+                                   depth_ok ? prev_depth->data : nullptr, options.input_temporal);
+                HIP_CHECK(hipGetLastError());
+            } else {
+                HIP_CHECK(hipMemcpyAsync(out, net_src, bytes, hipMemcpyDeviceToDevice, stream));
+            }
+            in_stab_cur = dst; in_stab_frame = job_frame;
+            in_stab_w = frame_w; in_stab_h = frame_h; in_stab_pitch = frame_pitch;
+            net_src = out;
+        }
+        net->run(net_src, frame_w, frame_h, frame_pitch,
                  frame_bpp, job_crop, stream, sw, sh, tone, !job_crop && options.encoded,
                  use_history && options.history_clamp ? hist_cur->data : nullptr,
                  use_history && options.history_clamp == 2 && hin_ok ? hin_cur->data : nullptr, options.reject);
@@ -1410,7 +1497,7 @@ struct Engine {
                                    job_albedo_valid ? job_albedo->data : nullptr,
                                    job_mv ? prev_d : nullptr, job_mv, ms.x, ms.y);
                 HIP_CHECK(hipGetLastError());
-                if (options.smooth_depth) {
+                if (options.smooth_depth || options.input_temporal > 0.0f) {
                     // Keep this job's depth for the next one (same stream, in order).
                     if (job_depth_valid) {
                         if (!prev_depth || prev_depth->count < size_t(frame_w)*frame_h)

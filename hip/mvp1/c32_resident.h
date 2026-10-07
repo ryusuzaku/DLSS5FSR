@@ -64,11 +64,23 @@ struct Weights {
                            data.data,reinterpret_cast<unsigned char*>(fp8.data),12288);
         HIP_CHECK(hipGetLastError());
     }
+    // RESIDENT_C32_F16=1: the half WMMA body instead of the FP8 one.
+    // Always in the half-activation build (H70_NO_FP8), which has no E4M3 operands.
+#if defined(H70_NO_FP8)
+    static inline const bool c32_f16 = true;
+#else
+    static inline const bool c32_f16 = [] { const char* v = getenv("RESIDENT_C32_F16"); return v && *v == '1'; }();
+#endif
     // Fused body of one launch: WMMA unless c512_resident::exact_math.
     void body(const float* input,int rows,float* raw_out,float* quant_out,const C32Io& io=C32Io()) const {
         if (c512_resident::exact_math && !io.in_hwc && !io.out_hwc && !io.permute) {
             hipLaunchKernelGGL(k_c32_fused,dim3(rows/64),dim3(256),0,c512_resident::stream,
                                input,data.data,scale,raw_out,quant_out);
+        } else if (c32_f16) {
+            // The half WMMA form (operands through h70_f: E4M3 values, or
+            // half with H70_NO_FP8).
+            hipLaunchKernelGGL(k_c32_wmma,dim3(rows/64),dim3(256),0,c512_resident::stream,
+                               input,data.data,reinterpret_cast<const _Float16*>(halves.data),scale,raw_out,quant_out,io);
         } else {
             // FP8 WMMA form: bit-identical to k_c32_wmma, 1.66x faster (S330).
             hipLaunchKernelGGL(k_c32_fp8,dim3(rows/64),dim3(256),0,c512_resident::stream,

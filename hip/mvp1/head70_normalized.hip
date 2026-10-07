@@ -6,7 +6,15 @@
 __device__ static float h70_h(float x) { return head70_half(x); }
 __device__ static float h70_hd(double x) { return float(static_cast<_Float16>(x)); }
 __device__ static float h70_f(float x) {
-#if defined(__gfx1200__) || defined(__gfx1201__)
+#if defined(H70_NO_FP8)
+    // H70_NO_FP8 (S332, build/resident_engine_hp.dll): activations kept at
+    // half precision instead of E4M3. With E4M3 any input change, however
+    // small, flips roundings that the attention blocks spread over the whole
+    // frame: the ratio map changed ~5% per frame on a still camera whatever
+    // the input noise (74 at noise 0.004 and 72 at 0.0002, log2 x1000); with
+    // half activations 8.8 and 1.8, the look unchanged, +0.8 ms.
+    return __half2float(__float2half_rn(x));
+#elif defined(__gfx1200__) || defined(__gfx1201__)
     return split512_fp8(__half2float(__float2half_rn(x)));  // == the software form for every half
 #else
     return sw_e4m3_decode(sw_h2e4m3(__half_as_ushort(__float2half_rn(x))));
