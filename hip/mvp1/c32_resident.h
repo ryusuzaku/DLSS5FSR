@@ -72,6 +72,18 @@ struct Weights {
 #else
     static inline const bool c32_f16 = [] { const char* v = getenv("RESIDENT_C32_F16"); return v && *v == '1'; }();
 #endif
+    // The fused full-resolution blocks (k_c32_t MODE 1 / 2; see C32Fuse):
+    // FP8 build, not exact_math.
+    // RESIDENT_C32_FUSE=0 keeps the separate stem / pool / merge / finish passes.
+    static inline const bool fuse = [] { const char* v = getenv("RESIDENT_C32_FUSE"); return !(v && *v == '0'); }();
+    static bool fusable() { return fuse && !c512_resident::exact_math && !c32_f16; }
+    template<int MODE> void fused(int rows, const C32Fuse& fz) const {
+        hipLaunchKernelGGL((k_c32_t<1, MODE>), dim3(rows/64), dim3(128), 0, c512_resident::stream,
+                           nullptr, data.data, reinterpret_cast<const unsigned char*>(fp8.data), scale,
+                           nullptr, nullptr, C32Io(), fz);
+        HIP_CHECK(hipGetLastError());
+        if (c512_resident::launch_hook) c512_resident::launch_hook(MODE == 1 ? "k_c32_t<pre>" : "k_c32_t<head>");
+    }
     // Fused body of one launch: WMMA unless c512_resident::exact_math.
     void body(const float* input,int rows,float* raw_out,float* quant_out,const C32Io& io=C32Io()) const {
         if (c512_resident::exact_math && !io.in_hwc && !io.out_hwc && !io.permute) {
@@ -268,6 +280,7 @@ class Head {
     bool ready=false;
     bool coeff_half=false;  // half-valued coefficients allow the fused finish pass
 public:
+    bool keep_native=true;  // the fused head writes the native body only when set (native_view)
     size_t comparisons=0;
     // max_rows caps the body scratch; larger frames run in chunks without stage checks.
     Head(int w,int h,const std::string& fixture,int max_rows=0):width(checked(w,h)),height(h),n(size_t(w)*h*32),nrgb(size_t(w)*h*3),dir(fixture),
@@ -282,6 +295,14 @@ public:
         if(!main.data||main.count!=n/4||!skip.data||skip.count!=n||!color.data||color.count!=nrgb)return false;
         if(!check(dir,"main",main.data,n/4,verify,comparisons)||!check(dir,"skip",skip.data,n,verify,comparisons)||
            !check(dir,"color",color.data,nrgb,verify,comparisons))return false;
+        if(!verify&&coeff_half&&Weights::fusable()){
+            // Merge, body and finish in one launch (k_c32_t MODE 2).
+            C32Fuse fz;fz.width=width;fz.height=height;fz.main=main.data;fz.skip=skip.data;fz.sm=sm.data;fz.ss=ss.data;
+            fz.coeff=coeff.data;fz.color=color.data;fz.rgb_native=rgb_native.data;fz.rgb_public=rgb_public.data;
+            fz.native=keep_native?native.data:nullptr;fz.native_scale=.03125f;
+            weights.fused<2>(width*height,fz);
+            ready=true;return true;
+        }
         C32_LAUNCH(k_head70_merge,n,main.data,skip.data,sm.data,ss.data,merged.data,width,height);
         if(!verify&&!c512_resident::exact_math){
             // The body reads the native merge in peer order and writes native directly.

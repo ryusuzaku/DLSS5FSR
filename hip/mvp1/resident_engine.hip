@@ -1435,6 +1435,7 @@ struct Engine {
         }
         net->front->history = use_history ? hist_cur->data : nullptr;
         net->front->noise_seed = temporal ? temporal_seed : 0;
+        net->head70->keep_native = temporal && use_history;  // k_head_temporal's input
         HIP_CHECK(hipEventRecord(start, stream));
         const unsigned char* net_src = reinterpret_cast<const unsigned char*>(raw_input->data);
         if (!job_crop && options.luma && options.input_temporal > 0.0f && frame_bpp == 8) {

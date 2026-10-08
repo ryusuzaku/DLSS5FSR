@@ -220,22 +220,29 @@ public:
             else load_noise();
             loaded_seed = noise_seed; loaded_function = noise_function;
         }
-        FRONT_LAUNCH(k_front_stem,pixels*32,rgb.data,noise.data,stem.data,tokens.data,width,height,controls,history);
         const float *raw = nullptr, *quant = nullptr;
         const bool fused = !verify && !c512_resident::exact_math;  // bodies gather/scatter themselves
+        // Stem, block0, pool and skip0 in one launch (k_c32_t MODE 1).
+        const bool pre = fused && Weights::fusable();
+        if (!pre) FRONT_LAUNCH(k_front_stem,pixels*32,rgb.data,noise.data,stem.data,tokens.data,width,height,controls,history);
         auto io = [](int in_hwc, int w, int h, int shift) {
             C32Io v; v.in_hwc = in_hwc; v.out_hwc = 1; v.width = w; v.height = h;
             v.px = (shift&1) ? 4 : 0; v.py = (shift&2) ? 4 : 0; v.pw = ((w+v.px+7)/8)*8;
             return v;
         };
-        if (fused) {
+        if (pre) {
+            C32Fuse fz; fz.width = width; fz.height = height; fz.rgb = rgb.data; fz.noise = noise.data;
+            fz.stem = stem.data; fz.history = history; fz.skip0 = skip0.data; fz.pool = image.data;
+            for (int k = 0; k < 5; ++k) fz.controls[k] = controls.v[k];
+            weights[0]->fused<1>(int(pixels), fz);
+        } else if (fused) {
             weights[0]->body(tokens.data, int(pixels), raw0.data, nullptr, io(0, width, height, 0));
         } else {
             if (!check(dir+"/block0","input",tokens.data,pixels*32,verify,comparisons) ||
                 !block(0,int(pixels),verify,raw,quant)) return false;
             FRONT_LAUNCH(k_front_scatter,pixels*32,raw,raw0.data,width,height,0);
         }
-        FRONT_LAUNCH(k_front_pool,pixels/4*32,raw0.data,image.data,width,height,32);
+        if (!pre) FRONT_LAUNCH(k_front_pool,pixels/4*32,raw0.data,image.data,width,height,32);
         if (!check(dir+"/block0","raw",raw0.data,pixels*32,verify,comparisons) ||
             !check(dir,"pre_down",image.data,pixels/4*32,verify,comparisons)) return false;
         const int shifts[5] = {0,0,3,0,3};
@@ -260,7 +267,7 @@ public:
         FRONT_LAUNCH(k_front_down,size_t(w/2)*(h/2)*64,down_pool.data,matrix.data,down.data,(w/2)*(h/2));
         FRONT_LAUNCH(k_front_native64,down.count,down.data,c64.data,int(down.count));
         FRONT_LAUNCH(k_front_native32,skip4.count,image.data,skip4.data,int(skip4.count),0);
-        FRONT_LAUNCH(k_front_native32,skip0.count,raw0.data,skip0.data,int(skip0.count),1);
+        if (!pre) FRONT_LAUNCH(k_front_native32,skip0.count,raw0.data,skip0.data,int(skip0.count),1);
         if (!check(dir,"down_pool",down_pool.data,down_pool.count,verify,comparisons) ||
             !check(dir,"down",down.data,down.count,verify,comparisons) ||
             !check(dir,"c64_input",c64.data,c64.count,verify,comparisons) ||

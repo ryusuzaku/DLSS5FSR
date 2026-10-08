@@ -28,6 +28,7 @@ int main(int argc, char** argv) {
         HIP_CHECK(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking));
         c512_resident::stream = stream;
         Network net(lines, W, H);
+        net.head70->keep_native = false;  // as the engine without temporal history
         Buffer raw((size_t(pitch)*fh+3)/4);
         HIP_CHECK(hipMemcpy(raw.data, bytes.data()+36, size_t(pitch)*fh, hipMemcpyHostToDevice));
         const unsigned char* src = reinterpret_cast<const unsigned char*>(raw.data);

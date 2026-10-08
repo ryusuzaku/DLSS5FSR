@@ -56,10 +56,72 @@ __device__ inline float expo(float c, float bias) {
 }
 }  // namespace c32t
 
-template<int TT>
+// Fused full-resolution blocks (MODE, one 16-token tile per wave). Windows
+// are the 8x8 raster windows of a width x height image (shift 0).
+// MODE 1, the front's block0: the input is k_front_stem's token computed in
+// place (rgb, noise, optional history, controls); the outputs are
+// k_front_native32's clamped native skip0 and k_front_pool's FP8 pool (the
+// 2x2 block of a pool is in one wave: lanes n, n^1, n^8).
+// MODE 2, head70: the input is k_head70_merge's value (main at half
+// resolution and the skip, native order) read in the body's peer order; the
+// outputs are k_head70_finish_pair's two RGB images (the aligned sums are
+// integer sums of truncated terms, so the two lane halves' partial sums
+// combine exactly) and, when native is set, the native body.
+struct C32Fuse {
+    int width = 0, height = 0;
+    const float *rgb = nullptr, *noise = nullptr, *stem = nullptr, *history = nullptr;
+    float controls[5] = {};
+    float *skip0 = nullptr, *pool = nullptr;
+    const float *main = nullptr, *skip = nullptr, *sm = nullptr, *ss = nullptr, *coeff = nullptr, *color = nullptr;
+    float *rgb_native = nullptr, *rgb_public = nullptr, *native = nullptr;
+    float native_scale = 1.0f;
+};
+
+namespace c32t {
+// float(static_cast<_Float16>(d)) without the software f64 -> f16 lowering:
+// round to float by odd (RNE, then one ulp toward d when inexact and even),
+// then to half; a float carries more than two extra bits, so the second
+// rounding is correct.
+__device__ inline float half_of(double d) {
+    float f = float(d);
+    if (double(f) != d) {
+        unsigned u = __float_as_uint(f);
+        if (!(u & 1u)) f = __uint_as_float(fabs(d) > fabs(double(f)) ? u + 1u : u - 1u);
+    }
+    return split512_half(f);
+}
+// head70_aligned_half over the 16 products of a lane pair: this lane's 8
+// (a[k], b[k]) and the other lane half's 8, with the running acc. ea / eb are
+// frexp exponents of a / b (a value's own once, not per colour). Every
+// truncated term is below 2^27 in magnitude, so 16 of them sum exactly in
+// an int.
+__device__ inline float aligned_pair(const float* a, const int* ea, const float* b, float acc) {
+    int e = -1000;
+    for (int k = 0; k < 8; ++k) {
+        int be;
+        frexpf(fabsf(b[k]), &be);
+        if (a[k] != 0.0f && b[k] != 0.0f) e = max(e, ea[k] + be);
+    }
+    e = max(e, __shfl_xor(e, 16));
+    if (acc != 0.0f) {
+        int ae;
+        frexpf(fabsf(acc), &ae);
+        e = max(e, ae + 1);
+    }
+    if (e == -1000) e = 0;
+    int sum = 0;
+    for (int k = 0; k < 8; ++k) sum += int(truncf(ldexpf(a[k] * b[k], 27 - e)));
+    sum += __shfl_xor(sum, 16);
+    return half_of(double(sum) * ldexp(1.0, e - 27) + double(acc));
+}
+}  // namespace c32t
+
+template<int TT, int MODE = 0>
 __global__ __launch_bounds__(128/TT) void k_c32_t(const float* in, const float* __restrict__ dw,
                                                   const unsigned char* __restrict__ w8, float scale,
-                                                  float* raw_out, float* quant_out, C32Io io) {
+                                                  float* raw_out, float* quant_out, C32Io io,
+                                                  C32Fuse fz = C32Fuse()) {
+    static_assert(MODE == 0 || TT == 1, "fused blocks run one tile per wave");
     using namespace c32t;
     __shared__ __attribute__((aligned(16))) unsigned char Ks[64*32];  // [key][d]
     __shared__ __attribute__((aligned(16))) unsigned char Vt[32*64];  // [d][key]
@@ -70,18 +132,56 @@ __global__ __launch_bounds__(128/TT) void k_c32_t(const float* in, const float* 
     const int win = blockIdx.x;
     int token[TT];
     for (int u = 0; u < TT; ++u) token[u] = (wave*TT + u)*16 + n;
-    for (int t = tid; t < 64; t += 128/TT) { in_base[t] = io.base(io.in_hwc, win, t); out_base[t] = io.base(io.out_hwc, win, t); }
-    __syncthreads();
+    if constexpr (MODE == 0) {
+        for (int t = tid; t < 64; t += 128/TT) { in_base[t] = io.base(io.in_hwc, win, t); out_base[t] = io.base(io.out_hwc, win, t); }
+        __syncthreads();
+    }
+    // The fused modes' pixel (fx, fy) of this lane's token.
+    const int wx = fz.width/8 > 0 ? fz.width/8 : 1;
+    const int fx = (win % wx)*8 + token[0]%8, fy = (win / wx)*8 + token[0]/8;
+    const size_t fp = size_t(fy)*fz.width + fx;
 
     // x^T as two B operands (channels s*16 + h*8 + e) and the FFN residual,
     // which sits in the contract output's layout (feature tile s, rows h*8+e).
     op8 xb[TT][2];
     float ffn[TT][2][8];
     for (int u = 0; u < TT; ++u) {
-        const int b = in_base[token[u]];
+        const int b = MODE == 0 ? in_base[token[u]] : 0;
+        float f[15];
+        if constexpr (MODE == 1) {  // k_front_stem's features
+            const float* p = fz.rgb + fp*3;
+            const float* nz = fz.noise + fp*3;
+            for (int k = 0; k < 3; ++k) f[k] = h70_h(nz[k]);
+            f[3] = 1.0f;
+            for (int k = 0; k < 3; ++k) {
+                float v = h70_h((p[k]-.5f)*.125f);
+                f[4+k] = v; f[7+k] = v;
+            }
+            if (fz.history) {
+                const float* q = fz.history + fp*3;
+                if (q[0] >= 0.0f)
+                    for (int k = 0; k < 3; ++k) f[7+k] = h70_h(h70_h(h70_h(q[k])-.5f)*.125f);
+            }
+            for (int k = 10; k < 15; ++k) f[k] = h70_h(fz.controls[k-10]);
+        }
         for (int s = 0; s < 2; ++s) {
             float v[8], x[8];
-            if (b < 0) {
+            if constexpr (MODE == 1) {
+                for (int e = 0; e < 8; ++e) {
+                    const int c = s*16 + h*8 + e;
+                    float part = 0.0f;
+                    for (int k = 0; k < 15; ++k) part += f[k]*fz.stem[k*32+c];
+                    x[e] = h70_h(part);
+                }
+            } else if constexpr (MODE == 2) {  // k_head70_merge
+                const size_t m = (size_t(fy/2)*(fz.width/2) + fx/2)*32;
+                for (int e = 0; e < 8; ++e) {
+                    const int nc = peer_to_native32(s*16 + h*8 + e);
+                    float main_product = fz.main[m + nc]*fz.sm[nc];
+                    float skip_product = fz.skip[fp*32 + nc]*fz.ss[nc];
+                    x[e] = head70_half(head70_half(main_product) + skip_product);
+                }
+            } else if (b < 0) {
                 for (int e = 0; e < 8; ++e) x[e] = 0.0f;
             } else if (!io.permute) {
                 const float4 lo = *reinterpret_cast<const float4*>(in + b + s*16 + h*8);
@@ -215,6 +315,55 @@ __global__ __launch_bounds__(128/TT) void k_c32_t(const float* in, const float* 
                 for (int e = 0; e < 8; ++e) acc[e] = c32f_h(acc[e]+part[e]);
             }
             cb[d] = pack(acc);
+        }
+        if constexpr (MODE != 0) {
+            float body[2][8];
+            for (int o = 0; o < 2; ++o) {
+                acc8 c = {};
+                c = mma(arow(Wp + o*16*32, 32, 16), cb[1], mma(arow(Wp + o*16*32, 32, 0), cb[0], c));
+                for (int e = 0; e < 8; ++e) body[o][e] = split512_half_sum(c[e], c32f_h(ffn[u][o][e]*g2[o*16 + h*8 + e]));
+            }
+            if constexpr (MODE == 1) {
+                // skip0 (k_front_native32, clamped) and the pool (k_front_pool).
+                const bool corner = (token[u] % 2) == 0 && (token[u] / 8) % 2 == 0;
+                float* pool = fz.pool + (size_t(fy/2)*(fz.width/2) + fx/2)*32;
+                for (int o = 0; o < 2; ++o)
+                    for (int e = 0; e < 8; ++e) {
+                        const int c = o*16 + h*8 + e;
+                        const float v = body[o][e];
+                        fz.skip0[fp*32 + peer_to_native32(c)] = fminf(448.0f, fmaxf(-448.0f, v));
+                        const float a = h70_h(v + __shfl_xor(v, 1));
+                        const float below = __shfl_xor(a, 8);
+                        if (corner) pool[c] = h70_f(h70_h(h70_h(a + below)*.25f));
+                    }
+            } else {
+                if (fz.native)
+                    for (int o = 0; o < 2; ++o)
+                        for (int e = 0; e < 8; ++e)
+                            fz.native[(size_t(win)*64 + token[u])*32 + peer_to_native32(o*16 + h*8 + e)] = body[o][e];
+                int ea[2][8];
+                for (int o = 0; o < 2; ++o)
+                    for (int e = 0; e < 8; ++e) frexpf(fabsf(body[o][e]), &ea[o][e]);
+                for (int c = 0; c < 3; ++c) {
+                    float coef[2][8];
+                    for (int o = 0; o < 2; ++o)
+                        for (int e = 0; e < 8; ++e) coef[o][e] = fz.coeff[c*32 + peer_to_native32(o*16 + h*8 + e)];
+                    float value = aligned_pair(body[0], ea[0], coef[0], 0.0f);
+                    value = aligned_pair(body[1], ea[1], coef[1], value);
+                    if (h) continue;
+                    const size_t i = fp*3 + c;
+                    // k_head70_finish_pair's double forms in float: each is one
+                    // rounding of an exact product/sum of floats (the scales are
+                    // powers of two), and rounding a float sum through double
+                    // first gives the same float.
+                    float base = fz.color[i] * 0.125f - 0.0625f;
+                    float nat = value * fz.native_scale + base;
+                    float pub = value + base;
+                    fz.rgb_native[i] = fminf(1.0f, fmaxf(0.0f, nat * 8.0f + 0.5f));
+                    fz.rgb_public[i] = fminf(1.0f, fmaxf(0.0f, pub * 8.0f + 0.5f));
+                }
+            }
+            continue;
         }
         const int ob = out_base[token[u]];
         for (int o = 0; o < 2; ++o) {
