@@ -247,19 +247,37 @@ __global__ void k_c32_half_weights(const float* dw, _Float16* hw, int n) {
 // the peer channel order when permute is set (either layout). Invalid (padding) tokens read
 // as zero and are not written; windows own disjoint pixels, so input and
 // output may be the same image.
+// A window token's pixel inside its 8x8 window. QUAD_TOKENS (experiment,
+// S333): four 4x4 quads in turn, raster inside each (the order the peer
+// DLSSNR-AMD validated against NVIDIA); otherwise raster over the window.
+__device__ inline int c32_local_x(int t) {
+#if defined(QUAD_TOKENS)
+    return ((t/16)%2)*4 + t%4;
+#else
+    return t%8;
+#endif
+}
+__device__ inline int c32_local_y(int t) {
+#if defined(QUAD_TOKENS)
+    return (t/32)*4 + (t%16)/4;
+#else
+    return t/8;
+#endif
+}
+
 struct C32Io {
     int in_hwc = 0, out_hwc = 0, permute = 0;
     int width = 0, height = 0, px = 0, py = 0, pw = 0;
     __device__ long long at(bool hwc, int win, int t, int c) const {
         if (!hwc) return (long long)(size_t(win)*64 + t)*32 + (permute ? peer_to_native32(c) : c);
-        int x = (win % (pw/8))*8 + t%8 - px, y = (win / (pw/8))*8 + t/8 - py;
+        int x = (win % (pw/8))*8 + c32_local_x(t) - px, y = (win / (pw/8))*8 + c32_local_y(t) - py;
         if (x < 0 || x >= width || y < 0 || y >= height) return -1;
         return (long long)(size_t(y)*width + x)*32 + (permute ? peer_to_native32(c) : c);
     }
     // A token's first element (channel 0 before the permutation), or -1.
     __device__ int base(bool hwc, int win, int t) const {
         if (!hwc) return (win*64 + t)*32;
-        int x = (win % (pw/8))*8 + t%8 - px, y = (win / (pw/8))*8 + t/8 - py;
+        int x = (win % (pw/8))*8 + c32_local_x(t) - px, y = (win / (pw/8))*8 + c32_local_y(t) - py;
         if (x < 0 || x >= width || y < 0 || y >= height) return -1;
         return (y*width + x)*32;
     }

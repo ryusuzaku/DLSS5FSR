@@ -18,8 +18,8 @@ __device__ inline bool front_window_pixel(int token, int width, int height, int 
     int px = (shift&1) ? 4 : 0, py = (shift&2) ? 4 : 0;
     int wx = (width+px+7)/8;
     int window = token/64, local = token%64;
-    x = (window%wx)*8 + local%8 - px;
-    y = (window/wx)*8 + local/8 - py;
+    x = (window%wx)*8 + c32_local_x(local) - px;
+    y = (window/wx)*8 + c32_local_y(local) - py;
     return x >= 0 && x < width && y >= 0 && y < height;
 }
 
