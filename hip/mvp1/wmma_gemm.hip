@@ -299,15 +299,18 @@ __global__ __launch_bounds__(32*WAVES) void k_wmma_gemm8t(
         const float* __restrict__ X, int ldx, const unsigned char* __restrict__ W, int K,
         const float* __restrict__ R, int ldr, const float* __restrict__ S,
         float* out, float* out2, int ldo, int T, int O,
-        long long gx, long long gw, long long go, int parts, float* partial) {
+        long long gx, long long gw, long long go, int parts, float* partial,
+        const unsigned char* __restrict__ X8 = nullptr, unsigned char* out8 = nullptr) {
     constexpr int LX = TKC + 16, THREADS = 32*WAVES;
     __shared__ __attribute__((aligned(16))) unsigned char xs[64*LX];
     const int tid = threadIdx.x, wave = tid/32, lane = tid%32, n = lane%16, h = lane/16;
     const int t0 = blockIdx.y*64, o0 = blockIdx.x*16*WAVES + wave*16;
     const int part = partial ? blockIdx.z : 0, group = partial ? 0 : blockIdx.z;
     X += group*gx; W += group*gw;
+    if (X8) X8 += group*gx;
     if (out) out += group*go;
     if (out2) out2 += group*go;
+    if (out8) out8 += group*go;
     if (RESIDUAL) R += group*go;
     const int span = K / parts, kbegin = partial ? part*span : 0, kend = partial ? kbegin+span : K;
     float acc[4][8], total[4][8];
@@ -327,10 +330,20 @@ __global__ __launch_bounds__(32*WAVES) void k_wmma_gemm8t(
     const unsigned char* wrow = W + size_t(o0 + n)*K + h*8;
     // The tokens' K range in TKC-deep chunks, software-pipelined: the next
     // chunk's X is loaded into registers while this one is multiplied.
-    constexpr int PER = 64*(TKC/4)/THREADS;
+    constexpr int PER = 64*(TKC/4)/THREADS, PER8 = (64*(TKC/16) + THREADS-1)/THREADS;
     float4 vin[PER];
+    uint4 bin[PER8];  // X8: the E4M3 bytes themselves (16 a load)
     auto fetch = [&](int c0) {
         const int kc = min(TKC, kend - c0);
+        if (X8) {
+#pragma unroll
+            for (int j = 0; j < PER8; ++j) {
+                const int i = tid + j*THREADS, row = i / (TKC/16), col = (i % (TKC/16))*16, t = t0 + row;
+                bin[j] = uint4{0, 0, 0, 0};
+                if (i < 64*(TKC/16) && t < T && col < kc) bin[j] = *reinterpret_cast<const uint4*>(X8 + size_t(t)*ldx + c0 + col);
+            }
+            return;
+        }
 #pragma unroll
         for (int j = 0; j < PER; ++j) {
             const int i = tid + j*THREADS, row = i / (TKC/4), col = (i % (TKC/4))*4, t = t0 + row;
@@ -349,6 +362,13 @@ __global__ __launch_bounds__(32*WAVES) void k_wmma_gemm8t(
                 wa[j][1] = *reinterpret_cast<const op8v*>(wrow + c0 + j*KS + 16);
             }
         __syncthreads();  // the previous chunk is consumed
+        if (X8) {
+#pragma unroll
+            for (int j = 0; j < PER8; ++j) {
+                const int i = tid + j*THREADS, row = i / (TKC/16), col = (i % (TKC/16))*16;
+                if (i < 64*(TKC/16) && col < kc) *reinterpret_cast<uint4*>(xs + row*LX + col) = bin[j];
+            }
+        } else
 #pragma unroll
         for (int j = 0; j < PER; ++j) {
             const int i = tid + j*THREADS, row = i / (TKC/4), col = (i % (TKC/4))*4;
@@ -411,17 +431,27 @@ __global__ __launch_bounds__(32*WAVES) void k_wmma_gemm8t(
             }
             put(out2 + at, v);
         }
+        if constexpr (EPI == FP8 || EPI == GATE) {
+            if (out8) {  // the FP8 output's E4M3 bytes (exact: they are E4M3 values)
+                unsigned lo = 0, hi = 0;
+                for (int e = 0; e < 4; ++e) { lo |= unsigned(to_e4m3(v[e])) << (8*e); hi |= unsigned(to_e4m3(v[4+e])) << (8*e); }
+                *reinterpret_cast<uint2*>(out8 + at) = uint2{lo, hi};
+            }
+        }
     }
 }
 
 // Partition totals in order: total = half(total + part), then the epilogue.
 template<class P, int EPI>
-__global__ void k_wmma_combine(const float* partial, int parts, int T, int O, float* out, float* out2, int ldo) {
+__global__ void k_wmma_combine(const float* partial, int parts, int T, int O, float* out, float* out2, int ldo,
+                               unsigned char* out8 = nullptr) {
     size_t i = blockIdx.x*(size_t)blockDim.x + threadIdx.x, n = size_t(T)*O;
     if (i >= n) return;
     float a = partial[i];
     for (int p = 1; p < parts; ++p) a = P::half(a + partial[p*n + i]);
-    store<P,EPI>(a, 0.0f, (i/O)*ldo + i%O, out, out2);
+    const size_t at = (i/O)*ldo + i%O;
+    store<P,EPI>(a, 0.0f, at, out, out2);
+    if constexpr (EPI == FP8) if (out8) out8[at] = to_e4m3(out[at]);
 }
 
 // Half copies of weight matrices, keyed by source pointer and size. Weights
@@ -484,9 +514,14 @@ inline const h16* half_weights(hipStream_t stream, const float* W, size_t count)
 }
 
 template<class P, int EPI, bool RESIDUAL>
+// X8 (optional): X's E4M3 bytes, same layout (read instead of X by the
+// transposed kernel). out8 (optional, FP8 / GATE): the FP8 output's bytes;
+// *wrote8 says whether this call wrote them.
 inline bool gemm(hipStream_t stream, const float* X, int ldx, const float* W, int K,
                  const float* R, int ldr, const float* S, float* out, float* out2, int ldo,
-                 int T, int O, int groups, long long gx, long long gw, long long go, int parts) {
+                 int T, int O, int groups, long long gx, long long gw, long long go, int parts,
+                 const unsigned char* X8 = nullptr, unsigned char* out8 = nullptr, bool* wrote8 = nullptr) {
+    if (wrote8) *wrote8 = false;
     // 16-byte weight rows/slices; K whole slices in every partition.
     if (K % 32 || (K/parts) % 32 || gw % 8) return false;
     const size_t wcount = size_t(groups-1)*gw + size_t(O)*K;
@@ -511,15 +546,18 @@ inline bool gemm(hipStream_t stream, const float* X, int ldx, const float* W, in
     const int zdim = partial ? parts : groups;
     if (use8 && gemm_t && EPI != DOUBLE_RES && O % 64 == 0 && ldx % 4 == 0 && gx % 4 == 0 && ldo % 4 == 0 && go % 4 == 0 &&
         (!RESIDUAL || ldr % 4 == 0) && (K/parts) % 32 == 0) {
+        if (X8 && (ldx % 16 || gx % 16)) X8 = nullptr;
+        unsigned char* o8 = !partial && ldo % 8 == 0 && go % 8 == 0 ? out8 : nullptr;
+        if (wrote8) *wrote8 = o8 != nullptr || (partial && EPI == FP8 && out8);
         if (O % 128 == 0 && size_t(O/128)*((T+63)/64)*zdim >= 256)
             hipLaunchKernelGGL((k_wmma_gemm8t<P,EPI,RESIDUAL,8>), dim3(O/128, (T+63)/64, zdim), dim3(256), 0, stream,
-                               X, ldx, w8, K, R, ldr, S, out, out2, ldo, T, O, gx, gw, go, parts, partial);
+                               X, ldx, w8, K, R, ldr, S, out, out2, ldo, T, O, gx, gw, go, parts, partial, X8, o8);
         else
             hipLaunchKernelGGL((k_wmma_gemm8t<P,EPI,RESIDUAL,4>), dim3(O/64, (T+63)/64, zdim), dim3(128), 0, stream,
-                               X, ldx, w8, K, R, ldr, S, out, out2, ldo, T, O, gx, gw, go, parts, partial);
+                               X, ldx, w8, K, R, ldr, S, out, out2, ldo, T, O, gx, gw, go, parts, partial, X8, o8);
         if (partial)
             hipLaunchKernelGGL((k_wmma_combine<P,EPI>), dim3((size_t(T)*O+255)/256), dim3(256), 0, stream,
-                               partial, parts, T, O, out, out2, ldo);
+                               partial, parts, T, O, out, out2, ldo, EPI == FP8 ? out8 : nullptr);
         HIP_CHECK(hipGetLastError());
         return true;
     }

@@ -71,6 +71,10 @@ class Chain {
     std::string head_dir;
     float* result = nullptr;
     Buffer raw_output;
+    // E4M3 byte copies of the FP8 activations the GEMMs pass on (S336): the
+    // consuming GEMM reads a quarter of the bytes and converts nothing.
+    Buffer mixed8, hidden8, branch8, feature8, ping8, pong8;
+    static unsigned char* bytes(Buffer& b) { return reinterpret_cast<unsigned char*>(b.data); }
 
     bool check(const std::string& dir, const char* name, float* device, size_t count, bool verify) {
         if (!verify) return true;
@@ -92,7 +96,8 @@ public:
         scores(size_t(max_window_tokens)*1024), exponents(size_t(max_window_tokens)*1024),
         probabilities(size_t(max_window_tokens)*1024), inverse(size_t(max_window_tokens)*32),
         context(size_t(max_window_tokens)*512),
-        crop(n), head_dir(head), raw_output(n) {
+        crop(n), head_dir(head), raw_output(n), mixed8(n/4), hidden8(size_t(tokens)*512), branch8(n/4),
+        feature8(n/4), ping8(n/4), pong8(n/4) {
         for (const auto& block : blocks)
             weights.emplace_back(new Weights(block.first, block.second));
         if (!head.empty()) {
@@ -119,6 +124,10 @@ public:
         }
         float* input = ping.data;
         float* output = pong.data;
+        // Byte copies only on the fast path; the block input has none until a
+        // block of this chain wrote it.
+        const bool b8 = !c512_resident::exact_math && !verify;
+        unsigned char *input8 = nullptr, *output8 = b8 ? bytes(pong8) : nullptr, *spare8 = b8 ? bytes(ping8) : nullptr;
         for (const auto& entry : weights) {
             const Weights& w = *entry;
             int px = (w.shift & 1) ? 4 : 0, py = (w.shift & 2) ? 4 : 0;
@@ -133,7 +142,7 @@ public:
             } else {
                 // FP8 epilogue = k_split512_quant of the raw product (kept for checks).
                 tiled::gemm<tiled::Split,tiled::FP8,false>(c512_resident::stream, input, 512, w.matrix.data, 512, nullptr, 0, nullptr,
-                    mixed.data, verify ? pre.data : nullptr, 512, tokens, 512);
+                    mixed.data, verify ? pre.data : nullptr, 512, tokens, 512, 1, 0, 0, 0, 1, input8, b8 ? bytes(mixed8) : nullptr);
             }
             if (!check(w.dir, "expected", pre.data, n, verify)) return false;
             if (small) C512_LAUNCH(k_split512_quant, n, pre.data, mixed.data, int(n));
@@ -143,9 +152,11 @@ public:
                 C512_LAUNCH(k_split512_contract, n, hidden.data, w.contract.data, branch.data, tokens);
             } else {
                 tiled::gemm<tiled::Split,tiled::GATE,false>(c512_resident::stream, mixed.data, 512, w.expand.data, 64, nullptr, 0, nullptr,
-                    nullptr, hidden.data, 2048, tokens, 256, 8, 64, 256*64, 256);
+                    nullptr, hidden.data, 2048, tokens, 256, 8, 64, 256*64, 256, 1,
+                    b8 ? bytes(mixed8) : nullptr, b8 ? bytes(hidden8) : nullptr);
                 tiled::gemm<tiled::Split,tiled::FP8,false>(c512_resident::stream, hidden.data, 2048, w.contract.data, 256, nullptr, 0, nullptr,
-                    branch.data, nullptr, 512, tokens, 64, 8, 256, 64*256, 64);
+                    branch.data, nullptr, 512, tokens, 64, 8, 256, 64*256, 64, 1,
+                    b8 ? bytes(hidden8) : nullptr, b8 ? bytes(branch8) : nullptr);
                 HIP_CHECK(hipGetLastError());
             }
             if (!check(w.dir, "branch", branch.data, n, verify)) return false;
@@ -154,7 +165,8 @@ public:
                             w.skip.data, nullptr, feature.data, tokens);
             } else {
                 tiled::gemm<tiled::Split,tiled::FP8,true>(c512_resident::stream, branch.data, 512, w.projection.data, 512, input, 512,
-                    w.skip.data, feature.data, nullptr, 512, tokens, 512);
+                    w.skip.data, feature.data, nullptr, 512, tokens, 512, 1, 0, 0, 0, 1,
+                    b8 ? bytes(branch8) : nullptr, b8 ? bytes(feature8) : nullptr);
             }
             if (!check(w.dir, "feature", feature.data, n, verify)) return false;
             if (!verify && !small && !c512_resident::exact_math && width > 4 && height > 4) {
@@ -162,15 +174,16 @@ public:
                 // windows (zero rows for padding) and writes the context to
                 // HWC: no gather or scatter pass.
                 tiled::gemm<tiled::Split,tiled::RAW,false>(c512_resident::stream, feature.data, 512, w.qkv.data, 512, nullptr, 0, nullptr,
-                    qkv.data, nullptr, 1536, tokens, 1536);
+                    qkv.data, nullptr, 1536, tokens, 1536, 1, 0, 0, 0, 1, bytes(feature8));
                 WindowIo io;
                 io.hwc = 1; io.width = width; io.height = height; io.px = px; io.py = py;
                 io.pw = ((width+px+7)/8)*8;
                 c512_resident::fused_attention(qkv.data, w.scales.data, w.bias.data, crop.data, wt, 512, &io);
                 tiled::gemm<tiled::Split,tiled::FP8,true>(c512_resident::stream, crop.data, 512, w.final.data, 512, feature.data, 512,
-                    w.final_skip.data, output, raw_output.data, 512, tokens, 512);
+                    w.final_skip.data, output, raw_output.data, 512, tokens, 512, 1, 0, 0, 0, 1, nullptr, output8);
                 HIP_CHECK(hipGetLastError());
                 std::swap(input, output);
+                input8 = output8; std::swap(output8, spare8);
                 continue;
             }
             C512_LAUNCH(k_split512_window_gather, wn, feature.data, window.data, width, height, w.shift);
@@ -209,6 +222,7 @@ public:
             if (!check(w.dir, "final_raw", raw_output.data, n, verify) ||
                 !check(w.dir, "final", output, n, verify)) return false;
             std::swap(input, output);
+            input8 = nullptr;  // this path wrote no bytes
         }
         if (head_weights) {
             if (!check(head_dir, "raw", raw_output.data, n, verify)) return false;

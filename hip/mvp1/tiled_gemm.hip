@@ -116,9 +116,13 @@ template<class P, int EPI, bool RESIDUAL>
 inline void gemm(hipStream_t stream, const float* X, int ldx, const float* W, int K,
                  const float* R, int ldr, const float* S, float* out, float* out2, int ldo,
                  int T, int O, int groups = 1, long long gx = 0, long long gw = 0, long long go = 0,
-                 int parts = 1) {
+                 int parts = 1, const unsigned char* X8 = nullptr, unsigned char* out8 = nullptr) {
+    // X8 / out8: E4M3 byte copies of X / the FP8 output (wmma_gemm::gemm).
+    // out8 is always written: by the GEMM when it can, else from the floats.
+    bool wrote8 = false;
     const bool wmma = wmma_gemm::enabled && !c512_resident::exact_math &&
-        wmma_gemm::gemm<P,EPI,RESIDUAL>(stream, X, ldx, W, K, R, ldr, S, out, out2, ldo, T, O, groups, gx, gw, go, parts);
+        wmma_gemm::gemm<P,EPI,RESIDUAL>(stream, X, ldx, W, K, R, ldr, S, out, out2, ldo, T, O, groups, gx, gw, go, parts,
+                                        X8, out8, &wrote8);
     // Narrow outputs use taller tiles so no thread idles; the arithmetic per
     // output is identical for every tile shape.
     if (wmma) {
@@ -134,6 +138,11 @@ inline void gemm(hipStream_t stream, const float* X, int ldx, const float* W, in
         dim3 grid((O+TO-1)/TO, (T+TT-1)/TT, groups);
         hipLaunchKernelGGL((k_gemm<P,EPI,RESIDUAL>), grid, dim3(256), 0, stream,
                            X, ldx, W, K, R, ldr, S, out, out2, ldo, T, O, gx, gw, go, parts);
+    }
+    if (out8 && !wrote8 && (EPI == FP8 || EPI == GATE)) {
+        const float* src = EPI == FP8 ? out : out2;
+        const size_t n = size_t(groups-1)*go + size_t(T)*ldo;
+        hipLaunchKernelGGL(wmma_gemm::k_to_e4m3, dim3((n+255)/256), dim3(256), 0, stream, src, out8, n);
     }
     if (c512_resident::launch_hook) {
         char name[96];

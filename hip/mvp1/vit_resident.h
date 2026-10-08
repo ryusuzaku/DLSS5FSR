@@ -36,6 +36,9 @@ class Chain {
     Buffer ping, pong, expanded, hidden, contract, projected, qkv, scores, exponents, attention;
     std::vector<std::unique_ptr<Weights>> weights;
     float* result = nullptr;
+    // E4M3 byte copies of the FP8 activations between the GEMMs (S336).
+    Buffer hidden8, contract8, ping8, pong8;
+    static unsigned char* bytes(Buffer& b) { return reinterpret_cast<unsigned char*>(b.data); }
 
     bool check(const std::string& dir, const char* name, float* device, size_t count, bool verify) {
         if (!verify) return true;
@@ -50,7 +53,8 @@ public:
         tokens(checked_tokens(count, blocks.size())), valid(valid_tokens > 0 ? valid_tokens : count),
         n(size_t(tokens)*1024),
         sn(size_t(32)*tokens*tokens), ping(n), pong(n), expanded(4*n), hidden(4*n),
-        contract(n), projected(3*n), qkv(3*n), scores(sn), exponents(sn), attention(n) {
+        contract(n), projected(3*n), qkv(3*n), scores(sn), exponents(sn), attention(n),
+        hidden8(n), contract8(n/4), ping8(n/4), pong8(n/4) {
         for (const auto& dir : blocks) weights.emplace_back(new Weights(dir));
     }
 
@@ -64,6 +68,8 @@ public:
             traffic.d2d_bytes += n*sizeof(float);
         }
         float *input = ping.data, *output = pong.data;
+        const bool b8 = !c512_resident::exact_math && !verify;
+        unsigned char *input8 = nullptr, *output8 = b8 ? bytes(pong8) : nullptr, *spare8 = b8 ? bytes(ping8) : nullptr;
         for (const auto& owned : weights) {
             const auto& w = *owned;
             if (!check(w.dir, "input", input, n, verify)) return false;
@@ -77,11 +83,13 @@ public:
                 VIT_LAUNCH(k_vit_qkv_projection, 3*n, contract.data, w.qkv.data, projected.data, tokens);
             } else {
                 tiled::gemm<tiled::Split,tiled::GATE,false>(c512_resident::stream, input, 1024, w.expand.data, 1024, nullptr, 0, nullptr,
-                    verify ? expanded.data : nullptr, hidden.data, 4096, tokens, 4096);
+                    verify ? expanded.data : nullptr, hidden.data, 4096, tokens, 4096, 1, 0, 0, 0, 1,
+                    input8, b8 ? bytes(hidden8) : nullptr);
                 tiled::gemm<tiled::Split,tiled::FP8,true>(c512_resident::stream, hidden.data, 4096, w.contract.data, 4096, input, 1024,
-                    w.skip.data, contract.data, nullptr, 1024, tokens, 1024, 1, 0, 0, 0, 4);
+                    w.skip.data, contract.data, nullptr, 1024, tokens, 1024, 1, 0, 0, 0, 4,
+                    b8 ? bytes(hidden8) : nullptr, b8 ? bytes(contract8) : nullptr);
                 tiled::gemm<tiled::Split,tiled::RAW,false>(c512_resident::stream, contract.data, 1024, w.qkv.data, 1024, nullptr, 0, nullptr,
-                    projected.data, nullptr, 3072, tokens, 3072, 1, 0, 0, 0, 2);
+                    projected.data, nullptr, 3072, tokens, 3072, 1, 0, 0, 0, 2, b8 ? bytes(contract8) : nullptr);
                 HIP_CHECK(hipGetLastError());
             }
             const bool fused = tokens % 64 == 0 && !c512_resident::exact_math && !verify;
@@ -108,7 +116,7 @@ public:
                            w.projection.data, w.projection_skip.data, output, tokens, 1024);
             } else {
                 tiled::gemm<tiled::Split,tiled::FP8,true>(c512_resident::stream, attention.data, 1024, w.projection.data, 1024, contract.data, 1024,
-                    w.projection_skip.data, output, nullptr, 1024, tokens, 1024, 1, 0, 0, 0, 4);
+                    w.projection_skip.data, output, nullptr, 1024, tokens, 1024, 1, 0, 0, 0, 4, nullptr, output8);
                 HIP_CHECK(hipGetLastError());
             }
             if (!check(w.dir, "expanded", expanded.data, 4*n, verify) ||
@@ -121,6 +129,8 @@ public:
                 !check(w.dir, "attention", attention.data, n, verify) ||
                 !check(w.dir, "projection", output, n, verify)) return false;
             std::swap(input, output);
+            if (small) input8 = nullptr;
+            else { input8 = output8; std::swap(output8, spare8); }
         }
         result = input;
         return true;
