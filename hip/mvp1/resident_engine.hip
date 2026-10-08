@@ -89,7 +89,10 @@ __global__ void k_candidate_input_full(const unsigned char* src, float* output, 
                                        const float* tone = nullptr, int encoded = 0) {
     const int pixel = (int)(blockIdx.x*blockDim.x + threadIdx.x);
     if (pixel >= width*height) return;
-    const int x = min(pixel % width, sw-1), y = min(pixel / width, sh-1);
+    // Past the content the original mirrors it, without repeating the edge
+    // (peer DLSSNR-AMD image_input.glsl: sx = 2*sw - x - 2).
+    const int px = pixel % width, py = pixel / width;
+    const int x = max(0, px < sw ? px : 2*sw - px - 2), y = max(0, py < sh ? py : 2*sh - py - 2);
     for (int c = 0; c < 3; ++c) {
         float srgb;
         if (sw == frame_w && sh == frame_h) {
