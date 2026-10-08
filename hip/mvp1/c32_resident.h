@@ -12,6 +12,7 @@
 #include "tiled_gemm.hip"
 #include "c32_fused.hip"
 #include "c32_fp8.hip"
+#include "c32_t.hip"
 
 namespace c32_resident {
 // Tiled-GEMM rounding policies of the head70/C32 kernels. The expand and QKV
@@ -82,12 +83,13 @@ struct Weights {
             hipLaunchKernelGGL(k_c32_wmma,dim3(rows/64),dim3(256),0,c512_resident::stream,
                                input,data.data,reinterpret_cast<const _Float16*>(halves.data),scale,raw_out,quant_out,io);
         } else {
-            // FP8 WMMA form: bit-identical to k_c32_wmma, 1.66x faster (S330).
-            hipLaunchKernelGGL(k_c32_fp8,dim3(rows/64),dim3(256),0,c512_resident::stream,
+            // FP8 WMMA form, transposed: bit-identical to k_c32_fp8 / k_c32_wmma,
+            // 2.9x faster than k_c32_fp8 (S336).
+            hipLaunchKernelGGL(k_c32_t<1>,dim3(rows/64),dim3(128),0,c512_resident::stream,
                                input,data.data,reinterpret_cast<const unsigned char*>(fp8.data),scale,raw_out,quant_out,io);
         }
         HIP_CHECK(hipGetLastError());
-        if (c512_resident::launch_hook) c512_resident::launch_hook(c512_resident::exact_math?"k_c32_fused":"k_c32_fp8");
+        if (c512_resident::launch_hook) c512_resident::launch_hook(c512_resident::exact_math?"k_c32_fused":"k_c32_t");
     }
 };
 // Shared retained workspace for sequential C32 body dispatches.

@@ -2,6 +2,8 @@
 // Fixed-shape decoder56-61 candidate; unchanged arithmetic kernels below.
 // Borrowed same-device/default-stream views expire at the next submission.
 #include "split512_resident.h"
+#include "c32_resident.h"
+#include "swin_t.hip"
 #include "upsample56_prefix.hip"
 #include "spatial128_window.hip"
 #include "c128_ffn_candidate.hip"
@@ -114,7 +116,7 @@ public:
             int wn=tokens/64;
             size_t count=size_t(tokens)*128, sc=size_t(wn)*4*4096;
             if (!check(w.dir+"/spatial","input",input,n,verify,comparisons)) return false;
-            if (!verify && swin_fp8::run<128>(input,output,last_raw?raw->data:nullptr,width,height,w.shift,
+            if (!verify && swin_t::run<128>(input,output,last_raw?raw->data:nullptr,width,height,w.shift,
                     {w.w1.data,w.w2.data,w.w3.data,w.skip.data,w.qkv.data,w.scales.data,w.bias.data,
                      w.projection.data,w.attention_skip.data},middle.data)) {
                 std::swap(input,output);

@@ -1,5 +1,7 @@
 #pragma once
 #include "split512_resident.h"
+#include "c32_resident.h"
+#include "swin_t.hip"
 #include "upsample48_prefix.hip"
 #include "spatial256_window.hip"
 #include "c256_ffn_candidate.hip"
@@ -115,7 +117,7 @@ public:
             int wn=tokens/64;
             size_t count=size_t(tokens)*256, sc=size_t(wn)*8*4096;
             if (!check(w.dir+"/spatial","input",input,n,verify,comparisons)) return false;
-            if (!verify && swin_fp8::run<256>(input,output,last_raw?raw->data:nullptr,width,height,w.shift,
+            if (!verify && swin_t::run<256>(input,output,last_raw?raw->data:nullptr,width,height,w.shift,
                     {w.w1.data,w.w2.data,w.w3.data,w.skip.data,w.qkv.data,w.scales.data,w.bias.data,
                      w.projection.data,w.attention_skip.data},middle.data)) {
                 std::swap(input,output);
