@@ -279,6 +279,141 @@ __global__ __launch_bounds__(256) void k_wmma_gemm8(
             }
 }
 
+// Transposed FP8 GEMM (S336): k_wmma_gemm8's arithmetic with the weights as
+// the A operand. A block covers 64 tokens x 16*WAVES outputs; each wave owns
+// one 16-output row tile and reuses its weight fragment on four token tiles.
+// The block stages its tokens' K range as E4M3 in LDS once per 256-deep chunk
+// (one barrier pair a chunk instead of one a 32-slice), and the weights stream
+// straight from memory. Same slices (two 16-deep steps from zero, then
+// acc = half(acc + slice)), partitions, residual and epilogues as
+// k_wmma_gemm8, so the outputs are identical. Not for DOUBLE_RES.
+#ifndef GEMMT_TKC
+#define GEMMT_TKC 64
+#endif
+#ifndef GEMMT_EXP
+#define GEMMT_EXP 0
+#endif
+constexpr int TKC = GEMMT_TKC;
+template<class P, int EPI, bool RESIDUAL, int WAVES>
+__global__ __launch_bounds__(32*WAVES) void k_wmma_gemm8t(
+        const float* __restrict__ X, int ldx, const unsigned char* __restrict__ W, int K,
+        const float* __restrict__ R, int ldr, const float* __restrict__ S,
+        float* out, float* out2, int ldo, int T, int O,
+        long long gx, long long gw, long long go, int parts, float* partial) {
+    constexpr int LX = TKC + 16, THREADS = 32*WAVES;
+    __shared__ __attribute__((aligned(16))) unsigned char xs[64*LX];
+    const int tid = threadIdx.x, wave = tid/32, lane = tid%32, n = lane%16, h = lane/16;
+    const int t0 = blockIdx.y*64, o0 = blockIdx.x*16*WAVES + wave*16;
+    const int part = partial ? blockIdx.z : 0, group = partial ? 0 : blockIdx.z;
+    X += group*gx; W += group*gw;
+    if (out) out += group*go;
+    if (out2) out2 += group*go;
+    if (RESIDUAL) R += group*go;
+    const int span = K / parts, kbegin = partial ? part*span : 0, kend = partial ? kbegin+span : K;
+    float acc[4][8], total[4][8];
+    for (int u = 0; u < 4; ++u) {
+        const int t = t0+u*16+n;
+        float r[8] = {};
+        if (RESIDUAL && part == 0 && t < T) {
+            const float4 lo = *reinterpret_cast<const float4*>(R + size_t(t)*ldr + o0+h*8);
+            const float4 hi = *reinterpret_cast<const float4*>(R + size_t(t)*ldr + o0+h*8 + 4);
+            r[0] = lo.x; r[1] = lo.y; r[2] = lo.z; r[3] = lo.w; r[4] = hi.x; r[5] = hi.y; r[6] = hi.z; r[7] = hi.w;
+        }
+        for (int e = 0; e < 8; ++e) {
+            acc[u][e] = 0.0f; total[u][e] = 0.0f;
+            if (RESIDUAL && part == 0 && t < T) acc[u][e] = P::half(r[e]*S[o0+h*8+e]);
+        }
+    }
+    const unsigned char* wrow = W + size_t(o0 + n)*K + h*8;
+    // The tokens' K range in TKC-deep chunks, software-pipelined: the next
+    // chunk's X is loaded into registers while this one is multiplied.
+    constexpr int PER = 64*(TKC/4)/THREADS;
+    float4 vin[PER];
+    auto fetch = [&](int c0) {
+        const int kc = min(TKC, kend - c0);
+#pragma unroll
+        for (int j = 0; j < PER; ++j) {
+            const int i = tid + j*THREADS, row = i / (TKC/4), col = (i % (TKC/4))*4, t = t0 + row;
+            vin[j] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            if (!(GEMMT_EXP & 1) && t < T && col < kc) vin[j] = *reinterpret_cast<const float4*>(X + size_t(t)*ldx + c0 + col);
+        }
+    };
+    fetch(kbegin);
+    for (int c0 = kbegin; c0 < kend; c0 += TKC) {
+        const int kc = min(TKC, kend - c0);
+        op8v wa[TKC/KS][2];
+        for (int j = 0; j < TKC/KS; ++j)
+            if (j*KS < kc) {
+                if (GEMMT_EXP & 2) { wa[j][0] = op8v{int(c0+j), 0x38}; wa[j][1] = op8v{0x38, int(c0)}; continue; }
+                wa[j][0] = *reinterpret_cast<const op8v*>(wrow + c0 + j*KS);
+                wa[j][1] = *reinterpret_cast<const op8v*>(wrow + c0 + j*KS + 16);
+            }
+        __syncthreads();  // the previous chunk is consumed
+#pragma unroll
+        for (int j = 0; j < PER; ++j) {
+            const int i = tid + j*THREADS, row = i / (TKC/4), col = (i % (TKC/4))*4;
+            if (col >= kc) continue;
+            const float4 v = vin[j];
+            const unsigned packed = unsigned(to_e4m3(split512_half(P::load(v.x)))) |
+                                    unsigned(to_e4m3(split512_half(P::load(v.y)))) << 8 |
+                                    unsigned(to_e4m3(split512_half(P::load(v.z)))) << 16 |
+                                    unsigned(to_e4m3(split512_half(P::load(v.w)))) << 24;
+            *reinterpret_cast<unsigned*>(xs + row*LX + col) = packed;
+        }
+        __syncthreads();
+        if (c0 + TKC < kend) fetch(c0 + TKC);
+        for (int j = 0; j < TKC/KS; ++j) {
+            const int k = j*KS, kg = c0 + k;
+            if (k >= kc) break;
+            const op8v a0 = wa[j][0], a1 = wa[j][1];
+            for (int u = 0; u < 4; ++u) {
+                const unsigned char* xr = xs + (u*16 + n)*LX + k + h*8;
+                acc8v slice = {};
+                slice = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(a0, *reinterpret_cast<const op8v*>(xr), slice);
+                slice = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(a1, *reinterpret_cast<const op8v*>(xr + 16), slice);
+                for (int e = 0; e < 8; ++e) acc[u][e] = P::half(acc[u][e] + slice[e]);
+            }
+            if ((kg+KS) % span == 0) {
+                for (int u = 0; u < 4; ++u)
+                    for (int e = 0; e < 8; ++e) {
+                        total[u][e] = kg+KS == kbegin+span ? acc[u][e] : P::half(total[u][e] + acc[u][e]);
+                        acc[u][e] = 0.0f;
+                    }
+            }
+        }
+    }
+    // Eight consecutive outputs of one token per lane: two float4 stores
+    // per destination (store<>'s values).
+    auto put = [](float* dst, const float* v) {
+        reinterpret_cast<float4*>(dst)[0] = make_float4(v[0], v[1], v[2], v[3]);
+        reinterpret_cast<float4*>(dst)[1] = make_float4(v[4], v[5], v[6], v[7]);
+    };
+    for (int u = 0; u < 4; ++u) {
+        const int t = t0+u*16+n;
+        if (t >= T) continue;
+        const float* a = total[u];
+        if (partial) { put(partial + (size_t(part)*T + t)*O + o0+h*8, a); continue; }
+        const size_t at = size_t(t)*ldo + o0+h*8;
+        float v[8];
+        if constexpr (EPI == RAW) {
+            put(out + at, a);
+        } else if constexpr (EPI == FP8) {
+            for (int e = 0; e < 8; ++e) v[e] = P::fp8(a[e]);
+            put(out + at, v);
+            if (out2) put(out2 + at, a);
+        } else {
+            if (out) put(out + at, a);
+            for (int e = 0; e < 8; ++e) {
+                float gate = fminf(4.0f, fmaxf(-4.0f, a[e]));
+                float inner = P::half(fabsf(gate)*(-0.055908203125f)+0.447265625f);
+                float poly = P::half(gate*inner+0.89453125f);
+                v[e] = P::fp8(P::half(a[e]*poly));
+            }
+            put(out2 + at, v);
+        }
+    }
+}
+
 // Partition totals in order: total = half(total + part), then the epilogue.
 template<class P, int EPI>
 __global__ void k_wmma_combine(const float* partial, int parts, int T, int O, float* out, float* out2, int ldo) {
@@ -309,6 +444,8 @@ struct State {
 inline State& state() { static State s; return s; }
 // RESIDENT_WMMA=0 disables this path; exact_math always does.
 inline bool enabled = [] { const char* v = getenv("RESIDENT_WMMA"); return !(v && *v == '0'); }();
+// RESIDENT_GEMM_T=0 keeps k_wmma_gemm8 instead of the transposed k_wmma_gemm8t.
+inline bool gemm_t = [] { const char* v = getenv("RESIDENT_GEMM_T"); return !(v && *v == '0'); }();
 // RESIDENT_GEMM_F16=1 keeps the f16 WMMA kernel instead of the FP8 one.
 #if defined(H70_NO_FP8)
 inline bool fp8 = false;  // half-activation build: f16 operands only
@@ -372,6 +509,20 @@ inline bool gemm(hipStream_t stream, const float* X, int ldx, const float* W, in
         partial = s.partial;
     }
     const int zdim = partial ? parts : groups;
+    if (use8 && gemm_t && EPI != DOUBLE_RES && O % 64 == 0 && ldx % 4 == 0 && gx % 4 == 0 && ldo % 4 == 0 && go % 4 == 0 &&
+        (!RESIDUAL || ldr % 4 == 0) && (K/parts) % 32 == 0) {
+        if (O % 128 == 0 && size_t(O/128)*((T+63)/64)*zdim >= 256)
+            hipLaunchKernelGGL((k_wmma_gemm8t<P,EPI,RESIDUAL,8>), dim3(O/128, (T+63)/64, zdim), dim3(256), 0, stream,
+                               X, ldx, w8, K, R, ldr, S, out, out2, ldo, T, O, gx, gw, go, parts, partial);
+        else
+            hipLaunchKernelGGL((k_wmma_gemm8t<P,EPI,RESIDUAL,4>), dim3(O/64, (T+63)/64, zdim), dim3(128), 0, stream,
+                               X, ldx, w8, K, R, ldr, S, out, out2, ldo, T, O, gx, gw, go, parts, partial);
+        if (partial)
+            hipLaunchKernelGGL((k_wmma_combine<P,EPI>), dim3((size_t(T)*O+255)/256), dim3(256), 0, stream,
+                               partial, parts, T, O, out, out2, ldo);
+        HIP_CHECK(hipGetLastError());
+        return true;
+    }
 #define WMMA_LAUNCH(BT, BO, FM, FN) \
     do { \
         if (use8) hipLaunchKernelGGL((k_wmma_gemm8<P,EPI,RESIDUAL,BT,BO,FM,FN>), dim3((O+BO-1)/BO, (T+BT-1)/BT, zdim), \
