@@ -227,8 +227,8 @@ public:
         if (head_weights) {
             if (!check(head_dir, "raw", raw_output.data, n, verify)) return false;
             C512_LAUNCH(k_split512_pool, pooled->count, raw_output.data, pooled->data, width, height);
-            C512_LAUNCH(k_split512_head, head_output->count, pooled->data, head_weights->data,
-                        head_output->data, tokens/4);
+            tiled::gemm<tiled::Split,tiled::FP8,false>(c512_resident::stream, pooled->data, 512, head_weights->data, 512,
+                nullptr, 0, nullptr, head_output->data, nullptr, 1024, tokens/4, 1024);  // k_split512_head
             if (!check(head_dir, "pool", pooled->data, pooled->count, verify) ||
                 !check(head_dir, "head", head_output->data, head_output->count, verify)) return false;
         }

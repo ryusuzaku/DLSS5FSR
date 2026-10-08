@@ -188,7 +188,11 @@ __global__ __launch_bounds__(128/TT) void k_c32_t(const float* in, const float* 
                 const float4 hi = *reinterpret_cast<const float4*>(in + b + s*16 + h*8 + 4);
                 x[0] = lo.x; x[1] = lo.y; x[2] = lo.z; x[3] = lo.w; x[4] = hi.x; x[5] = hi.y; x[6] = hi.z; x[7] = hi.w;
             } else {
-                for (int e = 0; e < 8; ++e) x[e] = in[b + io.channel(s*16 + h*8 + e)];
+                // peer c = s*16 + h*8 + e is native s*16 + 4(e>>1) + 2h + (e&1): four pairs.
+                for (int q = 0; q < 4; ++q) {
+                    const float2 v2 = *reinterpret_cast<const float2*>(in + b + s*16 + 4*q + 2*h);
+                    x[2*q] = v2.x; x[2*q+1] = v2.y;
+                }
             }
             for (int e = 0; e < 8; ++e) {
                 v[e] = c32f_h(x[e]);
@@ -386,10 +390,10 @@ __global__ __launch_bounds__(128/TT) void k_c32_t(const float* in, const float* 
                     *reinterpret_cast<float4*>(quant_out + a + 4) = make_float4(quant[4], quant[5], quant[6], quant[7]);
                 }
             } else {
-                for (int e = 0; e < 8; ++e) {
-                    const int a = ob + io.channel(o*16 + h*8 + e);
-                    if (raw_out) raw_out[a] = body[e];
-                    if (quant_out) quant_out[a] = quant[e];
+                for (int q = 0; q < 4; ++q) {
+                    const int a = ob + o*16 + 4*q + 2*h;
+                    if (raw_out) *reinterpret_cast<float2*>(raw_out + a) = make_float2(body[2*q], body[2*q+1]);
+                    if (quant_out) *reinterpret_cast<float2*>(quant_out + a) = make_float2(quant[2*q], quant[2*q+1]);
                 }
             }
         }

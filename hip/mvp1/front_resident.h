@@ -264,7 +264,8 @@ public:
                 (b == 4 && !check(block,"raw",raw4.data,size_t(w)*h*32,verify,comparisons))) return false;
         }
         FRONT_LAUNCH(k_front_pool,size_t(w/2)*(h/2)*32,raw4.data,down_pool.data,w,h,32);
-        FRONT_LAUNCH(k_front_down,size_t(w/2)*(h/2)*64,down_pool.data,matrix.data,down.data,(w/2)*(h/2));
+        tiled::gemm<c32_resident::H70Raw,tiled::FP8,false>(c512_resident::stream,down_pool.data,32,matrix.data,32,nullptr,0,nullptr,
+            down.data,nullptr,64,(w/2)*(h/2),64);  // k_front_down
         FRONT_LAUNCH(k_front_native64,down.count,down.data,c64.data,int(down.count));
         FRONT_LAUNCH(k_front_native32,skip4.count,image.data,skip4.data,int(skip4.count),0);
         if (!pre) FRONT_LAUNCH(k_front_native32,skip0.count,raw0.data,skip0.data,int(skip0.count),1);

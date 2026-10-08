@@ -206,7 +206,8 @@ public:
         if (!input.data || input.count != n || !skip.data || skip.count != out_n) return false;
         if (!check(dir,"input",input.data,n,verify,comparisons) ||
             !check(dir,"skip",skip.data,out_n,verify,comparisons)) return false;
-        C32_LAUNCH(k_upsample66_project, n/2, input.data,weights.data,low.data,width*height);
+        tiled::gemm<tiled::Split,tiled::RAW,false>(c512_resident::stream,input.data,64,weights.data,64,nullptr,0,nullptr,
+            low.data,nullptr,32,width*height,32);  // k_upsample66_project
         C32_LAUNCH(k_upsample66_merge, out_n, low.data,skip.data,scale.data,merged.data,width,height);
         if (!check(dir,"low",low.data,n/2,verify,comparisons) ||
             !check(dir,"merged",merged.data,out_n,verify,comparisons)) return false;

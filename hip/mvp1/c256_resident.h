@@ -51,7 +51,8 @@ public:
         if (!input.data || input.count != n || !skip.data || skip.count != out_n) return false;
         if (!check(dir,"input",input.data,n,verify,comparisons) ||
             !check(dir,"skip",skip.data,out_n,verify,comparisons)) return false;
-        C256_LAUNCH(k_upsample48_project, n/2, input.data,weights.data,low.data,width*height);
+        tiled::gemm<tiled::Split,tiled::RAW,false>(c512_resident::stream,input.data,512,weights.data,512,nullptr,0,nullptr,
+            low.data,nullptr,256,width*height,256);  // k_upsample48_project
         C256_LAUNCH(k_upsample48_merge, out_n, low.data,skip.data,scale.data,merged.data,width,height,out_w,out_h);
         if (!check(dir,"low",low.data,n/2,verify,comparisons) ||
             !check(dir,"merged",merged.data,out_n,verify,comparisons)) return false;
@@ -198,7 +199,8 @@ public:
         if (!raw.data || raw.count != n) return false;
         if (!check(dir,"raw",raw.data,n,verify,comparisons)) return false;
         C256_LAUNCH(k_encoder256_pool,pool_n,raw.data,pool.data,width,height);
-        C256_LAUNCH(k_encoder256_downsample,out_n,pool.data,matrix.data,output.data,width*height/4);
+        tiled::gemm<tiled::Split,tiled::FP8,false>(c512_resident::stream,pool.data,256,matrix.data,256,nullptr,0,nullptr,
+            output.data,nullptr,512,width*height/4,512);  // k_encoder256_downsample
         if (!check(dir,"pool",pool.data,pool_n,verify,comparisons) ||
             !check(dir,"output",output.data,out_n,verify,comparisons)) return false;
         ready=true;
