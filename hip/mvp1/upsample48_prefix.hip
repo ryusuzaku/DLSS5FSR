@@ -18,11 +18,15 @@ __global__ void k_upsample48_project(const float* input,const float* weights,
     low[i]=acc;
 }
 
+// outwidth/outheight (0: twice the input): the skip's extent. NVIDIA's decoder
+// upsample takes the encoder level's own shape, which can be smaller than twice
+// the rounded-up C512 grid (1080p: 36 C512 rows, 68 skip rows).
 __global__ void k_upsample48_merge(const float* low,const float* skip,
                                    const float* scale,float* merged,
-                                   int width,int height) {
+                                   int width,int height,int outwidth=0,int outheight=0) {
     int i=blockIdx.x*blockDim.x+threadIdx.x;
-    int outwidth=2*width,outheight=2*height;
+    if(outwidth<=0)outwidth=2*width;
+    if(outheight<=0)outheight=2*height;
     if(i>=outwidth*outheight*256)return;
     int c=i%256,x=i/256%outwidth,y=i/256/outwidth;
     float main=low[((y/2)*width+x/2)*256+c];

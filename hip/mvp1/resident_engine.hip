@@ -730,8 +730,30 @@ __global__ void k_head_temporal(const float* tiles, const float* row, const floa
     }
 }
 
+// NVIDIA's level sizes (peer DLSSNR-AMD nr_native_plan.cpp, validated against
+// the DLL): every reduction maps a side d to up(ceil(d/2), 4). For the network
+// extents used here (multiples of 64) that changes nothing down to 1/16, but
+// the C512 grid (1/32) and the ViT grid (1/64) are rounded up to multiples of
+// 4, and the extra rows and columns are real tokens -- zero where the encoder
+// hands over, then computed through every C512 block and attended by the ViT
+// (1080p: C512 36x60 for 34x60 of image, ViT 32x20 = 640 tokens for 30x17).
+// The decoder's upsample takes the encoder level's own shape again.
+static inline int up4(int v) { return (v + 3)/4*4; }
+
+__global__ void k_pad_hwc(const float* src, float* dst, int w, int h, int dw, int c) {
+    const size_t i = size_t(blockIdx.x)*blockDim.x + threadIdx.x;
+    if (i >= size_t(w)*h*c) return;
+    const size_t pixel = i / c;
+    const int x = int(pixel % w), y = int(pixel / w);
+    dst[(size_t(y)*dw + x)*c + i % c] = src[i];
+}
+
 struct Network {
-    int W, H, width, height, tokens, vit_tokens;  // vit_tokens: tokens padded to a multiple of 64
+    // width x height: the image at 1/32; w32 x h32: NVIDIA's C512 grid (multiples
+    // of 4); tokens: the C512 head's (w32/2 x h32/2); vit_valid: NVIDIA's ViT
+    // sequence (up4(w32/2) x up4(h32/2)); vit_tokens: that padded to a multiple
+    // of 64 for the fused attention, which masks only past vit_valid.
+    int W, H, width, height, w32, h32, tokens, vit_valid, vit_tokens;
     size_t n, hn;
     std::unique_ptr<front_resident::FrontEnd> front;
     std::unique_ptr<c64_resident::Chain> encoder8;
@@ -754,6 +776,18 @@ struct Network {
     std::unique_ptr<c32_resident::Chain> c32;
     std::unique_ptr<c32_resident::Head> head70;
     std::unique_ptr<Buffer> bridge, color, rgb_native, rgb_public;
+    std::unique_ptr<Buffer> padded;  // the C512 chain's input on NVIDIA's grid (null when it is the image's)
+
+    // The encoder's 1/32 output into the zeroed, rounded-up C512 grid.
+    bool pad_c512() {
+        if (!padded) return true;
+        const DeviceTensor src = down22->final_view();
+        if (!src.data || src.count != size_t(width)*height*512) return false;
+        hipLaunchKernelGGL(k_pad_hwc, dim3((src.count+255)/256), dim3(256), 0, c512_resident::stream,
+                           src.data, padded->data, width, height, w32, 512);
+        HIP_CHECK(hipGetLastError());
+        return true;
+    }
 
     // The WMMA half weight cache is keyed by these weights' device pointers;
     // a later network can reuse the addresses, so drop the copies with them.
@@ -765,10 +799,11 @@ struct Network {
     // Config: the resident_frame_server arguments after the executable; the
     // width/height lines are ignored, weights come from the listed fixtures.
     Network(const std::vector<std::string>& a, int rgb_w, int rgb_h) :
-        W(rgb_w), H(rgb_h), width(rgb_w/32), height(rgb_h/32), tokens((rgb_w/64)*(rgb_h/64)),
-        vit_tokens(tokens == 16 || tokens % 64 == 0 ? tokens : (tokens+63)/64*64),
-        n(size_t(width)*height*512), hn(size_t(tokens)*1024) {
-        if (vit_tokens != tokens && c512_resident::exact_math)
+        W(rgb_w), H(rgb_h), width(rgb_w/32), height(rgb_h/32), w32(up4(width)), h32(up4(height)),
+        tokens((w32/2)*(h32/2)), vit_valid(up4(w32/2)*up4(h32/2)),
+        vit_tokens(vit_valid == 16 || vit_valid % 64 == 0 ? vit_valid : (vit_valid+63)/64*64),
+        n(size_t(w32)*h32*512), hn(size_t(tokens)*1024) {
+        if (vit_tokens != vit_valid && c512_resident::exact_math)
             throw std::runtime_error("exact mode needs a ViT token count of 16 or a multiple of 64");
         const int cap = 65536;  // C32 body rows per chunk above this
         front.reset(new front_resident::FrontEnd(W,H,a[23],cap));
@@ -778,7 +813,11 @@ struct Network {
         down14.reset(new c128_resident::Downsample(width*4,height*4,a[20]));
         encoder22.reset(new c256_resident::Chain(width*2,height*2,blocks(a[17],8),true));
         down22.reset(new c256_resident::Downsample(width*2,height*2,a[18]));
-        chain.reset(new Chain(width,height,blocks(a[0],8),a[3]));
+        chain.reset(new Chain(w32,h32,blocks(a[0],8),a[3]));
+        if (w32 != width || h32 != height) {
+            padded.reset(new Buffer(n));
+            HIP_CHECK(hipMemset(padded->data, 0, n*sizeof(float)));  // the extra rows/columns enter as zero
+        }
         auto gather = vit_gather_map(tokens);
         std::vector<int32_t> inverse(gather.size());
         for (size_t i = 0; i < gather.size(); ++i) inverse[size_t(gather[i])] = int32_t(i);
@@ -786,10 +825,10 @@ struct Network {
         // Padding tokens stay zero (the gather writes only the real ones).
         bridge.reset(new Buffer(size_t(vit_tokens)*1024));
         HIP_CHECK(hipMemset(bridge->data, 0, bridge->count*sizeof(float)));
-        vit.reset(new vit_resident::Chain(vit_tokens,folders(a[5],8),tokens));
-        entry.reset(new decoder39_resident::Entry(width/2,height/2,a[6],inverse));
-        decoder.reset(new Chain(width,height,blocks(a[7],8)));
-        prefix48.reset(new c256_resident::Prefix(width,height,a[8]));
+        vit.reset(new vit_resident::Chain(vit_tokens,folders(a[5],8),vit_valid));
+        entry.reset(new decoder39_resident::Entry(w32/2,h32/2,a[6],inverse));
+        decoder.reset(new Chain(w32,h32,blocks(a[7],8)));
+        prefix48.reset(new c256_resident::Prefix(w32,h32,a[8],width*2,height*2));
         c256.reset(new c256_resident::Chain(width*2,height*2,blocks(a[9],8)));
         prefix56.reset(new c128_resident::Prefix(width*2,height*2,a[10]));
         c128.reset(new c128_resident::Chain(width*4,height*4,blocks(a[11],6)));
@@ -827,7 +866,7 @@ struct Network {
             encoder8->run_from_device(front->c64_view()) && down8->run_from_device(encoder8->raw_view()) &&
             encoder14->run_from_device(down8->final_view()) && down14->run_from_device(encoder14->raw_view()) &&
             encoder22->run_from_device(down14->final_view()) && down22->run_from_device(encoder22->raw_view()) &&
-            chain->run_from_device(down22->final_view());
+            pad_c512() && chain->run_from_device(padded ? DeviceTensor{padded->data, n} : down22->final_view());
         if (ok) {
             auto head = chain->head_view();
             hipLaunchKernelGGL(k_vit_bridge_gather, dim3((hn+255)/256), dim3(256), 0, stream,

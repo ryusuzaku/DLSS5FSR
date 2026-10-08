@@ -1642,7 +1642,12 @@ int main(int argc, char** argv) {
             Check(MaxChannelDiff(p1.rb, ep.rb) > 2,
                   "resident engine changes the resolved frame");
         } else {
-            Check(MaxChannelDiff(p1.rb, ep.rb) > 20,
+            const int preview_change = MaxChannelDiff(p1.rb, ep.rb);
+            printf("  preview max channel change: %d\n", preview_change);
+            // > 8: proof the engine's output reaches the texture. The network
+            // with NVIDIA's level sizes (S334) edits this synthetic gradient by
+            // 17 (the earlier, non-matching one by 39).
+            Check(preview_change > 8,
                   "resident engine preview visibly changes the model texture");
             bool opaque = ep.rb.pixels.size() == (size_t)DST_W * DST_H * 4;
             for (size_t k = 0; opaque && k < (size_t)DST_W * DST_H; ++k)

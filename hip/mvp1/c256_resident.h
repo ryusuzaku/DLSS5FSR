@@ -30,23 +30,27 @@ class Prefix {
         if (w <= 0 || h <= 0 || w % 2 || h % 2) throw std::invalid_argument("block48 input must be a positive multiple of 2");
         return w;
     }
-    int width, height;
+    int width, height, out_w, out_h;
     size_t n, out_n;
     std::string dir;
     Buffer weights, scale, low, merged;
     bool ready = false;
 public:
     size_t comparisons = 0;
-    Prefix(int w, int h, const std::string& fixture) : width(checked(w,h)), height(h),
-        n(size_t(w)*h*512), out_n(n*2), dir(fixture), weights(dir,"weights",256*512),
-        scale(dir,"scale",256), low(n/2), merged(out_n) {}
+    // ow x oh (0: twice the input): the output and skip extent, at most twice the input.
+    Prefix(int w, int h, const std::string& fixture, int ow = 0, int oh = 0) : width(checked(w,h)), height(h),
+        out_w(ow > 0 ? ow : 2*w), out_h(oh > 0 ? oh : 2*h),
+        n(size_t(w)*h*512), out_n(size_t(out_w)*out_h*256), dir(fixture), weights(dir,"weights",256*512),
+        scale(dir,"scale",256), low(n/2), merged(out_n) {
+        if (out_w > 2*w || out_h > 2*h) throw std::invalid_argument("block48 output larger than twice its input");
+    }
     bool run_from_device(DeviceTensor input, DeviceTensor skip, bool verify = false) {
         ready = false;
         if (!input.data || input.count != n || !skip.data || skip.count != out_n) return false;
         if (!check(dir,"input",input.data,n,verify,comparisons) ||
             !check(dir,"skip",skip.data,out_n,verify,comparisons)) return false;
         C256_LAUNCH(k_upsample48_project, n/2, input.data,weights.data,low.data,width*height);
-        C256_LAUNCH(k_upsample48_merge, out_n, low.data,skip.data,scale.data,merged.data,width,height);
+        C256_LAUNCH(k_upsample48_merge, out_n, low.data,skip.data,scale.data,merged.data,width,height,out_w,out_h);
         if (!check(dir,"low",low.data,n/2,verify,comparisons) ||
             !check(dir,"merged",merged.data,out_n,verify,comparisons)) return false;
         ready = true;

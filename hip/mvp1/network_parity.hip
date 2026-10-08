@@ -69,6 +69,29 @@ int main(int argc, char** argv) {
     // encoded = 1: the network sees the display-encoded values, as the original.
     net.run(reinterpret_cast<const unsigned char*>(dev), fw, fh, fw*4, 4, false, stream, fw, fh, nullptr, 1);
     HIP_CHECK(hipStreamSynchronize(stream));
+    // PARITY_DUMP=dir: every stage's activations as raw floats (dir/NN_name.f32),
+    // in this implementation's own layout, for comparison with a reference.
+    if (const char* dir = getenv("PARITY_DUMP")) {
+        struct Stage { const char* name; DeviceTensor t; };
+        const Stage stages[] = {
+            {"00_input", {net.color->data, net.color->count}}, {"01_front_c64", net.front->c64_view()},
+            {"02_skip4", net.front->skip4_view()}, {"03_skip0", net.front->skip0_view()},
+            {"04_encoder8", net.encoder8->final_view()}, {"05_down8", net.down8->final_view()},
+            {"06_encoder14", net.encoder14->final_view()}, {"07_down14", net.down14->final_view()},
+            {"08_encoder22", net.encoder22->final_view()}, {"09_down22", net.down22->final_view()},
+            {"10_chain", net.chain->final_view()}, {"11_vit", net.vit->final_view()},
+            {"12_entry", net.entry->final_view()}, {"13_decoder", net.decoder->final_view()},
+            {"14_c256", net.c256->final_view()}, {"15_c128", net.c128->final_view()},
+            {"16_c64", net.c64->final_view()}, {"17_c32", net.c32->final_view()},
+            {"18_head", {net.rgb_native->data, net.rgb_native->count}}};
+        for (const Stage& st : stages) {
+            std::vector<float> v(st.t.count);
+            if (st.t.data && st.t.count) HIP_CHECK(hipMemcpy(v.data(), st.t.data, v.size()*sizeof(float), hipMemcpyDeviceToHost));
+            const std::string path = std::string(dir) + "/" + st.name + ".f32";
+            if (FILE* d = fopen(path.c_str(), "wb")) { fwrite(v.data(), 4, v.size(), d); fclose(d); }
+            printf("dump %s: %zu floats\n", st.name, v.size());
+        }
+    }
     std::vector<float> out(size_t(W)*H*3);
     HIP_CHECK(hipMemcpy(out.data(), net.rgb_native->data, out.size()*sizeof(float), hipMemcpyDeviceToHost));
     FILE* o = fopen(argv[3], "wb");
