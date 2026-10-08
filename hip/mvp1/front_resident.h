@@ -146,6 +146,9 @@ public:
     FrontControls controls{};  // stem features 10..14 (engine option controls=)
     const float* history = nullptr;  // stem features 7..9 (engine option temporal=), null: current colour
     unsigned noise_seed = 0;         // 0: the captured tile; otherwise the original's noise for this seed
+    // noise_function: the original's noise also at seed 0 (computed over the
+    // whole extent, as the original) instead of the fixtures' 256x256 tile.
+    bool noise_function = false, loaded_function = false;
 private:
     unsigned loaded_seed = 0;
     static int checked(int w, int h) {
@@ -212,10 +215,10 @@ public:
         ready = false;
         if (!rgb.data || rgb.count != pixels*3) return false;
         if (!check(dir,"rgb",rgb.data,pixels*3,verify,comparisons)) return false;
-        if (noise_seed != loaded_seed) {
-            if (noise_seed) FRONT_LAUNCH(k_front_noise,pixels,noise.data,width,height,noise_seed);
+        if (noise_seed != loaded_seed || noise_function != loaded_function) {
+            if (noise_seed || noise_function) FRONT_LAUNCH(k_front_noise,pixels,noise.data,width,height,noise_seed);
             else load_noise();
-            loaded_seed = noise_seed;
+            loaded_seed = noise_seed; loaded_function = noise_function;
         }
         FRONT_LAUNCH(k_front_stem,pixels*32,rgb.data,noise.data,stem.data,tokens.data,width,height,controls,history);
         const float *raw = nullptr, *quant = nullptr;

@@ -63,6 +63,7 @@ int main(int argc, char** argv) {
     Network net(config, W, H);
     for (int k = 0; k < 5; ++k) net.front->controls.v[k] = controls[k];
     net.front->noise_seed = seed;
+    net.front->noise_function = getenv("PARITY_NOISE_FN") && *getenv("PARITY_NOISE_FN") == '1';
     void* dev = nullptr;
     HIP_CHECK(hipMalloc(&dev, rgba.size()));
     HIP_CHECK(hipMemcpy(dev, rgba.data(), rgba.size(), hipMemcpyHostToDevice));
