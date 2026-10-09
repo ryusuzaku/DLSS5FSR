@@ -267,6 +267,9 @@ __device__ inline int c32_local_y(int t) {
 
 struct C32Io {
     int in_hwc = 0, out_hwc = 0, permute = 0;
+    // k_c32_t storage formats (S336): in_fmt 0 float, 1 E4M3 byte, 2 half;
+    // out_fmt (quant_out) 0 float, 1 E4M3 byte. Addresses stay element indices.
+    int in_fmt = 0, out_fmt = 0;
     int width = 0, height = 0, px = 0, py = 0, pw = 0;
     __device__ long long at(bool hwc, int win, int t, int c) const {
         if (!hwc) return (long long)(size_t(win)*64 + t)*32 + (permute ? peer_to_native32(c) : c);

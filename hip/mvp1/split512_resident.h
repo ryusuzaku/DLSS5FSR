@@ -27,7 +27,8 @@ inline const double alloc_log_mb = [] { const char* v = getenv("RESIDENT_ALLOC_L
 // Borrowed default-stream device view; it never owns or frees its pointer.
 struct DeviceTensor {
     const float* data = nullptr;
-    size_t count = 0;
+    size_t count = 0;  // elements
+    int fmt = 0;       // storage: 0 float, 1 E4M3 byte, 2 half (S336; data is then reinterpreted)
 };
 
 // Device buffer of `count` floats, allocated on first use of `data` (S336):

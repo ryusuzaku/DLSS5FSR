@@ -207,13 +207,15 @@ class Prefix {
     int width, height;
     size_t n, out_n;
     std::string dir;
-    Buffer weights, scale, low, merged;
-    bool ready = false;
+    Buffer weights, scale, low, merged, merged_h;
+    bool ready = false, wrote_half = false;
 public:
     size_t comparisons = 0;
+    // half_out: the fast path stores the (half-valued) merge as halves.
+    bool half_out = false;
     Prefix(int w, int h, const std::string& fixture) : width(checked(w,h)), height(h),
         n(size_t(w)*h*64), out_n(n*2), dir(fixture), weights(dir,"weights",32*64),
-        scale(dir,"scale",32), low(n/2), merged(out_n) {}
+        scale(dir,"scale",32), low(n/2), merged(out_n), merged_h(out_n/2) {}
     bool run_from_device(DeviceTensor input, DeviceTensor skip, bool verify = false, bool skip_peer = false) {
         ready = false;
         if (!input.data || input.count != n || !skip.data || skip.count != out_n) return false;
@@ -221,14 +223,19 @@ public:
             !check(dir,"skip",skip.data,out_n,verify,comparisons)) return false;
         tiled::gemm<tiled::Split,tiled::RAW,false>(c512_resident::stream,input.data,64,weights.data,64,nullptr,0,nullptr,
             low.data,nullptr,32,width*height,32);  // k_upsample66_project
-        C32_LAUNCH(k_upsample66_merge, out_n, low.data,skip.data,scale.data,merged.data,width,height,int(skip_peer));
+        wrote_half = half_out && !verify && !c512_resident::exact_math;
+        if (skip.fmt && (verify || c512_resident::exact_math)) return false;
+        C32_LAUNCH(k_upsample66_merge, out_n, low.data,skip.data,scale.data,wrote_half ? merged_h.data.get() : merged.data.get(),
+                   width,height,int(skip_peer),skip.fmt,int(wrote_half));
         if (!check(dir,"low",low.data,n/2,verify,comparisons) ||
             !check(dir,"merged",merged.data,out_n,verify,comparisons)) return false;
         ready = true;
         return true;
     }
     DeviceTensor low_view() const { return ready ? DeviceTensor{low.data,n/2} : DeviceTensor{}; }
-    DeviceTensor final_view() const { return ready ? DeviceTensor{merged.data,out_n} : DeviceTensor{}; }
+    DeviceTensor final_view() const {
+        return !ready ? DeviceTensor{} : wrote_half ? DeviceTensor{merged_h.data.get(),out_n,2} : DeviceTensor{merged.data.get(),out_n};
+    }
 };
 
 class Chain {
@@ -239,22 +246,44 @@ class Chain {
     }
     int width,height;
     size_t n;
-    Buffer ping,pong,windows;
+    Buffer ping,pong,windows,ping8,pong8;
     Body body;
     std::vector<std::unique_ptr<Weights>> weights;
     std::vector<int> shifts;
     float* result=nullptr;
+    int result_fmt=0;
 public:
     size_t comparisons=0;
     Chain(int w,int h,const std::vector<std::pair<std::string,int>>& blocks):width(checked(w,h,blocks)),height(h),
-        n(size_t(w)*h*32),ping(n),pong(n),windows(size_t(w+8)*(h+8)*32),body((w+8)*(h+8)) {
+        n(size_t(w)*h*32),ping(n),pong(n),windows(size_t(w+8)*(h+8)*32),ping8(n/4),pong8(n/4),body((w+8)*(h+8)) {
         for(auto& b:blocks){weights.emplace_back(new Weights(b.first+"/body"));shifts.push_back(b.second);}
     }
     // consume_source: the fast path may use the source as its second buffer
     // (one buffer less; set when nothing reads the source afterwards).
     bool consume_source = false;
+    // byte_out: the fast path passes E4M3 bytes between blocks (and returns them).
+    bool byte_out = false;
     bool run_from_device(DeviceTensor source,bool verify=false) {
-        result=nullptr;if(!source.data||source.count!=n)return false;
+        result=nullptr;result_fmt=0;if(!source.data||source.count!=n)return false;
+        const bool fast=!verify&&!c512_resident::exact_math;
+        if(source.fmt&&!fast)return false;
+        if(fast&&(byte_out||source.fmt)){
+            // Block i reads its input in its format and writes bytes; buffers
+            // alternate between pong8 and the source (consume_source) or ping8.
+            const void* in=source.data;int in_fmt=source.fmt;
+            void* out=pong8.data.get();
+            void* other=consume_source?const_cast<float*>(source.data):static_cast<void*>(ping8.data.get());
+            for(size_t i=0;i<weights.size();++i){
+                auto& w=*weights[i];int shift=shifts[i],px=(shift&1)?4:0,py=(shift&2)?4:0;
+                int rows=((width+px+7)/8)*8*((height+py+7)/8)*8;
+                C32Io io;io.in_hwc=io.out_hwc=io.permute=1;io.width=width;io.height=height;io.px=px;io.py=py;
+                io.pw=((width+px+7)/8)*8;io.in_fmt=in_fmt;io.out_fmt=1;
+                w.body(static_cast<const float*>(in),rows,nullptr,static_cast<float*>(out),io);
+                const void* prev=in;in=out;in_fmt=1;
+                out=i==0?other:const_cast<void*>(prev);
+            }
+            result=static_cast<float*>(const_cast<void*>(in));result_fmt=1;return true;
+        }
         float *input = const_cast<float*>(source.data), *output = pong.data;
         // The first block reads the source in place (no copy into ping), the
         // rest ping-pong between pong and ping: the source is never written.
@@ -282,7 +311,7 @@ public:
         }
         result=input;return true;
     }
-    DeviceTensor final_view()const{return result?DeviceTensor{result,n}:DeviceTensor{};}
+    DeviceTensor final_view()const{return result?DeviceTensor{result,n,result_fmt}:DeviceTensor{};}
 };
 
 class Head {
@@ -319,13 +348,13 @@ public:
     bool run_from_device(DeviceTensor main,DeviceTensor skip,DeviceTensor color,bool verify=false,
                          const _Float16* skip_half=nullptr){
         ready=false;
-        if(skip_half&&(verify||!fusable()))return false;
+        if((skip_half||main.fmt)&&(verify||!fusable()))return false;
         if(!main.data||main.count!=n/4||(!skip_half&&(!skip.data||skip.count!=n))||!color.data||color.count!=nrgb)return false;
         if(!check(dir,"main",main.data,n/4,verify,comparisons)||(!skip_half&&!check(dir,"skip",skip.data,n,verify,comparisons))||
            !check(dir,"color",color.data,nrgb,verify,comparisons))return false;
         if(!verify&&coeff_half&&Weights::fusable()){
             // Merge, body and finish in one launch (k_c32_t MODE 2).
-            C32Fuse fz;fz.width=width;fz.height=height;fz.main=main.data;fz.skip=skip.data;fz.skiph=skip_half;fz.sm=sm.data;fz.ss=ss.data;
+            C32Fuse fz;fz.width=width;fz.height=height;fz.main=main.data;fz.main_fmt=main.fmt;fz.skip=skip.data;fz.skiph=skip_half;fz.sm=sm.data;fz.ss=ss.data;
             fz.coeff=coeff.data;fz.color=color.data;fz.rgb_native=dn();fz.rgb_public=dp();
             fz.native=keep_native?native.data:nullptr;fz.native_scale=.03125f;
             weights.fused<2>(width*height,fz);

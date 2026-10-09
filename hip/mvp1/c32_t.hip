@@ -35,6 +35,54 @@ __device__ inline op8 arow(const unsigned char* m, int ld, int k) {
     const int l = threadIdx.x % 32;
     return *reinterpret_cast<const op8*>(m + (l % 16) * ld + (l / 16) * 8 + k);
 }
+// Loads and stores of `n` consecutive elements in a storage format (0 float,
+// 1 E4M3 byte, 2 half); E4M3 and half hold these values exactly.
+__device__ inline float fp8_at(unsigned w, int k) { return __builtin_amdgcn_cvt_f32_fp8(int(w >> (8*k)), 0); }
+template<int N>
+__device__ inline void load_fmt(const void* p, int fmt, size_t at, float* x) {
+    if (fmt == 1) {
+        const unsigned char* q = static_cast<const unsigned char*>(p) + at;
+        if constexpr (N == 8) {
+            const uint2 w = *reinterpret_cast<const uint2*>(q);
+            for (int k = 0; k < 4; ++k) { x[k] = fp8_at(w.x, k); x[4+k] = fp8_at(w.y, k); }
+        } else {
+            const unsigned w = *reinterpret_cast<const unsigned short*>(q);
+            for (int k = 0; k < N; ++k) x[k] = fp8_at(w, k);
+        }
+    } else if (fmt == 2) {
+        const _Float16* q = static_cast<const _Float16*>(p) + at;
+        for (int k = 0; k < N; ++k) x[k] = float(q[k]);
+    } else {
+        const float* q = static_cast<const float*>(p) + at;
+        if constexpr (N == 8) {
+            const float4 lo = reinterpret_cast<const float4*>(q)[0], hi = reinterpret_cast<const float4*>(q)[1];
+            x[0] = lo.x; x[1] = lo.y; x[2] = lo.z; x[3] = lo.w; x[4] = hi.x; x[5] = hi.y; x[6] = hi.z; x[7] = hi.w;
+        } else {
+            for (int k = 0; k < N; ++k) x[k] = q[k];
+        }
+    }
+}
+// v: E4M3 values when fmt == 1 (the quantized outputs).
+template<int N>
+__device__ inline void store_fmt(void* p, int fmt, size_t at, const float* v) {
+    if (fmt == 1) {
+        unsigned char* q = static_cast<unsigned char*>(p) + at;
+        if constexpr (N == 8) {
+            const op8 b = pack(v);
+            *reinterpret_cast<uint2*>(q) = make_uint2(unsigned(b[0]), unsigned(b[1]));
+        } else {
+            for (int k = 0; k < N; ++k) q[k] = wmma_t::byte8(v[k]);
+        }
+    } else {
+        float* q = static_cast<float*>(p) + at;
+        if constexpr (N == 8) {
+            reinterpret_cast<float4*>(q)[0] = make_float4(v[0], v[1], v[2], v[3]);
+            reinterpret_cast<float4*>(q)[1] = make_float4(v[4], v[5], v[6], v[7]);
+        } else {
+            for (int k = 0; k < N; ++k) q[k] = v[k];
+        }
+    }
+}
 using wmma_t::gate;  // the shared f16 forms (wmma_t.hip)
 using wmma_t::expo;
 }  // namespace c32t
@@ -55,6 +103,7 @@ struct C32Fuse {
     const float *rgb = nullptr, *noise = nullptr, *stem = nullptr, *history = nullptr;
     float controls[5] = {};
     float *skip0 = nullptr, *pool = nullptr;
+    int pool_fmt = 0, main_fmt = 0;    // MODE 1 pool / MODE 2 main storage (0 float, 1 E4M3 byte)
     _Float16* skip0h = nullptr;        // MODE 1: skip0 as halves instead (exact: clamped half values)
     const float *main = nullptr, *skip = nullptr, *sm = nullptr, *ss = nullptr, *coeff = nullptr, *color = nullptr;
     const _Float16* skiph = nullptr;   // MODE 2: the skip as halves instead
@@ -213,7 +262,9 @@ __global__ __launch_bounds__(128/TT) void k_c32_t(const float* in, const float* 
                 const size_t m = (size_t(fy/2)*(fz.width/2) + fx/2)*32;
                 for (int q = 0; q < 4; ++q) {
                     const int nb = s*16 + 4*q + 2*h;
-                    const float2 mv = *reinterpret_cast<const float2*>(fz.main + m + nb);
+                    float mvv[2];
+                    load_fmt<2>(fz.main, fz.main_fmt, m + nb, mvv);
+                    const float2 mv = make_float2(mvv[0], mvv[1]);
                     float2 sv;
                     if (fz.skiph) {
                         const _Float16* hp = fz.skiph + fp*32 + nb;
@@ -231,15 +282,10 @@ __global__ __launch_bounds__(128/TT) void k_c32_t(const float* in, const float* 
             } else if (b < 0) {
                 for (int e = 0; e < 8; ++e) x[e] = 0.0f;
             } else if (!io.permute) {
-                const float4 lo = *reinterpret_cast<const float4*>(in + b + s*16 + h*8);
-                const float4 hi = *reinterpret_cast<const float4*>(in + b + s*16 + h*8 + 4);
-                x[0] = lo.x; x[1] = lo.y; x[2] = lo.z; x[3] = lo.w; x[4] = hi.x; x[5] = hi.y; x[6] = hi.z; x[7] = hi.w;
+                load_fmt<8>(in, io.in_fmt, size_t(b) + s*16 + h*8, x);
             } else {
                 // peer c = s*16 + h*8 + e is native s*16 + 4(e>>1) + 2h + (e&1): four pairs.
-                for (int q = 0; q < 4; ++q) {
-                    const float2 v2 = *reinterpret_cast<const float2*>(in + b + s*16 + 4*q + 2*h);
-                    x[2*q] = v2.x; x[2*q+1] = v2.y;
-                }
+                for (int q = 0; q < 4; ++q) load_fmt<2>(in, io.in_fmt, size_t(b) + s*16 + 4*q + 2*h, x + 2*q);
             }
             for (int e = 0; e < 8; ++e) {
                 v[e] = c32f_h(x[e]);
@@ -372,7 +418,11 @@ __global__ __launch_bounds__(128/TT) void k_c32_t(const float* in, const float* 
                         const float v = body[o][e];
                         const float a = h70_h(v + __shfl_xor(v, 1));
                         const float below = __shfl_xor(a, 8);
-                        if (corner) pool[c] = h70_f(h70_h(h70_h(a + below)*.25f));
+                        if (corner) {
+                            const float pv = h70_f(h70_h(h70_h(a + below)*.25f));
+                            if (fz.pool_fmt == 1) reinterpret_cast<unsigned char*>(fz.pool)[(pool - fz.pool) + c] = wmma_t::byte8(pv);
+                            else pool[c] = pv;
+                        }
                     }
             } else {
                 if (fz.native)
@@ -435,15 +485,12 @@ __global__ __launch_bounds__(128/TT) void k_c32_t(const float* in, const float* 
                     *reinterpret_cast<float4*>(raw_out + a) = make_float4(body[0], body[1], body[2], body[3]);
                     *reinterpret_cast<float4*>(raw_out + a + 4) = make_float4(body[4], body[5], body[6], body[7]);
                 }
-                if (quant_out) {
-                    *reinterpret_cast<float4*>(quant_out + a) = make_float4(quant[0], quant[1], quant[2], quant[3]);
-                    *reinterpret_cast<float4*>(quant_out + a + 4) = make_float4(quant[4], quant[5], quant[6], quant[7]);
-                }
+                if (quant_out) store_fmt<8>(quant_out, io.out_fmt, a, quant);
             } else {
                 for (int q = 0; q < 4; ++q) {
                     const int a = ob + o*16 + 4*q + 2*h;
                     if (raw_out) *reinterpret_cast<float2*>(raw_out + a) = make_float2(body[2*q], body[2*q+1]);
-                    if (quant_out) *reinterpret_cast<float2*>(quant_out + a) = make_float2(quant[2*q], quant[2*q+1]);
+                    if (quant_out) store_fmt<2>(quant_out, io.out_fmt, a, quant + 2*q);
                 }
             }
         }

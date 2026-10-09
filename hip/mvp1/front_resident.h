@@ -155,6 +155,8 @@ public:
     // skip4_native: also write skip4 in native order (skip4_view); the
     // network reads skip4_peer_view instead and turns this off.
     bool skip4_native = true;
+    // image_bytes: keep the block1-4 image as E4M3 bytes (skip4_view then empty).
+    bool image_bytes = false;
     // pool4: block4 pools its raw body itself (k_c32_t fz.pool), no raw4 buffer.
     bool pool4 = [] { const char* v = getenv("RESIDENT_POOL4"); return !(v && *v == '0'); }();
 private:
@@ -168,6 +170,8 @@ private:
     std::string dir;
     Buffer noise, stem, matrix, tokens, raw0, image, raw4, down_pool, down, c64, skip4, skip0, skip0h;
     Buffer matrix_native;  // matrix rows in the native order: the down GEMM writes c64 directly
+    Buffer image8;         // the block1-4 image as E4M3 bytes (image_bytes)
+    bool image_was_bytes = false;
     bool skip_is_half = false;  // this run wrote skip0 only as halves
     std::vector<std::unique_ptr<Weights>> weights;
     Body body;
@@ -179,7 +183,7 @@ public:
     FrontEnd(int w, int h, const std::string& fixture, int max_rows = 0) : width(checked(w,h)), height(h), pixels(size_t(w)*h),
         dir(fixture), noise(pixels*3), stem(dir,"stem_weights",15*32), matrix(dir,"matrix",64*32), matrix_native(64*32),
         tokens(size_t(w/2+8)*(h/2+8)*32 > pixels*32 ? size_t(w/2+8)*(h/2+8)*32 : pixels*32),
-        raw0(pixels*32), image(pixels/4*32), raw4(pixels/4*32), down_pool(pixels/16*32), down(pixels/16*64),
+        raw0(pixels*32), image(pixels/4*32), image8(pixels/4*32/4), raw4(pixels/4*32), down_pool(pixels/16*32), down(pixels/16*64),
         c64(pixels/16*64), skip4(pixels/4*32), skip0(pixels*32), skip0h(pixels*16),
         body(max_rows > 0 && size_t(max_rows) < pixels ? max_rows : int(pixels)) {
         for (int b = 0; b < 5; ++b) weights.emplace_back(new Weights(dir+"/block"+std::to_string(b)));
@@ -244,7 +248,11 @@ public:
         // Stem, block0, pool and skip0 in one launch (k_c32_t MODE 1).
         const bool pre = fused && Weights::fusable();
         skip_is_half = pre && half_skip;
-        const bool p4 = pool4 && Weights::fusable();  // the FP8 body (k_c32_t) pools; the f16 one does not
+        const bool p4 = pool4 && Weights::fusable();
+        // The block1-4 image as E4M3 bytes (it holds E4M3 values): the fused pre
+        // block writes it, the fused blocks read and write it (image_bytes).
+        const bool i8 = pre && image_bytes && fused;
+        image_was_bytes = i8;  // the FP8 body (k_c32_t) pools; the f16 one does not
         if (!pre) FRONT_LAUNCH(k_front_stem,pixels*32,rgb.data,noise.data,stem.data,tokens.data,width,height,controls,history);
         auto io = [](int in_hwc, int w, int h, int shift) {
             C32Io v; v.in_hwc = in_hwc; v.out_hwc = 1; v.width = w; v.height = h;
@@ -253,7 +261,8 @@ public:
         };
         if (pre) {
             C32Fuse fz; fz.width = width; fz.height = height; fz.rgb = rgb.data; fz.noise = noise.data;
-            fz.stem = stem.data; fz.history = history; fz.pool = image.data;
+            fz.stem = stem.data; fz.history = history;
+            fz.pool = i8 ? image8.data.get() : image.data.get(); fz.pool_fmt = int(i8);
             if (half_skip) fz.skip0h = reinterpret_cast<_Float16*>(skip0h.data.get()); else fz.skip0 = skip0.data;
             for (int k = 0; k < 5; ++k) fz.controls[k] = controls.v[k];
             weights[0]->fused<1>(int(pixels), fz);
@@ -276,8 +285,9 @@ public:
             if (fused) {
                 // block4: the 2x2 pool of its raw body in the epilogue (no raw4).
                 C32Fuse pz; pz.pool = b == 4 && p4 ? down_pool.data.get() : nullptr;
-                weights[b]->body(image.data, rows, b == 4 && !p4 ? raw4.data.get() : nullptr, image.data,
-                                 io(1, w, h, shifts[b]), pz);
+                C32Io bio = io(1, w, h, shifts[b]); bio.in_fmt = bio.out_fmt = int(i8);
+                float* img = i8 ? image8.data.get() : image.data.get();
+                weights[b]->body(img, rows, b == 4 && !p4 ? raw4.data.get() : nullptr, img, bio, pz);
                 continue;
             }
             FRONT_LAUNCH(k_front_gather,size_t(rows)*32,image.data,tokens.data,w,h,shifts[b]);
@@ -299,7 +309,7 @@ public:
                 down.data,nullptr,64,(w/2)*(h/2),64);  // k_front_down
             FRONT_LAUNCH(k_front_native64,down.count,down.data,c64.data,int(down.count));
         }
-        if (skip4_native) FRONT_LAUNCH(k_front_native32,skip4.count,image.data,skip4.data,int(skip4.count),0);
+        if (skip4_native && !i8) FRONT_LAUNCH(k_front_native32,skip4.count,image.data,skip4.data,int(skip4.count),0);
         if (!pre) FRONT_LAUNCH(k_front_native32,skip0.count,raw0.data,skip0.data,int(skip0.count),1);
         if (!check(dir,"down_pool",down_pool.data,down_pool.count,verify,comparisons) ||
             !check(dir,"down",down.data,down.count,verify,comparisons) ||
@@ -313,7 +323,9 @@ public:
     DeviceTensor skip4_view() const { return ready && skip4_native ? DeviceTensor{skip4.data,skip4.count} : DeviceTensor{}; }
     // The same values in the peer channel order (block4's image), for a reader
     // that maps the channels itself (k_upsample66_merge skip_peer).
-    DeviceTensor skip4_peer_view() const { return ready ? DeviceTensor{image.data.get(),skip4.count} : DeviceTensor{}; }
+    DeviceTensor skip4_peer_view() const {
+        return !ready ? DeviceTensor{} : image_was_bytes ? DeviceTensor{image8.data.get(),skip4.count,1} : DeviceTensor{image.data.get(),skip4.count};
+    }
     DeviceTensor skip0_view() const { return ready && !skip_is_half ? DeviceTensor{skip0.data,skip0.count} : DeviceTensor{}; }
     // skip0 as halves (the fused block0 with half_skip set), else null.
     const _Float16* skip0_half() const { return ready && skip_is_half ? reinterpret_cast<const _Float16*>(skip0h.data.get()) : nullptr; }

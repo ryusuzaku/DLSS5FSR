@@ -755,10 +755,10 @@ struct Network {
     // RESIDENT_MEMSAVE=0: the S336 memory savings off (A/B): sources consumed by
     // the chains, skip0 as halves, skip4 read in peer order.
     // A number selects parts (bits: 1 consume, 2 half skip0, 4 skip4 peer, 8 head
-    // out). Bit 8 is off by default: the engine's compose can still be reading the
+    // out, 16 C32-level E4M3/half storage). Bit 8 is off by default: the engine's compose can still be reading the
     // network's RGB buffers of the previous job while the next one runs (it broke
     // resident_engine_test), so the head keeps its own and the end-of-run copy.
-    static inline const int memsave_bits = [] { const char* v = getenv("RESIDENT_MEMSAVE"); return v ? atoi(v) : 7; }();
+    static inline const int memsave_bits = [] { const char* v = getenv("RESIDENT_MEMSAVE"); return v ? atoi(v) : 23; }();
     static inline const bool memsave = memsave_bits != 0;
     // width x height: the image at 1/32; w32 x h32: NVIDIA's C512 grid (multiples
     // of 4); tokens: the C512 head's (w32/2 x h32/2); vit_valid: NVIDIA's ViT
@@ -861,6 +861,8 @@ struct Network {
             c256->consume_source = c128->consume_source = c64->consume_source = c32->consume_source = true;
         }
         if (memsave_bits & 4) front->skip4_native = false;  // prefix66 reads block4's image in peer order
+        // Bit 16: E4M3 / half storage at the C32 level (front image, prefix66, C32 chain, head main).
+        if ((memsave_bits & 16) && (memsave_bits & 4) && c32_resident::Weights::fusable()) { front->image_bytes = true; prefix66->half_out = true; c32->byte_out = true; }
         if (memsave_bits & 8) { head70->out_native = rgb_native->data.get(); head70->out_public = rgb_public->data.get(); }
     }
 

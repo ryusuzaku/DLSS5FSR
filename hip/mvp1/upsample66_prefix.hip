@@ -21,16 +21,21 @@ __global__ void k_upsample66_project(const float* input,const float* weights,
 // skip_peer: the skip in the peer channel order (the front's block4 image)
 // instead of native (its k_front_native32 copy): read through the inverse
 // of peer_to_native32, the same value.
+// skip_fmt 1: the skip as E4M3 bytes; out_half: merged as halves (it is
+// half-valued; S336 storage formats).
 __global__ void k_upsample66_merge(const float* low,const float* skip,
                                    const float* scale,float* merged,
-                                   int width,int height,int skip_peer=0) {
+                                   int width,int height,int skip_peer=0,int skip_fmt=0,int out_half=0) {
     int i=blockIdx.x*blockDim.x+threadIdx.x;
     int outwidth=2*width,outheight=2*height;
     if(i>=outwidth*outheight*32)return;
     int c=i%32,x=i/32%outwidth,y=i/32/outwidth;
     float main=low[((y/2)*width+x/2)*32+c];
     const int sc=skip_peer?((c&~15)|(c&1)|((c&2)<<2)|((c&4)>>1)|((c&8)>>1)):c;
-    float product=skip[(i&~31)+sc]*scale[c];
+    const size_t si=(i&~31)+sc;
+    const float sv=skip_fmt==1?__builtin_amdgcn_cvt_f32_fp8(int(reinterpret_cast<const unsigned char*>(skip)[si]),0):skip[si];
+    float product=sv*scale[c];
     float total=main+product;
-    merged[i]=split512_half(total);
+    if(out_half) reinterpret_cast<_Float16*>(merged)[i]=split512_to_half(total);
+    else merged[i]=split512_half(total);
 }
