@@ -294,14 +294,15 @@ __global__ __launch_bounds__(256) void k_wmma_gemm8(
 #define GEMMT_EXP 0
 #endif
 constexpr int TKC = GEMMT_TKC;
-template<class P, int EPI, bool RESIDUAL, int WAVES>
+// TK: the K chunk; TK > 64 only with X8 (bytes need a quarter of the registers).
+template<class P, int EPI, bool RESIDUAL, int WAVES, int TK = TKC>
 __global__ __launch_bounds__(32*WAVES) void k_wmma_gemm8t(
         const float* __restrict__ X, int ldx, const unsigned char* __restrict__ W, int K,
         const float* __restrict__ R, int ldr, const float* __restrict__ S,
         float* out, float* out2, int ldo, int T, int O,
         long long gx, long long gw, long long go, int parts, float* partial,
         const unsigned char* __restrict__ X8 = nullptr, unsigned char* out8 = nullptr) {
-    constexpr int LX = TKC + 16, THREADS = 32*WAVES;
+    constexpr int LX = TK + 16, THREADS = 32*WAVES;
     __shared__ __attribute__((aligned(16))) unsigned char xs[64*LX];
     const int tid = threadIdx.x, wave = tid/32, lane = tid%32, n = lane%16, h = lane/16;
     const int t0 = blockIdx.y*64, o0 = blockIdx.x*16*WAVES + wave*16;
@@ -328,50 +329,51 @@ __global__ __launch_bounds__(32*WAVES) void k_wmma_gemm8t(
         }
     }
     const unsigned char* wrow = W + size_t(o0 + n)*K + h*8;
-    // The tokens' K range in TKC-deep chunks, software-pipelined: the next
+    // The tokens' K range in TK-deep chunks, software-pipelined: the next
     // chunk's X is loaded into registers while this one is multiplied.
-    constexpr int PER = 64*(TKC/4)/THREADS, PER8 = (64*(TKC/16) + THREADS-1)/THREADS;
+    constexpr bool BYTES = TK > 64;  // X8 only
+    constexpr int PER = BYTES ? 1 : 64*(TK/4)/THREADS, PER8 = (64*(TK/16) + THREADS-1)/THREADS;
     float4 vin[PER];
     uint4 bin[PER8];  // X8: the E4M3 bytes themselves (16 a load)
     auto fetch = [&](int c0) {
-        const int kc = min(TKC, kend - c0);
-        if (X8) {
+        const int kc = min(TK, kend - c0);
+        if (BYTES || X8) {
 #pragma unroll
             for (int j = 0; j < PER8; ++j) {
-                const int i = tid + j*THREADS, row = i / (TKC/16), col = (i % (TKC/16))*16, t = t0 + row;
+                const int i = tid + j*THREADS, row = i / (TK/16), col = (i % (TK/16))*16, t = t0 + row;
                 bin[j] = uint4{0, 0, 0, 0};
-                if (i < 64*(TKC/16) && t < T && col < kc) bin[j] = *reinterpret_cast<const uint4*>(X8 + size_t(t)*ldx + c0 + col);
+                if (i < 64*(TK/16) && t < T && col < kc) bin[j] = *reinterpret_cast<const uint4*>(X8 + size_t(t)*ldx + c0 + col);
             }
             return;
         }
 #pragma unroll
         for (int j = 0; j < PER; ++j) {
-            const int i = tid + j*THREADS, row = i / (TKC/4), col = (i % (TKC/4))*4, t = t0 + row;
+            const int i = tid + j*THREADS, row = i / (TK/4), col = (i % (TK/4))*4, t = t0 + row;
             vin[j] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
             if (!(GEMMT_EXP & 1) && t < T && col < kc) vin[j] = *reinterpret_cast<const float4*>(X + size_t(t)*ldx + c0 + col);
         }
     };
     fetch(kbegin);
-    for (int c0 = kbegin; c0 < kend; c0 += TKC) {
-        const int kc = min(TKC, kend - c0);
-        op8v wa[TKC/KS][2];
-        for (int j = 0; j < TKC/KS; ++j)
+    for (int c0 = kbegin; c0 < kend; c0 += TK) {
+        const int kc = min(TK, kend - c0);
+        op8v wa[TK/KS][2];
+        for (int j = 0; j < TK/KS; ++j)
             if (j*KS < kc) {
                 if (GEMMT_EXP & 2) { wa[j][0] = op8v{int(c0+j), 0x38}; wa[j][1] = op8v{0x38, int(c0)}; continue; }
                 wa[j][0] = *reinterpret_cast<const op8v*>(wrow + c0 + j*KS);
                 wa[j][1] = *reinterpret_cast<const op8v*>(wrow + c0 + j*KS + 16);
             }
         __syncthreads();  // the previous chunk is consumed
-        if (X8) {
+        if (BYTES || X8) {
 #pragma unroll
             for (int j = 0; j < PER8; ++j) {
-                const int i = tid + j*THREADS, row = i / (TKC/16), col = (i % (TKC/16))*16;
-                if (i < 64*(TKC/16) && col < kc) *reinterpret_cast<uint4*>(xs + row*LX + col) = bin[j];
+                const int i = tid + j*THREADS, row = i / (TK/16), col = (i % (TK/16))*16;
+                if (i < 64*(TK/16) && col < kc) *reinterpret_cast<uint4*>(xs + row*LX + col) = bin[j];
             }
         } else
 #pragma unroll
         for (int j = 0; j < PER; ++j) {
-            const int i = tid + j*THREADS, row = i / (TKC/4), col = (i % (TKC/4))*4;
+            const int i = tid + j*THREADS, row = i / (TK/4), col = (i % (TK/4))*4;
             if (col >= kc) continue;
             const float4 v = vin[j];
             const unsigned packed = unsigned(to_e4m3(split512_half(P::load(v.x)))) |
@@ -381,8 +383,8 @@ __global__ __launch_bounds__(32*WAVES) void k_wmma_gemm8t(
             *reinterpret_cast<unsigned*>(xs + row*LX + col) = packed;
         }
         __syncthreads();
-        if (c0 + TKC < kend) fetch(c0 + TKC);
-        for (int j = 0; j < TKC/KS; ++j) {
+        if (c0 + TK < kend) fetch(c0 + TK);
+        for (int j = 0; j < TK/KS; ++j) {
             const int k = j*KS, kg = c0 + k;
             if (k >= kc) break;
             const op8v a0 = wa[j][0], a1 = wa[j][1];
@@ -476,6 +478,8 @@ inline State& state() { static State s; return s; }
 inline bool enabled = [] { const char* v = getenv("RESIDENT_WMMA"); return !(v && *v == '0'); }();
 // RESIDENT_GEMM_T=0 keeps k_wmma_gemm8 instead of the transposed k_wmma_gemm8t.
 inline bool gemm_t = [] { const char* v = getenv("RESIDENT_GEMM_T"); return !(v && *v == '0'); }();
+// RESIDENT_GEMM_CHUNK256=0: 64-deep chunks on the byte path too.
+inline bool chunk256 = [] { const char* v = getenv("RESIDENT_GEMM_CHUNK256"); return !(v && *v == '0'); }();
 // RESIDENT_GEMM_F16=1 keeps the f16 WMMA kernel instead of the FP8 one.
 #if defined(H70_NO_FP8)
 inline bool fp8 = false;  // half-activation build: f16 operands only
@@ -549,12 +553,12 @@ inline bool gemm(hipStream_t stream, const float* X, int ldx, const float* W, in
         if (X8 && (ldx % 16 || gx % 16)) X8 = nullptr;
         unsigned char* o8 = !partial && ldo % 8 == 0 && go % 8 == 0 ? out8 : nullptr;
         if (wrote8) *wrote8 = o8 != nullptr || (partial && EPI == FP8 && out8);
-        if (O % 128 == 0 && size_t(O/128)*((T+63)/64)*zdim >= 256)
-            hipLaunchKernelGGL((k_wmma_gemm8t<P,EPI,RESIDUAL,8>), dim3(O/128, (T+63)/64, zdim), dim3(256), 0, stream,
-                               X, ldx, w8, K, R, ldr, S, out, out2, ldo, T, O, gx, gw, go, parts, partial, X8, o8);
-        else
-            hipLaunchKernelGGL((k_wmma_gemm8t<P,EPI,RESIDUAL,4>), dim3(O/64, (T+63)/64, zdim), dim3(128), 0, stream,
-                               X, ldx, w8, K, R, ldr, S, out, out2, ldo, T, O, gx, gw, go, parts, partial, X8, o8);
+        // Byte input: 256-deep chunks (a quarter of the barriers) when K allows.
+        const bool wide = X8 && chunk256 && (K/parts) % 256 == 0;
+#define GEMMT_LAUNCH(W, TKV) hipLaunchKernelGGL((k_wmma_gemm8t<P,EPI,RESIDUAL,W,TKV>), dim3(O/(16*W), (T+63)/64, zdim),                                dim3(32*W), 0, stream, X, ldx, w8, K, R, ldr, S, out, out2, ldo, T, O, gx, gw, go, parts, partial, X8, o8)
+        if (O % 128 == 0 && size_t(O/128)*((T+63)/64)*zdim >= 256) { if (wide) GEMMT_LAUNCH(8, 256); else GEMMT_LAUNCH(8, TKC); }
+        else { if (wide) GEMMT_LAUNCH(4, 256); else GEMMT_LAUNCH(4, TKC); }
+#undef GEMMT_LAUNCH
         if (partial)
             hipLaunchKernelGGL((k_wmma_combine<P,EPI>), dim3((size_t(T)*O+255)/256), dim3(256), 0, stream,
                                partial, parts, T, O, out, out2, ldo, EPI == FP8 ? out8 : nullptr);
