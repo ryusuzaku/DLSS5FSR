@@ -28,6 +28,9 @@ inline bool enabled = [] { const char* v = getenv("RESIDENT_SWIN_T"); return !(v
 // RESIDENT_SWIN_TT=0: one token tile a wave at C128 too (k_swin_t instead of k_swin_tt<128,2>).
 inline bool tiles2 = [] { const char* v = getenv("RESIDENT_SWIN_TT"); return !(v && *v == '0'); }();
 
+// Storage formats of a block's input, quantized output and raw output (S336):
+// 0 float, 1 E4M3 byte, 2 half (raw only); element addressing either way.
+struct SwinIo { int in_fmt = 0, out_fmt = 0, raw_fmt = 0; };
 __device__ inline float byte_of(op8 v, int e) {
     return __builtin_amdgcn_cvt_f32_fp8(int(unsigned(e < 4 ? v[0] : v[1]) >> (8*(e % 4))), 0);
 }
@@ -41,7 +44,7 @@ __global__ __launch_bounds__(128) void k_swin_t(const float* __restrict__ input,
         const u8* __restrict__ w1, const u8* __restrict__ w2, const u8* __restrict__ w3,
         const float* __restrict__ skip, const u8* __restrict__ wqkv, const float* __restrict__ scales,
         const float* __restrict__ bias, const u8* __restrict__ wp, const float* __restrict__ attention_skip,
-        float* output, float* raw_out) {
+        float* output, float* raw_out, SwinIo sio = SwinIo()) {
     constexpr int FT = C/16, KS = C/32, HEADS = C/32, HID = 4*C;
     __shared__ __attribute__((aligned(16))) u8 Ks[2][64*32];  // [key][d], per head parity
     __shared__ __attribute__((aligned(16))) u8 Vt[2][32*64];  // [d][key]
@@ -49,13 +52,13 @@ __global__ __launch_bounds__(128) void k_swin_t(const float* __restrict__ input,
     const int token = wave*16 + n, win = blockIdx.x;
     int px, py;
     const bool valid = g.pixel(win, token, px, py);
-    const float* src = input + (size_t(valid ? py : 0)*g.width + (valid ? px : 0))*C;
+    const size_t sb = (size_t(valid ? py : 0)*g.width + (valid ? px : 0))*C;  // element index
 
     // x^T: FT B operands (channels s*16 + h*8 + e).
     op8 xb[FT];
     for (int s = 0; s < FT; ++s) {
         float v[8];
-        load8(src + s*16 + h*8, v);  // a valid address either way: no branch
+        c32t::load_fmt<8>(input, sio.in_fmt, sb + s*16 + h*8, v);  // a valid address either way: no branch
         for (int e = 0; e < 8; ++e) v[e] = valid ? c32f_h(v[e]) : 0.0f;
         xb[s] = pack(v);
     }
@@ -97,7 +100,7 @@ __global__ __launch_bounds__(128) void k_swin_t(const float* __restrict__ input,
     h8 res[FT];
     for (int f = 0; f < FT; ++f) {
         float x[8], acc[8];
-        load8(src + f*16 + h*8, x);
+        c32t::load_fmt<8>(input, sio.in_fmt, sb + f*16 + h*8, x);
         for (int e = 0; e < 8; ++e) x[e] = valid ? x[e] : 0.0f;
         for (int e = 0; e < 8; ++e) acc[e] = c32f_h(x[e]*skip[f*16 + h*8 + e]);
         const u8* wr = w3 + size_t(f*16)*C;
@@ -182,17 +185,12 @@ __global__ __launch_bounds__(128) void k_swin_t(const float* __restrict__ input,
             }
     }
     if (!valid) return;
-    float* out = output + (size_t(py)*g.width + px)*C;
-    float* raw = raw_out ? raw_out + (size_t(py)*g.width + px)*C : nullptr;
+    const size_t ob = (size_t(py)*g.width + px)*C;
     for (int f = 0; f < FT; ++f) {
         float v[8], q[8];
         for (int e = 0; e < 8; ++e) { v[e] = float(res[f][e]); q[e] = split512_fp8(v[e]); }
-        float4* o = reinterpret_cast<float4*>(out + f*16 + h*8);
-        o[0] = make_float4(q[0], q[1], q[2], q[3]); o[1] = make_float4(q[4], q[5], q[6], q[7]);
-        if (raw) {
-            float4* r = reinterpret_cast<float4*>(raw + f*16 + h*8);
-            r[0] = make_float4(v[0], v[1], v[2], v[3]); r[1] = make_float4(v[4], v[5], v[6], v[7]);
-        }
+        c32t::store_fmt<8>(output, sio.out_fmt, ob + f*16 + h*8, q);
+        if (raw_out) c32t::store_fmt<8>(raw_out, sio.raw_fmt, ob + f*16 + h*8, v);
     }
 }
 
@@ -206,7 +204,7 @@ __global__ __launch_bounds__(128/TT) void k_swin_tt(const float* __restrict__ in
         const u8* __restrict__ w1, const u8* __restrict__ w2, const u8* __restrict__ w3,
         const float* __restrict__ skip, const u8* __restrict__ wqkv, const float* __restrict__ scales,
         const float* __restrict__ bias, const u8* __restrict__ wp, const float* __restrict__ attention_skip,
-        float* output, float* raw_out) {
+        float* output, float* raw_out, SwinIo sio = SwinIo()) {
     constexpr int FT = C/16, KS = C/32, HEADS = C/32, HID = 4*C;
     __shared__ __attribute__((aligned(16))) u8 Ks[2][64*32];
     __shared__ __attribute__((aligned(16))) u8 Vt[2][32*64];
@@ -214,17 +212,17 @@ __global__ __launch_bounds__(128/TT) void k_swin_tt(const float* __restrict__ in
     const int win = blockIdx.x;
     int token[TT], px[TT], py[TT];
     bool valid[TT];
-    const float* src[TT];
+    size_t sb[TT];  // element indices
     for (int u = 0; u < TT; ++u) {
         token[u] = (wave*TT + u)*16 + n;
         valid[u] = g.pixel(win, token[u], px[u], py[u]);
-        src[u] = input + (size_t(valid[u] ? py[u] : 0)*g.width + (valid[u] ? px[u] : 0))*C;
+        sb[u] = (size_t(valid[u] ? py[u] : 0)*g.width + (valid[u] ? px[u] : 0))*C;
     }
     op8 xb[TT][FT];
     for (int u = 0; u < TT; ++u)
         for (int s = 0; s < FT; ++s) {
             float v[8];
-            load8(src[u] + s*16 + h*8, v);
+            c32t::load_fmt<8>(input, sio.in_fmt, sb[u] + s*16 + h*8, v);
             for (int e = 0; e < 8; ++e) v[e] = valid[u] ? c32f_h(v[e]) : 0.0f;
             xb[u][s] = pack(v);
         }
@@ -273,7 +271,7 @@ __global__ __launch_bounds__(128/TT) void k_swin_tt(const float* __restrict__ in
         float acc[TT][8];
         for (int u = 0; u < TT; ++u) {
             float x[8];
-            load8(src[u] + f*16 + h*8, x);
+            c32t::load_fmt<8>(input, sio.in_fmt, sb[u] + f*16 + h*8, x);
             for (int e = 0; e < 8; ++e) acc[u][e] = c32f_h((valid[u] ? x[e] : 0.0f)*skip[f*16 + h*8 + e]);
         }
         const u8* wr = w3 + size_t(f*16)*C;
@@ -373,17 +371,12 @@ __global__ __launch_bounds__(128/TT) void k_swin_tt(const float* __restrict__ in
     }
     for (int u = 0; u < TT; ++u) {
         if (!valid[u]) continue;
-        float* out = output + (size_t(py[u])*g.width + px[u])*C;
-        float* raw = raw_out ? raw_out + (size_t(py[u])*g.width + px[u])*C : nullptr;
+        const size_t ob = (size_t(py[u])*g.width + px[u])*C;
         for (int f = 0; f < FT; ++f) {
             float v[8], q[8];
             for (int e = 0; e < 8; ++e) { v[e] = float(res[u][f][e]); q[e] = split512_fp8(v[e]); }
-            float4* o = reinterpret_cast<float4*>(out + f*16 + h*8);
-            o[0] = make_float4(q[0], q[1], q[2], q[3]); o[1] = make_float4(q[4], q[5], q[6], q[7]);
-            if (raw) {
-                float4* r = reinterpret_cast<float4*>(raw + f*16 + h*8);
-                r[0] = make_float4(v[0], v[1], v[2], v[3]); r[1] = make_float4(v[4], v[5], v[6], v[7]);
-            }
+            c32t::store_fmt<8>(output, sio.out_fmt, ob + f*16 + h*8, q);
+            if (raw_out) c32t::store_fmt<8>(raw_out, sio.raw_fmt, ob + f*16 + h*8, v);
         }
     }
 }
@@ -391,10 +384,11 @@ __global__ __launch_bounds__(128/TT) void k_swin_tt(const float* __restrict__ in
 // swin_fp8::run's contract; false means "run the reference kernels".
 template<int C>
 inline bool run(const float* input, float* output, float* raw_out, int width, int height, int shift,
-                const swin_fused::Block& w, const c512_resident::Buffer::Lazy& scratch) {
+                const swin_fused::Block& w, const c512_resident::Buffer::Lazy& scratch, SwinIo sio = SwinIo()) {
     // scratch serves only the swin_fp8 fallback (taken lazily: no allocation otherwise).
     if (c512_resident::exact_math) return false;
-    if (!enabled) return swin_fp8::run<C>(input, output, raw_out, width, height, shift, w, scratch.get());
+    if (sio.in_fmt || sio.out_fmt || sio.raw_fmt) { if (!enabled) return false; }  // formats: k_swin_t only
+    else if (!enabled) return swin_fp8::run<C>(input, output, raw_out, width, height, shift, w, scratch.get());
     hipStream_t s = c512_resident::stream;
     Geometry g{width, height, (shift&1) ? 4 : 0, (shift&2) ? 4 : 0, 0};
     g.pw = ((width+g.px+7)/8)*8;
@@ -404,12 +398,12 @@ inline bool run(const float* input, float* output, float* raw_out, int width, in
         hipLaunchKernelGGL((k_swin_tt<C,2>), dim3(windows), dim3(64), 0, s, input, g,
                            f8w(w.w1, size_t(4*C)*C), f8w(w.w2, size_t(C)*4*C), f8w(w.w3, size_t(C)*C), w.skip,
                            f8w(w.qkv, size_t(3*C)*C), w.scales, w.bias, f8w(w.projection, size_t(C)*C),
-                           w.attention_skip, output, raw_out);
+                           w.attention_skip, output, raw_out, sio);
     else
     hipLaunchKernelGGL(k_swin_t<C>, dim3(windows), dim3(128), 0, s, input, g,
                        f8w(w.w1, size_t(4*C)*C), f8w(w.w2, size_t(C)*4*C), f8w(w.w3, size_t(C)*C), w.skip,
                        f8w(w.qkv, size_t(3*C)*C), w.scales, w.bias, f8w(w.projection, size_t(C)*C),
-                       w.attention_skip, output, raw_out);
+                       w.attention_skip, output, raw_out, sio);
     HIP_CHECK(hipGetLastError());
     if (c512_resident::launch_hook) c512_resident::launch_hook(C == 64 ? "k_swin_t<64>" : C == 128 ? "k_swin_t<128>" : "k_swin_t<256>");
     return true;

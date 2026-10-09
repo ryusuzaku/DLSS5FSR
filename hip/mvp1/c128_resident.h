@@ -44,8 +44,12 @@ class Prefix {
     std::string dir;
     Buffer weights, scale, low, merged;
     bool ready = false;
+    std::unique_ptr<Buffer> merged8;  // byte_out: the merge as E4M3 bytes
+    bool wrote8 = false;
 public:
     size_t comparisons = 0;
+    // byte_out: the fast path reads byte inputs/skips and writes the merge as bytes.
+    bool byte_out = false;
     Prefix(int w, int h, const std::string& fixture) : width(checked(w,h)), height(h),
         n(size_t(w)*h*256), out_n(n*2), dir(fixture), weights(dir,"weights",128*256),
         scale(dir,"scale",128), low(n/2), merged(out_n) {}
@@ -54,16 +58,21 @@ public:
         if (!input.data || input.count != n || !skip.data || skip.count != out_n) return false;
         if (!check(dir,"input",input.data,n,verify,comparisons) ||
             !check(dir,"skip",skip.data,out_n,verify,comparisons)) return false;
-        tiled::gemm<tiled::Split,tiled::RAW,false>(c512_resident::stream,input.data,256,weights.data,256,nullptr,0,nullptr,
-            low.data,nullptr,128,width*height,128);  // k_upsample56_project
-        C128_LAUNCH(k_upsample56_merge, out_n, low.data,skip.data,scale.data,merged.data,width,height);
+        wrote8 = byte_out && !verify && !c512_resident::exact_math;
+        if ((input.fmt || skip.fmt) && (verify || c512_resident::exact_math)) return false;
+        tiled::gemm<tiled::Split,tiled::RAW,false>(c512_resident::stream,input.fmt?nullptr:input.data,256,weights.data,256,nullptr,0,nullptr,
+            low.data,nullptr,128,width*height,128,1,0,0,0,1,input.fmt==1?reinterpret_cast<const unsigned char*>(input.data):nullptr);  // k_upsample56_project
+        if (wrote8 && !merged8) merged8.reset(new Buffer((out_n+3)/4));
+        C128_LAUNCH(k_upsample56_merge, out_n, low.data,skip.data,scale.data,wrote8 ? merged8->data.get() : merged.data.get(),width,height,skip.fmt,int(wrote8));
         if (!check(dir,"low",low.data,n/2,verify,comparisons) ||
             !check(dir,"merged",merged.data,out_n,verify,comparisons)) return false;
         ready = true;
         return true;
     }
     DeviceTensor low_view() const { return ready ? DeviceTensor{low.data,n/2} : DeviceTensor{}; }
-    DeviceTensor final_view() const { return ready ? DeviceTensor{merged.data,out_n} : DeviceTensor{}; }
+    DeviceTensor final_view() const {
+        return !ready ? DeviceTensor{} : wrote8 ? DeviceTensor{merged8->data.get(),out_n,1} : DeviceTensor{merged.data.get(),out_n};
+    }
 };
 
 struct Weights {
@@ -95,6 +104,9 @@ class Chain {
     std::unique_ptr<Buffer> raw_windows,raw;
     std::vector<std::unique_ptr<Weights>> weights;
     float* result = nullptr;
+    int result_fmt = 0;
+    bool raw_was_half = false;
+    std::unique_ptr<Buffer> ping8, pong8, raw_h;  // byte activations, half raw
 public:
     size_t comparisons = 0;
     Chain(int w,int h,const std::vector<std::pair<std::string,int>>& blocks,bool encoder_mode=false) :
@@ -109,9 +121,37 @@ public:
     // consume_source: the fast path may use the source as its second buffer
     // (one buffer less; set when nothing reads the source afterwards).
     bool consume_source = false;
+    // byte_out: the fast path passes E4M3 bytes between blocks (input bytes or
+    // halves, raw output as halves) and returns them.
+    bool byte_out = false;
     bool run_from_device(DeviceTensor source,bool verify=false) {
-        result = nullptr;
+        result = nullptr; result_fmt = 0; raw_was_half = false;
         if (!source.data || source.count != n) return false;
+        const bool fast = !verify && !c512_resident::exact_math;
+        if (source.fmt && !fast) return false;
+        if (fast && (byte_out || source.fmt)) {
+            // Outputs as bytes (byte_out) or floats; a byte-sized source cannot
+            // take float outputs, so the second buffer is then this chain's own.
+            const size_t words = byte_out ? (n+3)/4 : n;
+            const bool use_source = consume_source && (byte_out || !source.fmt);
+            if (!pong8) pong8.reset(new Buffer(words));
+            if (!use_source && !ping8) ping8.reset(new Buffer(words));
+            if (encoder && !raw_h) raw_h.reset(new Buffer((n+1)/2));
+            const void* in = source.data; int in_fmt = source.fmt;
+            void* out = pong8->data.get();
+            void* other = use_source ? const_cast<float*>(source.data) : static_cast<void*>(ping8->data.get());
+            for (size_t index = 0; index < weights.size(); ++index) {
+                const auto& w = *weights[index];
+                const bool last_raw = encoder && index+1 == weights.size();
+                swin_t::SwinIo sio; sio.in_fmt = in_fmt; sio.out_fmt = byte_out ? 1 : 0; sio.raw_fmt = 2;
+                if (!swin_t::run<128>(static_cast<const float*>(in), static_cast<float*>(out), last_raw ? raw_h->data.get() : nullptr,
+                        width, height, w.shift, {w.w1.data,w.w2.data,w.w3.data,w.skip.data,w.qkv.data,w.scales.data,w.bias.data,
+                     w.projection.data,w.attention_skip.data}, middle.data, sio)) return false;
+                const void* prev = in; in = out; in_fmt = sio.out_fmt; out = index == 0 ? other : const_cast<void*>(prev);
+            }
+            result = static_cast<float*>(const_cast<void*>(in)); result_fmt = byte_out ? 1 : 0; raw_was_half = encoder;
+            return true;
+        }
         float *input = const_cast<float*>(source.data), *output = pong.data;
         // The first block reads the source in place (no copy into ping), the
         // rest ping-pong between pong and ping: the source is never written.
@@ -182,8 +222,10 @@ public:
         result=input;
         return true;
     }
-    DeviceTensor final_view() const { return result ? DeviceTensor{result,n} : DeviceTensor{}; }
-    DeviceTensor raw_view() const { return result && encoder ? DeviceTensor{raw->data,n} : DeviceTensor{}; }
+    DeviceTensor final_view() const { return result ? DeviceTensor{result,n,result_fmt} : DeviceTensor{}; }
+    DeviceTensor raw_view() const {
+        return !(result && encoder) ? DeviceTensor{} : raw_was_half ? DeviceTensor{raw_h->data.get(),n,2} : DeviceTensor{raw->data,n};
+    }
 };
 
 // Encoder14 raw body -> rounded 2x2 pool -> FP8 C256 projection.
@@ -196,9 +238,13 @@ class Downsample {
     size_t n,pool_n,out_n;
     std::string dir;
     Buffer matrix,pool,output;
-    bool ready=false;
+    bool ready=false, wrote8=false;
+    std::unique_ptr<Buffer> pool8, output8;
 public:
     size_t comparisons=0;
+    // byte_out: the fast path writes the output as E4M3 bytes (a half raw input
+    // is read either way).
+    bool byte_out = false;
     Downsample(int w,int h,const std::string& fixture) : width(checked(w,h)),height(h),
         n(size_t(w)*h*128),pool_n(n/4),out_n(n/2),dir(fixture),matrix(dir,"matrix",256*128),
         pool(pool_n),output(out_n) {}
@@ -206,16 +252,32 @@ public:
         ready=false;
         if (!raw.data || raw.count != n) return false;
         if (!check(dir,"raw",raw.data,n,verify,comparisons)) return false;
-        C128_LAUNCH(k_encoder128_pool,pool_n,raw.data,pool.data,width,height);
-        tiled::gemm<tiled::Split,tiled::FP8,false>(c512_resident::stream,pool.data,128,matrix.data,128,nullptr,0,nullptr,
-            output.data,nullptr,256,width*height/4,256);  // k_encoder128_downsample
+        const bool fast = !verify && !c512_resident::exact_math;
+        if (raw.fmt && !fast) return false;
+        wrote8 = fast && byte_out;
+        if (fast && (raw.fmt || byte_out)) {
+            // The pool as E4M3 bytes (it holds E4M3 values) feeding the GEMM's byte input.
+            if (!pool8) pool8.reset(new Buffer((pool_n+3)/4));
+            if (wrote8 && !output8) output8.reset(new Buffer((out_n+3)/4));
+            C128_LAUNCH(k_encoder128_pool,pool_n,raw.data,pool8->data.get(),width,height,raw.fmt,1);
+            tiled::gemm<tiled::Split,tiled::FP8,false>(c512_resident::stream,nullptr,128,matrix.data,128,nullptr,0,nullptr,
+                wrote8 ? nullptr : output.data.get(),nullptr,256,width*height/4,256,1,0,0,0,1,
+                reinterpret_cast<const unsigned char*>(pool8->data.get()),
+                wrote8 ? reinterpret_cast<unsigned char*>(output8->data.get()) : nullptr);  // k_encoder128_downsample
+        } else {
+            C128_LAUNCH(k_encoder128_pool,pool_n,raw.data,pool.data,width,height);
+            tiled::gemm<tiled::Split,tiled::FP8,false>(c512_resident::stream,pool.data,128,matrix.data,128,nullptr,0,nullptr,
+                output.data,nullptr,256,width*height/4,256);  // k_encoder128_downsample
+        }
         if (!check(dir,"pool",pool.data,pool_n,verify,comparisons) ||
             !check(dir,"output",output.data,out_n,verify,comparisons)) return false;
         ready=true;
         return true;
     }
     DeviceTensor pool_view() const { return ready ? DeviceTensor{pool.data,pool_n} : DeviceTensor{}; }
-    DeviceTensor final_view() const { return ready ? DeviceTensor{output.data,out_n} : DeviceTensor{}; }
+    DeviceTensor final_view() const {
+        return !ready ? DeviceTensor{} : wrote8 ? DeviceTensor{output8->data.get(),out_n,1} : DeviceTensor{output.data.get(),out_n};
+    }
 };
 #undef C128_LAUNCH
 } // namespace c128_resident

@@ -418,10 +418,10 @@ __global__ __launch_bounds__(32*WAVES) void k_wmma_gemm8t(
         const size_t at = size_t(t)*ldo + o0+h*8;
         float v[8];
         if constexpr (EPI == RAW) {
-            put(out + at, a);
+            if (out) put(out + at, a);  // out may be null when only the bytes (out8) are wanted
         } else if constexpr (EPI == FP8) {
             for (int e = 0; e < 8; ++e) v[e] = P::fp8(a[e]);
-            put(out + at, v);
+            if (out) put(out + at, v);
             if (out2) put(out2 + at, a);
         } else {
             if (out) put(out + at, a);

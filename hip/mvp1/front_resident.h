@@ -157,6 +157,8 @@ public:
     bool skip4_native = true;
     // image_bytes: keep the block1-4 image as E4M3 bytes (skip4_view then empty).
     bool image_bytes = false;
+    // c64_bytes: the down GEMM writes c64 as E4M3 bytes only.
+    bool c64_bytes = false;
     // pool4: block4 pools its raw body itself (k_c32_t fz.pool), no raw4 buffer.
     bool pool4 = [] { const char* v = getenv("RESIDENT_POOL4"); return !(v && *v == '0'); }();
 private:
@@ -171,7 +173,8 @@ private:
     Buffer noise, stem, matrix, tokens, raw0, image, raw4, down_pool, down, c64, skip4, skip0, skip0h;
     Buffer matrix_native;  // matrix rows in the native order: the down GEMM writes c64 directly
     Buffer image8;         // the block1-4 image as E4M3 bytes (image_bytes)
-    bool image_was_bytes = false;
+    bool image_was_bytes = false, c64_was_bytes = false;
+    std::unique_ptr<Buffer> c64_8;  // c64 as E4M3 bytes (c64_bytes)
     bool skip_is_half = false;  // this run wrote skip0 only as halves
     std::vector<std::unique_ptr<Weights>> weights;
     Body body;
@@ -302,8 +305,11 @@ public:
         if (!verify) {
             // k_front_down + k_front_native64 in one GEMM: output column n of the
             // permuted matrix is peer column mh^-1(n), the same sums.
+            c64_was_bytes = c64_bytes && fused;
+            if (c64_was_bytes && !c64_8) c64_8.reset(new Buffer((c64.count+3)/4));
             tiled::gemm<c32_resident::H70Raw,tiled::FP8,false>(c512_resident::stream,down_pool.data,32,matrix_native.data,32,
-                nullptr,0,nullptr,c64.data,nullptr,64,(w/2)*(h/2),64);
+                nullptr,0,nullptr,c64_was_bytes ? nullptr : c64.data.get(),nullptr,64,(w/2)*(h/2),64,1,0,0,0,1,nullptr,
+                c64_was_bytes ? reinterpret_cast<unsigned char*>(c64_8->data.get()) : nullptr);
         } else {
             tiled::gemm<c32_resident::H70Raw,tiled::FP8,false>(c512_resident::stream,down_pool.data,32,matrix.data,32,nullptr,0,nullptr,
                 down.data,nullptr,64,(w/2)*(h/2),64);  // k_front_down
@@ -319,7 +325,9 @@ public:
         ready = true;
         return true;
     }
-    DeviceTensor c64_view() const { return ready ? DeviceTensor{c64.data,c64.count} : DeviceTensor{}; }
+    DeviceTensor c64_view() const {
+        return !ready ? DeviceTensor{} : c64_was_bytes ? DeviceTensor{c64_8->data.get(),c64.count,1} : DeviceTensor{c64.data.get(),c64.count};
+    }
     DeviceTensor skip4_view() const { return ready && skip4_native ? DeviceTensor{skip4.data,skip4.count} : DeviceTensor{}; }
     // The same values in the peer channel order (block4's image), for a reader
     // that maps the channels itself (k_upsample66_merge skip_peer).

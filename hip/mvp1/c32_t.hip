@@ -62,10 +62,13 @@ __device__ inline void load_fmt(const void* p, int fmt, size_t at, float* x) {
         }
     }
 }
-// v: E4M3 values when fmt == 1 (the quantized outputs).
+// v: E4M3 values when fmt == 1 (the quantized outputs), halves when fmt == 2.
 template<int N>
 __device__ inline void store_fmt(void* p, int fmt, size_t at, const float* v) {
-    if (fmt == 1) {
+    if (fmt == 2) {
+        _Float16* q = static_cast<_Float16*>(p) + at;
+        for (int k = 0; k < N; ++k) q[k] = (_Float16)v[k];
+    } else if (fmt == 1) {
         unsigned char* q = static_cast<unsigned char*>(p) + at;
         if constexpr (N == 8) {
             const op8 b = pack(v);
