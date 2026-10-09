@@ -196,7 +196,8 @@ public:
             } else {
                 // FP8 epilogue = k_split512_quant of the raw product (kept for checks).
                 tiled::gemm<tiled::Split,tiled::FP8,false>(c512_resident::stream, input, 512, w.matrix.data, 512, nullptr, 0, nullptr,
-                    mixed.data, verify ? pre.data : nullptr, 512, tokens, 512, 1, 0, 0, 0, 1, input8, b8 ? bytes(mixed8) : nullptr);
+                    b8 ? nullptr : mixed.data.get(), verify ? pre.data.get() : nullptr, 512, tokens, 512, 1, 0, 0, 0, 1, input8,
+                    b8 ? bytes(mixed8) : nullptr);  // bytes only on the fast path (the expand reads them)
             }
             if (!check(w.dir, "expected", pre.data, n, verify)) return false;
             if (small) C512_LAUNCH(k_split512_quant, n, pre.data, mixed.data, int(n));
@@ -205,11 +206,11 @@ public:
                 C512_LAUNCH(k_split512_expand, size_t(tokens)*2048, mixed.data, w.expand.data, hidden.data, tokens);
                 C512_LAUNCH(k_split512_contract, n, hidden.data, w.contract.data, branch.data, tokens);
             } else {
-                tiled::gemm<tiled::Split,tiled::GATE,false>(c512_resident::stream, mixed.data, 512, w.expand.data, 64, nullptr, 0, nullptr,
-                    nullptr, hidden.data, 2048, tokens, 256, 8, 64, 256*64, 256, 1,
+                tiled::gemm<tiled::Split,tiled::GATE,false>(c512_resident::stream, b8 ? nullptr : mixed.data.get(), 512, w.expand.data, 64, nullptr, 0, nullptr,
+                    nullptr, b8 ? nullptr : hidden.data.get(), 2048, tokens, 256, 8, 64, 256*64, 256, 1,
                     b8 ? bytes(mixed8) : nullptr, b8 ? bytes(hidden8) : nullptr);
-                tiled::gemm<tiled::Split,tiled::FP8,false>(c512_resident::stream, hidden.data, 2048, w.contract.data, 256, nullptr, 0, nullptr,
-                    branch.data, nullptr, 512, tokens, 64, 8, 256, 64*256, 64, 1,
+                tiled::gemm<tiled::Split,tiled::FP8,false>(c512_resident::stream, b8 ? nullptr : hidden.data.get(), 2048, w.contract.data, 256, nullptr, 0, nullptr,
+                    b8 ? nullptr : branch.data.get(), nullptr, 512, tokens, 64, 8, 256, 64*256, 64, 1,
                     b8 ? bytes(hidden8) : nullptr, b8 ? bytes(branch8) : nullptr);
                 HIP_CHECK(hipGetLastError());
             }
@@ -218,7 +219,7 @@ public:
                 C512_LAUNCH(k_split512_ffn_projection, n, branch.data, input, w.projection.data,
                             w.skip.data, nullptr, feature.data, tokens);
             } else {
-                tiled::gemm<tiled::Split,tiled::FP8,true>(c512_resident::stream, branch.data, 512, w.projection.data, 512, input, 512,
+                tiled::gemm<tiled::Split,tiled::FP8,true>(c512_resident::stream, b8 ? nullptr : branch.data.get(), 512, w.projection.data, 512, input, 512,
                     w.skip.data, feature.data, nullptr, 512, tokens, 512, 1, 0, 0, 0, 1,
                     b8 ? bytes(branch8) : nullptr, b8 ? bytes(feature8) : nullptr);
             }
@@ -233,9 +234,11 @@ public:
                 io.hwc = 1; io.width = width; io.height = height; io.px = px; io.py = py;
                 io.pw = ((width+px+7)/8)*8;
                 bool crop_bytes = false;
-                c512_resident::fused_attention(qkv.data, w.scales.data, w.bias.data, crop.data, wt, 512, &io,
+                // The context's floats only when no bytes replace them.
+                c512_resident::fused_attention(qkv.data, w.scales.data, w.bias.data,
+                                               b8 && c512_resident::attention_t ? nullptr : crop.data.get(), wt, 512, &io,
                                                b8 ? bytes(crop8) : nullptr, &crop_bytes);
-                tiled::gemm<tiled::Split,tiled::FP8,true>(c512_resident::stream, crop.data, 512, w.final.data, 512, feature.data, 512,
+                tiled::gemm<tiled::Split,tiled::FP8,true>(c512_resident::stream, crop_bytes ? nullptr : crop.data.get(), 512, w.final.data, 512, feature.data, 512,
                     w.final_skip.data, output, raw_output.data, 512, tokens, 512, 1, 0, 0, 0, 1,
                     crop_bytes ? bytes(crop8) : nullptr, output8);
                 HIP_CHECK(hipGetLastError());

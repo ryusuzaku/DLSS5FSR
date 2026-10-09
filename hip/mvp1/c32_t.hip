@@ -478,7 +478,11 @@ __global__ __launch_bounds__(128/TT) void k_c32_t(const float* in, const float* 
                 for (int e = 0; e < 8; ++e) {  // all lanes: the shuffles need the partners
                     const float a = h70_h(body[e] + __shfl_xor(body[e], 1));
                     const float below = __shfl_xor(a, 8);
-                    if (pool_at >= 0) fz.pool[pool_at + o*16 + h*8 + e] = h70_f(h70_h(h70_h(a + below)*.25f));
+                    if (pool_at >= 0) {
+                        const float pv = h70_f(h70_h(h70_h(a + below)*.25f));
+                        if (fz.pool_fmt == 1) reinterpret_cast<unsigned char*>(fz.pool)[pool_at + o*16 + h*8 + e] = wmma_t::byte8(pv);
+                        else fz.pool[pool_at + o*16 + h*8 + e] = pv;
+                    }
                 }
             }
             if (ob < 0) continue;

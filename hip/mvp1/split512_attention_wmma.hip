@@ -212,8 +212,10 @@ __global__ __launch_bounds__(128) void k_split512_attention_t(
         const size_t at = size_t(r)*channels + head*32 + d*16 + h*8;
         float q[8];
         for (int e = 0; e < 8; ++e) q[e] = split512_fp8(acc[e]);
-        reinterpret_cast<float4*>(context + at)[0] = make_float4(q[0], q[1], q[2], q[3]);
-        reinterpret_cast<float4*>(context + at)[1] = make_float4(q[4], q[5], q[6], q[7]);
+        if (context) {
+            reinterpret_cast<float4*>(context + at)[0] = make_float4(q[0], q[1], q[2], q[3]);
+            reinterpret_cast<float4*>(context + at)[1] = make_float4(q[4], q[5], q[6], q[7]);
+        }
         if (context8) *reinterpret_cast<op8*>(context8 + at) = pack(acc);
     }
 }

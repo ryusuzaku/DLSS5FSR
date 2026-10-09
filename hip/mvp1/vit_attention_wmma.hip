@@ -292,8 +292,10 @@ __global__ __launch_bounds__(128) void k_vit_attention_t(const float* __restrict
         float v[8], q[8];
         for (int e = 0; e < 8; ++e) { v[e] = hf(acc[dt][e]*r); q[e] = split512_fp8(v[e]); }
         const size_t at = size_t(query)*1024 + head*32 + dt*16 + h*8;
-        reinterpret_cast<float4*>(output + at)[0] = make_float4(q[0], q[1], q[2], q[3]);
-        reinterpret_cast<float4*>(output + at)[1] = make_float4(q[4], q[5], q[6], q[7]);
+        if (output) {  // null: the bytes (out8) only
+            reinterpret_cast<float4*>(output + at)[0] = make_float4(q[0], q[1], q[2], q[3]);
+            reinterpret_cast<float4*>(output + at)[1] = make_float4(q[4], q[5], q[6], q[7]);
+        }
         if (out8) *reinterpret_cast<op8*>(out8 + at) = pack(v);
     }
 }

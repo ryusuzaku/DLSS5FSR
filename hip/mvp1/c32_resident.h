@@ -221,8 +221,10 @@ public:
         if (!input.data || input.count != n || !skip.data || skip.count != out_n) return false;
         if (!check(dir,"input",input.data,n,verify,comparisons) ||
             !check(dir,"skip",skip.data,out_n,verify,comparisons)) return false;
-        tiled::gemm<tiled::Split,tiled::RAW,false>(c512_resident::stream,input.data,64,weights.data,64,nullptr,0,nullptr,
-            low.data,nullptr,32,width*height,32);  // k_upsample66_project
+        if (input.fmt && (verify || c512_resident::exact_math)) return false;
+        tiled::gemm<tiled::Split,tiled::RAW,false>(c512_resident::stream,input.fmt?nullptr:input.data,64,weights.data,64,nullptr,0,nullptr,
+            low.data,nullptr,32,width*height,32,1,0,0,0,1,
+            input.fmt==1?reinterpret_cast<const unsigned char*>(input.data):nullptr);  // k_upsample66_project
         wrote_half = half_out && !verify && !c512_resident::exact_math;
         if (skip.fmt && (verify || c512_resident::exact_math)) return false;
         C32_LAUNCH(k_upsample66_merge, out_n, low.data,skip.data,scale.data,wrote_half ? merged_h.data.get() : merged.data.get(),

@@ -431,7 +431,7 @@ __global__ __launch_bounds__(32*WAVES) void k_wmma_gemm8t(
                 float poly = P::half(gate*inner+0.89453125f);
                 v[e] = P::fp8(P::half(a[e]*poly));
             }
-            put(out2 + at, v);
+            if (out2) put(out2 + at, v);  // null: only the bytes (out8) wanted
         }
         if constexpr (EPI == FP8 || EPI == GATE) {
             if (out8) {  // the FP8 output's E4M3 bytes (exact: they are E4M3 values)
@@ -577,7 +577,7 @@ inline bool gemm(hipStream_t stream, const float* X, int ldx, c512_resident::Wei
         partial = s.partial;
     }
     const int zdim = partial ? parts : groups;
-    if (use8 && gemm_t && EPI != DOUBLE_RES && O % 64 == 0 && ldx % 4 == 0 && gx % 4 == 0 && ldo % 4 == 0 && go % 4 == 0 &&
+    if (use8 && gemm_t && EPI != DOUBLE_RES && O % 32 == 0 && ldx % 4 == 0 && gx % 4 == 0 && ldo % 4 == 0 && go % 4 == 0 &&
         (!RESIDUAL || ldr % 4 == 0) && (K/parts) % 32 == 0) {
         if (X8 && (ldx % 16 || gx % 16)) X8 = nullptr;
         unsigned char* o8 = !partial && ldo % 8 == 0 && go % 8 == 0 ? out8 : nullptr;
@@ -586,7 +586,8 @@ inline bool gemm(hipStream_t stream, const float* X, int ldx, c512_resident::Wei
         const bool wide = X8 && chunk256 && (K/parts) % 256 == 0;
 #define GEMMT_LAUNCH(W, TKV) hipLaunchKernelGGL((k_wmma_gemm8t<P,EPI,RESIDUAL,W,TKV>), dim3(O/(16*W), (T+63)/64, zdim),                                dim3(32*W), 0, stream, X, ldx, w8, K, R, ldr, S, out, out2, ldo, T, O, gx, gw, go, parts, partial, X8, o8)
         if (O % 128 == 0 && size_t(O/128)*((T+63)/64)*zdim >= 256) { if (wide) GEMMT_LAUNCH(8, 256); else GEMMT_LAUNCH(8, TKC); }
-        else { if (wide) GEMMT_LAUNCH(4, 256); else GEMMT_LAUNCH(4, TKC); }
+        else if (O % 64 == 0) { if (wide) GEMMT_LAUNCH(4, 256); else GEMMT_LAUNCH(4, TKC); }
+        else { if (wide) GEMMT_LAUNCH(2, 256); else GEMMT_LAUNCH(2, TKC); }  // 32-wide outputs (prefix66)
 #undef GEMMT_LAUNCH
         if (partial)
             hipLaunchKernelGGL((k_wmma_combine<P,EPI>), dim3((size_t(T)*O+255)/256), dim3(256), 0, stream,

@@ -93,9 +93,9 @@ public:
                 VIT_LAUNCH(k_vit_qkv_projection, 3*n, contract.data, w.qkv.data, projected.data, tokens);
             } else {
                 tiled::gemm<tiled::Split,tiled::GATE,false>(c512_resident::stream, input, 1024, w.expand.data, 1024, nullptr, 0, nullptr,
-                    verify ? expanded.data : nullptr, hidden.data, 4096, tokens, 4096, 1, 0, 0, 0, 1,
+                    verify ? expanded.data.get() : nullptr, b8 ? nullptr : hidden.data.get(), 4096, tokens, 4096, 1, 0, 0, 0, 1,
                     input8, b8 ? bytes(hidden8) : nullptr);
-                tiled::gemm<tiled::Split,tiled::FP8,true>(c512_resident::stream, hidden.data, 4096, w.contract.data, 4096, input, 1024,
+                tiled::gemm<tiled::Split,tiled::FP8,true>(c512_resident::stream, b8 ? nullptr : hidden.data.get(), 4096, w.contract.data, 4096, input, 1024,
                     w.skip.data, contract.data, nullptr, 1024, tokens, 1024, 1, 0, 0, 0, 4,
                     b8 ? bytes(hidden8) : nullptr, b8 ? bytes(contract8) : nullptr);
                 tiled::gemm<tiled::Split,tiled::RAW,false>(c512_resident::stream, contract.data, 1024, w.qkv.data, 1024, nullptr, 0, nullptr,
@@ -111,7 +111,7 @@ public:
                                    projected.data, bytes(kv8), bytes(kv8) + n, tokens);
                 if (c512_resident::launch_hook) c512_resident::launch_hook("k_vit_kv8");
                 hipLaunchKernelGGL(k_vit_attention_t, dim3(tokens/64, 32), dim3(128), 0, c512_resident::stream,
-                                   projected.data, bytes(kv8), bytes(kv8) + n, w.scales.data, attention.data,
+                                   projected.data, bytes(kv8), bytes(kv8) + n, w.scales.data, nullptr,
                                    bytes(attention8), tokens, valid);
                 HIP_CHECK(hipGetLastError());
                 attention_bytes = true;
@@ -137,7 +137,7 @@ public:
                 VIT_LAUNCH(k_vit_residual_projection, n, attention.data, contract.data,
                            w.projection.data, w.projection_skip.data, output, tokens, 1024);
             } else {
-                tiled::gemm<tiled::Split,tiled::FP8,true>(c512_resident::stream, attention.data, 1024, w.projection.data, 1024, contract.data, 1024,
+                tiled::gemm<tiled::Split,tiled::FP8,true>(c512_resident::stream, attention_bytes ? nullptr : attention.data.get(), 1024, w.projection.data, 1024, contract.data, 1024,
                     w.projection_skip.data, output, nullptr, 1024, tokens, 1024, 1, 0, 0, 0, 4,
                     attention_bytes ? bytes(attention8) : nullptr, output8);
                 HIP_CHECK(hipGetLastError());

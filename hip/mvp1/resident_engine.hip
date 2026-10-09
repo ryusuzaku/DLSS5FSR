@@ -864,14 +864,13 @@ struct Network {
         // Bit 16: E4M3 / half storage at the C32 level (front image, prefix66, C32 chain, head main).
         if ((memsave_bits & 16) && (memsave_bits & 4) && c32_resident::Weights::fusable()) { front->image_bytes = true; prefix66->half_out = true; c32->byte_out = true; }
         // Bit 32: E4M3 / half storage at the C64-C256 levels. Not down22 (the C512
-        // grid padding reads floats) nor the C64 decoder (prefix66's 32-wide
-        // projection has no byte input path).
+        // grid padding reads floats).
         if ((memsave_bits & 32) && c32_resident::Weights::fusable() && swin_t::enabled && wmma_gemm::fp8 && wmma_gemm::gemm_t) {
             front->c64_bytes = true;
             encoder8->byte_out = encoder14->byte_out = encoder22->byte_out = true;
             down8->byte_out = down14->byte_out = true;
             prefix48->byte_out = prefix56->byte_out = prefix62->byte_out = true;
-            c256->byte_out = c128->byte_out = true;
+            c256->byte_out = c128->byte_out = c64->byte_out = true;  // prefix66 reads bytes (32-wide transposed GEMM)
         }
         if (memsave_bits & 8) { head70->out_native = rgb_native->data.get(); head70->out_public = rgb_public->data.get(); }
     }

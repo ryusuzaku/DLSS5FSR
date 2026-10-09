@@ -174,7 +174,7 @@ private:
     Buffer matrix_native;  // matrix rows in the native order: the down GEMM writes c64 directly
     Buffer image8;         // the block1-4 image as E4M3 bytes (image_bytes)
     bool image_was_bytes = false, c64_was_bytes = false;
-    std::unique_ptr<Buffer> c64_8;  // c64 as E4M3 bytes (c64_bytes)
+    std::unique_ptr<Buffer> c64_8, down_pool8;  // c64 and block4's pool as E4M3 bytes (c64_bytes)
     bool skip_is_half = false;  // this run wrote skip0 only as halves
     std::vector<std::unique_ptr<Weights>> weights;
     Body body;
@@ -287,7 +287,11 @@ public:
             std::string block = dir+"/block"+std::to_string(b);
             if (fused) {
                 // block4: the 2x2 pool of its raw body in the epilogue (no raw4).
-                C32Fuse pz; pz.pool = b == 4 && p4 ? down_pool.data.get() : nullptr;
+                C32Fuse pz;
+                if (b == 4 && p4) {  // with c64_bytes the pool goes to the down GEMM as bytes
+                    if (c64_bytes && !down_pool8) down_pool8.reset(new Buffer((down_pool.count+3)/4));
+                    pz.pool = c64_bytes ? down_pool8->data.get() : down_pool.data.get(); pz.pool_fmt = int(c64_bytes);
+                }
                 C32Io bio = io(1, w, h, shifts[b]); bio.in_fmt = bio.out_fmt = int(i8);
                 float* img = i8 ? image8.data.get() : image.data.get();
                 weights[b]->body(img, rows, b == 4 && !p4 ? raw4.data.get() : nullptr, img, bio, pz);
@@ -307,8 +311,10 @@ public:
             // permuted matrix is peer column mh^-1(n), the same sums.
             c64_was_bytes = c64_bytes && fused;
             if (c64_was_bytes && !c64_8) c64_8.reset(new Buffer((c64.count+3)/4));
-            tiled::gemm<c32_resident::H70Raw,tiled::FP8,false>(c512_resident::stream,down_pool.data,32,matrix_native.data,32,
-                nullptr,0,nullptr,c64_was_bytes ? nullptr : c64.data.get(),nullptr,64,(w/2)*(h/2),64,1,0,0,0,1,nullptr,
+            const bool pool8 = c64_was_bytes && p4;  // block4 wrote the pool as bytes
+            tiled::gemm<c32_resident::H70Raw,tiled::FP8,false>(c512_resident::stream,pool8 ? nullptr : down_pool.data.get(),32,matrix_native.data,32,
+                nullptr,0,nullptr,c64_was_bytes ? nullptr : c64.data.get(),nullptr,64,(w/2)*(h/2),64,1,0,0,0,1,
+                pool8 ? reinterpret_cast<const unsigned char*>(down_pool8->data.get()) : nullptr,
                 c64_was_bytes ? reinterpret_cast<unsigned char*>(c64_8->data.get()) : nullptr);
         } else {
             tiled::gemm<c32_resident::H70Raw,tiled::FP8,false>(c512_resident::stream,down_pool.data,32,matrix.data,32,nullptr,0,nullptr,
