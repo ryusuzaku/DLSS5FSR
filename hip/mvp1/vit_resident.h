@@ -40,7 +40,7 @@ class Chain {
     Buffer hidden8, contract8, ping8, pong8, kv8, attention8;
     // RESIDENT_ATTN_T=0: k_vit_attention_fused instead of k_vit_kv8 + k_vit_attention_t.
     static inline const bool attention_t = [] { const char* v = getenv("RESIDENT_ATTN_T"); return !(v && *v == '0'); }();
-    static unsigned char* bytes(Buffer& b) { return reinterpret_cast<unsigned char*>(b.data); }
+    static unsigned char* bytes(Buffer& b) { return reinterpret_cast<unsigned char*>(b.data.get()); }
 
     bool check(const std::string& dir, const char* name, float* device, size_t count, bool verify) {
         if (!verify) return true;

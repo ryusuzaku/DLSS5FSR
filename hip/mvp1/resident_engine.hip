@@ -1197,9 +1197,9 @@ struct Engine {
                     if (!vote) { HIP_CHECK(hipMalloc(&vote, 10*sizeof(float))); HIP_CHECK(hipMemsetAsync(vote, 0, 10*sizeof(float), compose_stream)); }
                     const int samples = ((w+5)/6)*((h+5)/6);
                     hipLaunchKernelGGL(k_motion_vote, dim3((samples+255)/256), dim3(256), 0, compose_stream,
-                                       reinterpret_cast<const unsigned char*>(current->data),
-                                       reinterpret_cast<const unsigned char*>(previous_frame->data), pitch, bpp,
-                                       reinterpret_cast<const float2*>(ring[slot]->data), w, h, vote);
+                                       reinterpret_cast<const unsigned char*>(current->data.get()),
+                                       reinterpret_cast<const unsigned char*>(previous_frame->data.get()), pitch, bpp,
+                                       reinterpret_cast<const float2*>(ring[slot]->data.get()), w, h, vote);
                     if (++vote_frames >= 30) {
                         float sums[10];
                         HIP_CHECK(hipMemcpyAsync(sums, vote, sizeof(sums), hipMemcpyDeviceToHost, compose_stream));
@@ -1390,7 +1390,7 @@ struct Engine {
             }
             const int samples = ((frame_w+3)/4)*((frame_h+3)/4);
             hipLaunchKernelGGL(k_tone_measure, dim3((samples+255)/256), dim3(256), 0, stream,
-                               reinterpret_cast<const unsigned char*>(raw_input->data), frame_pitch, frame_bpp,
+                               reinterpret_cast<const unsigned char*>(raw_input->data.get()), frame_pitch, frame_bpp,
                                frame_w, frame_h, tone_state->data);
             hipLaunchKernelGGL(k_tone_update, dim3(1), dim3(1), 0, stream, tone_state->data, options.tone);
             HIP_CHECK(hipGetLastError());
@@ -1422,7 +1422,7 @@ struct Engine {
             use_history = coord_cur >= 0 && hist_prev && hist_W == W && hist_H == H && hist_sw == sw && hist_sh == sh;
             if (!hin_cur || hin_cur->count < count) hin_cur.reset(new Buffer(count));
             hin_ok = use_history && hin_prev;
-            const float2* coords = coord_cur == 2 || !use_history ? nullptr : reinterpret_cast<const float2*>(coord[coord_cur]->data);
+            const float2* coords = coord_cur == 2 || !use_history ? nullptr : reinterpret_cast<const float2*>(coord[coord_cur]->data.get());
             if (use_history)
                 hipLaunchKernelGGL(k_history_sample, dim3((W*H+255)/256), dim3(256), 0, stream,
                                    hist_prev->data, coords, hist_cur->data, frame_w, frame_h, sw, sh, W, H);
@@ -1437,7 +1437,7 @@ struct Engine {
         net->front->noise_seed = temporal ? temporal_seed : 0;
         net->head70->keep_native = temporal && use_history;  // k_head_temporal's input
         HIP_CHECK(hipEventRecord(start, stream));
-        const unsigned char* net_src = reinterpret_cast<const unsigned char*>(raw_input->data);
+        const unsigned char* net_src = reinterpret_cast<const unsigned char*>(raw_input->data.get());
         if (!job_crop && options.luma && options.input_temporal > 0.0f && frame_bpp == 8) {
             const size_t bytes = size_t(frame_pitch)*frame_h;
             for (auto& b : in_stab)
@@ -1449,11 +1449,11 @@ struct Engine {
                                  in_stab_pitch == frame_pitch && mv_w == frame_w && mv_h == frame_h &&
                                  ring_frame[mslot] == job_frame && (ms.x != 0.0f || ms.y != 0.0f);
             const bool depth_ok = job_depth_valid && prev_depth && prev_depth_frame == job_frame - 1;
-            auto* out = reinterpret_cast<unsigned char*>(in_stab[dst]->data);
+            auto* out = reinterpret_cast<unsigned char*>(in_stab[dst]->data.get());
             if (hist_ok) {
                 hipLaunchKernelGGL(k_input_stabilize, dim3((frame_w*frame_h+255)/256), dim3(256), 0, stream,
-                                   net_src, reinterpret_cast<const unsigned char*>(in_stab[in_stab_cur]->data), out,
-                                   frame_pitch, frame_w, frame_h, reinterpret_cast<const float2*>(ring[mslot]->data),
+                                   net_src, reinterpret_cast<const unsigned char*>(in_stab[in_stab_cur]->data.get()), out,
+                                   frame_pitch, frame_w, frame_h, reinterpret_cast<const float2*>(ring[mslot]->data.get()),
                                    ms.x, ms.y, depth_ok ? job_depth->data : nullptr,
                                    depth_ok ? prev_depth->data : nullptr, options.input_temporal);
                 HIP_CHECK(hipGetLastError());
@@ -1505,7 +1505,7 @@ struct Engine {
                 HIP_CHECK(hipHostMalloc(reinterpret_cast<void**>(&pinned), bytes));
                 pinned_bytes = bytes;
             }
-            auto* out = reinterpret_cast<unsigned char*>(encoded->data);
+            auto* out = reinterpret_cast<unsigned char*>(encoded->data.get());
             int gain = options.gain >= 0 ? options.gain : job_gain;
             const float* linear = gain ? net->rgb_public->data : net->rgb_native->data;
             if (options.luma) {
@@ -1525,16 +1525,16 @@ struct Engine {
                     ms = motion_scale(frame_w, frame_h);
                     if (ms.x != 0.0f || ms.y != 0.0f) {
                         prev_d = prev_depth->data;
-                        job_mv = reinterpret_cast<const float2*>(ring[mslot]->data);
+                        job_mv = reinterpret_cast<const float2*>(ring[mslot]->data.get());
                     }
                 }
                 hipLaunchKernelGGL(k_ratio_map, dim3((frame_w*frame_h+255)/256), dim3(256), 0, stream,
                                    linear, net->color->data,
-                                   reinterpret_cast<const unsigned char*>(raw_input->data), frame_pitch, frame_bpp,
+                                   reinterpret_cast<const unsigned char*>(raw_input->data.get()), frame_pitch, frame_bpp,
                                    !previous_valid ? nullptr : history_cur >= 0
-                                       ? reinterpret_cast<const float2*>(history[history_cur]->data)
-                                       : reinterpret_cast<const float2*>(maps[published]->data),
-                                   int(previous_valid), job_options(job_strength), reinterpret_cast<float2*>(maps[next]->data),
+                                       ? reinterpret_cast<const float2*>(history[history_cur]->data.get())
+                                       : reinterpret_cast<const float2*>(maps[published]->data.get()),
+                                   int(previous_valid), job_options(job_strength), reinterpret_cast<float2*>(maps[next]->data.get()),
                                    frame_w, frame_h, sw, sh, W, tone,
                                    job_depth_valid ? job_depth->data : nullptr,
                                    job_albedo_valid ? job_albedo->data : nullptr,
@@ -1569,7 +1569,7 @@ struct Engine {
                 return;
             }
             hipLaunchKernelGGL(k_encode_frame, dim3((frame_w*frame_h+255)/256), dim3(256), 0, stream,
-                               linear, reinterpret_cast<const unsigned char*>(raw_input->data), frame_pitch,
+                               linear, reinterpret_cast<const unsigned char*>(raw_input->data.get()), frame_pitch,
                                out, frame_w, frame_h, W, frame_bpp);
             HIP_CHECK(hipGetLastError());
             HIP_CHECK(hipMemcpyAsync(pinned, out, bytes, hipMemcpyDeviceToHost, stream));
@@ -1631,16 +1631,16 @@ struct Engine {
         if (from >= job_frame) return;  // already on the job's frame: the plain map is right
         for (auto& b : history)
             if (!b || b->count < size_t(w)*h*2) b.reset(new Buffer(size_t(w)*h*2));
-        const float2* src = reinterpret_cast<const float2*>(maps[published]->data);
+        const float2* src = reinterpret_cast<const float2*>(maps[published]->data.get());
         int cur = -1;
         for (long long f = from + 1; f <= job_frame; ++f) {
             int slot = int(f % kRing);
             if (ring_frame[slot] != f) return;  // motion lost: keep the plain previous map
             int next = cur == 0 ? 1 : 0;
             hipLaunchKernelGGL(k_warp_map, dim3((w*h+255)/256), dim3(256), 0, compose_stream,
-                               src, reinterpret_cast<const float2*>(ring[slot]->data),
-                               reinterpret_cast<float2*>(history[next]->data), w, h, mx, my);
-            src = reinterpret_cast<const float2*>(history[next]->data);
+                               src, reinterpret_cast<const float2*>(ring[slot]->data.get()),
+                               reinterpret_cast<float2*>(history[next]->data.get()), w, h, mx, my);
+            src = reinterpret_cast<const float2*>(history[next]->data.get());
             cur = next;
         }
         HIP_CHECK(hipGetLastError());
@@ -1725,15 +1725,15 @@ struct Engine {
         for (auto& b : coord)
             if (!b || b->count < size_t(w)*h*2) b.reset(new Buffer(size_t(w)*h*2));
         hipLaunchKernelGGL(k_coord_identity, dim3((w*h+255)/256), dim3(256), 0, compose_stream,
-                           reinterpret_cast<float2*>(coord[0]->data), w, h);
+                           reinterpret_cast<float2*>(coord[0]->data.get()), w, h);
         int cur = 0;
         for (long long f = hist_frame + 1; f <= job_frame; ++f) {
             int slot = int(f % kRing);
             if (ring_frame[slot] != f) return;  // motion lost: no history
             hipLaunchKernelGGL(k_warp_map, dim3((w*h+255)/256), dim3(256), 0, compose_stream,
-                               reinterpret_cast<const float2*>(coord[cur]->data),
-                               reinterpret_cast<const float2*>(ring[slot]->data),
-                               reinterpret_cast<float2*>(coord[1-cur]->data), w, h, mx, my);
+                               reinterpret_cast<const float2*>(coord[cur]->data.get()),
+                               reinterpret_cast<const float2*>(ring[slot]->data.get()),
+                               reinterpret_cast<float2*>(coord[1-cur]->data.get()), w, h, mx, my);
             cur = 1 - cur;
         }
         HIP_CHECK(hipGetLastError());
@@ -1746,7 +1746,7 @@ struct Engine {
         if (!out || published < 0 || map_w != w || map_h != h || cur_w != w || cur_h != h || cur_bpp != bpp ||
             dst_pitch < size_t(w)*bpp || out_pitch < size_t(w)*bpp) return 0;
         try {
-            const float2* map = reinterpret_cast<const float2*>(maps[published]->data);
+            const float2* map = reinterpret_cast<const float2*>(maps[published]->data.get());
             const float2 ms = motion_scale(w, h);
             const float mx = ms.x, my = ms.y;
             if (options.motion && (mx != 0.0f || my != 0.0f) && mv_w == w && mv_h == h && map_frame[published] >= 0) {
@@ -1760,17 +1760,17 @@ struct Engine {
                     for (auto& b : warped)
                         if (!b || b->count < size_t(w)*h*2) b.reset(new Buffer(size_t(w)*h*2));
                 } else {
-                    from = warped_frame; src = reinterpret_cast<const float2*>(warped[warped_cur]->data);
+                    from = warped_frame; src = reinterpret_cast<const float2*>(warped[warped_cur]->data.get());
                 }
                 bool carried = true;
                 for (long long f = from + 1; f <= target; ++f) {
                     int slot = int(f % kRing);
                     if (ring_frame[slot] != f) { carried = false; break; }  // motion lost: stop here
-                    int next = src == reinterpret_cast<const float2*>(warped[0]->data) ? 1 : 0;
+                    int next = src == reinterpret_cast<const float2*>(warped[0]->data.get()) ? 1 : 0;
                     hipLaunchKernelGGL(k_warp_map, dim3((w*h+255)/256), dim3(256), 0, compose_stream,
-                                       src, reinterpret_cast<const float2*>(ring[slot]->data),
-                                       reinterpret_cast<float2*>(warped[next]->data), w, h, mx, my);
-                    src = reinterpret_cast<const float2*>(warped[next]->data);
+                                       src, reinterpret_cast<const float2*>(ring[slot]->data.get()),
+                                       reinterpret_cast<float2*>(warped[next]->data.get()), w, h, mx, my);
+                    src = reinterpret_cast<const float2*>(warped[next]->data.get());
                     warped_cur = next;
                 }
                 if (src != map) {
@@ -1788,7 +1788,7 @@ struct Engine {
                                    map, out, out_pitch, w, h);
             else
                 hipLaunchKernelGGL(k_compose, dim3((w*h+255)/256), dim3(256), 0, compose_stream,
-                                   reinterpret_cast<const unsigned char*>(current->data), cur_pitch, bpp,
+                                   reinterpret_cast<const unsigned char*>(current->data.get()), cur_pitch, bpp,
                                    map, options, out, out_pitch, w, h);
             HIP_CHECK(hipGetLastError());
             if (sync) HIP_CHECK(hipStreamSynchronize(compose_stream));
@@ -1866,7 +1866,7 @@ struct Engine {
             } catch (const std::exception& e) {
                 failed = true; error = e.what(); return -1;
             }
-            int r = compose_into(composed ? reinterpret_cast<unsigned char*>(composed->data) : nullptr,
+            int r = compose_into(composed ? reinterpret_cast<unsigned char*>(composed->data.get()) : nullptr,
                                  size_t(w)*bpp, w, h, bpp, pitch);
             if (r == 0 && hipStreamSynchronize(compose_stream) != hipSuccess) {
                 failed = true; error = "compose stream sync failed"; return -1;

@@ -30,9 +30,11 @@ int main(int argc, char** argv) {
         c512_resident::stream = stream;
         Network net(lines, W, H);
         net.head70->keep_native = false;  // as the engine without temporal history
+        { size_t freeb = 0, all = 0; HIP_CHECK(hipMemGetInfo(&freeb, &all));
+          printf("device memory after building the network: %.2f GB used of %.2f GB\n", (all-freeb)/1e9, all/1e9); }
         Buffer raw((size_t(pitch)*fh+3)/4);
         HIP_CHECK(hipMemcpy(raw.data, bytes.data()+36, size_t(pitch)*fh, hipMemcpyHostToDevice));
-        const unsigned char* src = reinterpret_cast<const unsigned char*>(raw.data);
+        const unsigned char* src = reinterpret_cast<const unsigned char*>(raw.data.get());
         std::vector<std::pair<const char*, std::function<bool()>>> stages = {
             {"input", [&]{ hipLaunchKernelGGL(k_candidate_input_full, dim3((W*H+255)/256), dim3(256), 0, stream,
                                               src, net.color->data, fw, fh, pitch, bpp, W, H, fw, fh); return true; }},
@@ -43,7 +45,7 @@ int main(int argc, char** argv) {
             {"down14", [&]{ return net.down14->run_from_device(net.encoder14->raw_view()); }},
             {"encoder15-22 C256", [&]{ return net.encoder22->run_from_device(net.down14->final_view()); }},
             {"down22", [&]{ return net.down22->run_from_device(net.encoder22->raw_view()); }},
-            {"encoder23-30 C512 + head", [&]{ return net.chain->run_from_device(net.down22->final_view()); }},
+            {"encoder23-30 C512 + head", [&]{ return net.pad_c512() && net.chain->run_from_device(net.padded ? DeviceTensor{net.padded->data, net.n} : net.down22->final_view()); }},
             {"gather", [&]{ auto head = net.chain->head_view();
                 hipLaunchKernelGGL(k_vit_bridge_gather, dim3((net.hn+255)/256), dim3(256), 0, stream,
                                    head.data, net.map->data, net.bridge->data, int(net.hn)); return true; }},
@@ -82,6 +84,8 @@ int main(int argc, char** argv) {
                 total[i] += ms;
             }
         }
+        { size_t freeb = 0, all = 0; HIP_CHECK(hipMemGetInfo(&freeb, &all));
+          printf("device memory after the runs: %.2f GB used of %.2f GB\n", (all-freeb)/1e9, all/1e9); }
         // PROFILE_STAGE=name: that stage alone, 20 times back to back (after the
         // full runs above), against its time inside the network.
         if (const char* only = getenv("PROFILE_STAGE")) {

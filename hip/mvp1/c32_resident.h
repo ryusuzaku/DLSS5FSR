@@ -60,9 +60,9 @@ struct Weights {
     Buffer fp8;     // the same as E4M3 bytes (3072 floats of storage) for k_c32_fp8
     explicit Weights(const std::string& d):dir(d),scale(read(d,"weights",16449)[16384]),data(d,"weights",16449),halves(6144),fp8(3072) {
         hipLaunchKernelGGL(k_c32_half_weights,dim3(48),dim3(256),0,c512_resident::stream,
-                           data.data,reinterpret_cast<_Float16*>(halves.data),12288);
+                           data.data,reinterpret_cast<_Float16*>(halves.data.get()),12288);
         hipLaunchKernelGGL(k_c32_fp8_weights,dim3(48),dim3(256),0,c512_resident::stream,
-                           data.data,reinterpret_cast<unsigned char*>(fp8.data),12288);
+                           data.data,reinterpret_cast<unsigned char*>(fp8.data.get()),12288);
         HIP_CHECK(hipGetLastError());
     }
     // RESIDENT_C32_F16=1: the half WMMA body instead of the FP8 one.
@@ -79,7 +79,7 @@ struct Weights {
     static bool fusable() { return fuse && !c512_resident::exact_math && !c32_f16; }
     template<int MODE> void fused(int rows, const C32Fuse& fz) const {
         hipLaunchKernelGGL((k_c32_t<1, MODE>), dim3(rows/64), dim3(128), 0, c512_resident::stream,
-                           nullptr, data.data, reinterpret_cast<const unsigned char*>(fp8.data), scale,
+                           nullptr, data.data, reinterpret_cast<const unsigned char*>(fp8.data.get()), scale,
                            nullptr, nullptr, C32Io(), fz);
         HIP_CHECK(hipGetLastError());
         if (c512_resident::launch_hook) c512_resident::launch_hook(MODE == 1 ? "k_c32_t<pre>" : "k_c32_t<head>");
@@ -93,12 +93,12 @@ struct Weights {
             // The half WMMA form (operands through h70_f: E4M3 values, or
             // half with H70_NO_FP8).
             hipLaunchKernelGGL(k_c32_wmma,dim3(rows/64),dim3(256),0,c512_resident::stream,
-                               input,data.data,reinterpret_cast<const _Float16*>(halves.data),scale,raw_out,quant_out,io);
+                               input,data.data,reinterpret_cast<const _Float16*>(halves.data.get()),scale,raw_out,quant_out,io);
         } else {
             // FP8 WMMA form, transposed: bit-identical to k_c32_fp8 / k_c32_wmma,
             // 2.9x faster than k_c32_fp8 (S336).
             hipLaunchKernelGGL(k_c32_t<1>,dim3(rows/64),dim3(128),0,c512_resident::stream,
-                               input,data.data,reinterpret_cast<const unsigned char*>(fp8.data),scale,raw_out,quant_out,io);
+                               input,data.data,reinterpret_cast<const unsigned char*>(fp8.data.get()),scale,raw_out,quant_out,io);
         }
         HIP_CHECK(hipGetLastError());
         if (c512_resident::launch_hook) c512_resident::launch_hook(c512_resident::exact_math?"k_c32_fused":"k_c32_t");
@@ -107,47 +107,54 @@ struct Weights {
 // Shared retained workspace for sequential C32 body dispatches.
 class Body {
     int capacity;
-    Buffer expanded,hidden,ffn,qkv,norm,ninv,scores,ex,den,prob,context,body,output;
+    // The staged path's buffers, allocated on first use: the fused paths
+    // never touch them, and at full resolution they are gigabytes.
+    struct Scratch {
+        Buffer expanded,hidden,ffn,qkv,norm,ninv,scores,ex,den,prob,context,body,output;
+        explicit Scratch(int rows):expanded(size_t(rows)*128),hidden(expanded.count),
+            ffn(size_t(rows)*32),qkv(size_t(rows)*96),norm(qkv.count),ninv(size_t(rows)*2),scores(size_t(rows)*64),
+            ex(scores.count),den(rows),prob(scores.count),context(ffn.count),body(ffn.count),output(ffn.count) {}
+    };
+    std::unique_ptr<Scratch> scratch;
+    Scratch& sb() { if (!scratch) scratch.reset(new Scratch(capacity)); return *scratch; }
 public:
-    explicit Body(int rows):capacity(rows),expanded(size_t(rows)*128),hidden(expanded.count),
-        ffn(size_t(rows)*32),qkv(size_t(rows)*96),norm(qkv.count),ninv(size_t(rows)*2),scores(size_t(rows)*64),
-        ex(scores.count),den(rows),prob(scores.count),context(ffn.count),body(ffn.count),output(ffn.count) {}
+    explicit Body(int rows):capacity(rows) {}
     bool run(const Weights& w,const float* input,int rows,bool verify,size_t& comparisons) {
         if (!input || rows<=0 || rows>capacity || rows%64) return false;
         if (!verify) {
             // Fused one-window-per-workgroup body; stage outputs are not kept.
-            w.body(input,rows,body.data,output.data);
+            w.body(input,rows,sb().body.data,sb().output.data);
             return true;
         }
         auto dw=w.data.data;size_t n=size_t(rows)*32;
         tiled::gemm<H70,tiled::GATE,false>(c512_resident::stream,input,32,dw,32,nullptr,0,nullptr,
-            verify?expanded.data:nullptr,hidden.data,128,rows,128);
-        tiled::gemm<H70Raw,tiled::RAW,true>(c512_resident::stream,hidden.data,128,dw+4096,128,input,32,dw+16385,
-            ffn.data,nullptr,32,rows,32);
-        tiled::gemm<H70,tiled::RAW,false>(c512_resident::stream,ffn.data,32,dw+8192,32,nullptr,0,nullptr,
-            qkv.data,nullptr,96,rows,96);
+            verify?sb().expanded.data:nullptr,sb().hidden.data,128,rows,128);
+        tiled::gemm<H70Raw,tiled::RAW,true>(c512_resident::stream,sb().hidden.data,128,dw+4096,128,input,32,dw+16385,
+            sb().ffn.data,nullptr,32,rows,32);
+        tiled::gemm<H70,tiled::RAW,false>(c512_resident::stream,sb().ffn.data,32,dw+8192,32,nullptr,0,nullptr,
+            sb().qkv.data,nullptr,96,rows,96);
         HIP_CHECK(hipGetLastError());
-        C32_LAUNCH(k_h70_qknorm_inv,size_t(rows)*2,qkv.data,ninv.data,rows);
-        C32_LAUNCH(k_h70_qknorm_apply,size_t(rows)*96,qkv.data,ninv.data,norm.data,rows,w.scale);
-        C32_LAUNCH(k_h70_scores,size_t(rows)*64,norm.data,dw+12288,scores.data,rows/64);
-        C32_LAUNCH(k_h70_exp,size_t(rows)*64,scores.data,ex.data,rows*64);
-        C32_LAUNCH(k_h70_den,rows,ex.data,den.data,rows);
-        C32_LAUNCH(k_h70_prob,size_t(rows)*64,ex.data,den.data,prob.data,rows*64);
-        C32_LAUNCH(k_h70_context,n,prob.data,norm.data,context.data,rows/64);
-        tiled::gemm<H70,tiled::DOUBLE_RES,true>(c512_resident::stream,context.data,32,dw+11264,32,ffn.data,32,dw+16417,
-            body.data,nullptr,32,rows,32);
+        C32_LAUNCH(k_h70_qknorm_inv,size_t(rows)*2,sb().qkv.data,sb().ninv.data,rows);
+        C32_LAUNCH(k_h70_qknorm_apply,size_t(rows)*96,sb().qkv.data,sb().ninv.data,sb().norm.data,rows,w.scale);
+        C32_LAUNCH(k_h70_scores,size_t(rows)*64,sb().norm.data,dw+12288,sb().scores.data,rows/64);
+        C32_LAUNCH(k_h70_exp,size_t(rows)*64,sb().scores.data,sb().ex.data,rows*64);
+        C32_LAUNCH(k_h70_den,rows,sb().ex.data,sb().den.data,rows);
+        C32_LAUNCH(k_h70_prob,size_t(rows)*64,sb().ex.data,sb().den.data,sb().prob.data,rows*64);
+        C32_LAUNCH(k_h70_context,n,sb().prob.data,sb().norm.data,sb().context.data,rows/64);
+        tiled::gemm<H70,tiled::DOUBLE_RES,true>(c512_resident::stream,sb().context.data,32,dw+11264,32,sb().ffn.data,32,dw+16417,
+            sb().body.data,nullptr,32,rows,32);
         HIP_CHECK(hipGetLastError());
-        C32_LAUNCH(quantize_body,n,body.data,output.data,int(n));
+        C32_LAUNCH(quantize_body,n,sb().body.data,sb().output.data,int(n));
         struct Stage {const char* name;float* data;size_t count;};
-        Stage stages[]={{"expanded",expanded.data,size_t(rows)*128},{"hidden",hidden.data,size_t(rows)*128},
-          {"ffn",ffn.data,n},{"qkv",qkv.data,size_t(rows)*96},{"qknorm",norm.data,size_t(rows)*96},
-          {"scores",scores.data,size_t(rows)*64},{"exp",ex.data,size_t(rows)*64},{"den",den.data,size_t(rows)},
-          {"prob",prob.data,size_t(rows)*64},{"context",context.data,n},{"body",body.data,n},{"output",output.data,n}};
+        Stage stages[]={{"expanded",sb().expanded.data,size_t(rows)*128},{"hidden",sb().hidden.data,size_t(rows)*128},
+          {"ffn",sb().ffn.data,n},{"qkv",sb().qkv.data,size_t(rows)*96},{"qknorm",sb().norm.data,size_t(rows)*96},
+          {"scores",sb().scores.data,size_t(rows)*64},{"exp",sb().ex.data,size_t(rows)*64},{"den",sb().den.data,size_t(rows)},
+          {"prob",sb().prob.data,size_t(rows)*64},{"context",sb().context.data,n},{"body",sb().body.data,n},{"output",sb().output.data,n}};
         for (auto& s:stages) if(!check(w.dir,s.name,s.data,s.count,verify,comparisons))return false;
         return true;
     }
-    const float* raw() const {return body.data;}
-    const float* quantized() const {return output.data;}
+    const float* raw() const {return scratch?scratch->body.data:nullptr;}
+    const float* quantized() const {return scratch?scratch->output.data:nullptr;}
     int rows_capacity() const {return capacity;}
     // Any number of windows in capacity-sized chunks, written straight into
     // caller buffers (raw half body, optional FP8 output). Windows are
@@ -165,20 +172,20 @@ public:
             const float* in=input+size_t(start)*32;
             float* out=raw_out+size_t(start)*32;
             tiled::gemm<H70,tiled::GATE,false>(c512_resident::stream,in,32,dw,32,nullptr,0,nullptr,
-                nullptr,hidden.data,128,r,128);
-            tiled::gemm<H70Raw,tiled::RAW,true>(c512_resident::stream,hidden.data,128,dw+4096,128,in,32,dw+16385,
-                ffn.data,nullptr,32,r,32);
-            tiled::gemm<H70,tiled::RAW,false>(c512_resident::stream,ffn.data,32,dw+8192,32,nullptr,0,nullptr,
-                qkv.data,nullptr,96,r,96);
+                nullptr,sb().hidden.data,128,r,128);
+            tiled::gemm<H70Raw,tiled::RAW,true>(c512_resident::stream,sb().hidden.data,128,dw+4096,128,in,32,dw+16385,
+                sb().ffn.data,nullptr,32,r,32);
+            tiled::gemm<H70,tiled::RAW,false>(c512_resident::stream,sb().ffn.data,32,dw+8192,32,nullptr,0,nullptr,
+                sb().qkv.data,nullptr,96,r,96);
             HIP_CHECK(hipGetLastError());
-            C32_LAUNCH(k_h70_qknorm_inv,size_t(r)*2,qkv.data,ninv.data,r);
-        C32_LAUNCH(k_h70_qknorm_apply,size_t(r)*96,qkv.data,ninv.data,norm.data,r,w.scale);
-            C32_LAUNCH(k_h70_scores,size_t(r)*64,norm.data,dw+12288,scores.data,r/64);
-            C32_LAUNCH(k_h70_exp,size_t(r)*64,scores.data,ex.data,r*64);
-            C32_LAUNCH(k_h70_den,r,ex.data,den.data,r);
-            C32_LAUNCH(k_h70_prob,size_t(r)*64,ex.data,den.data,prob.data,r*64);
-            C32_LAUNCH(k_h70_context,n,prob.data,norm.data,context.data,r/64);
-            tiled::gemm<H70,tiled::DOUBLE_RES,true>(c512_resident::stream,context.data,32,dw+11264,32,ffn.data,32,
+            C32_LAUNCH(k_h70_qknorm_inv,size_t(r)*2,sb().qkv.data,sb().ninv.data,r);
+        C32_LAUNCH(k_h70_qknorm_apply,size_t(r)*96,sb().qkv.data,sb().ninv.data,sb().norm.data,r,w.scale);
+            C32_LAUNCH(k_h70_scores,size_t(r)*64,sb().norm.data,dw+12288,sb().scores.data,r/64);
+            C32_LAUNCH(k_h70_exp,size_t(r)*64,sb().scores.data,sb().ex.data,r*64);
+            C32_LAUNCH(k_h70_den,r,sb().ex.data,sb().den.data,r);
+            C32_LAUNCH(k_h70_prob,size_t(r)*64,sb().ex.data,sb().den.data,sb().prob.data,r*64);
+            C32_LAUNCH(k_h70_context,n,sb().prob.data,sb().norm.data,sb().context.data,r/64);
+            tiled::gemm<H70,tiled::DOUBLE_RES,true>(c512_resident::stream,sb().context.data,32,dw+11264,32,sb().ffn.data,32,
                 dw+16417,out,nullptr,32,r,32);
             HIP_CHECK(hipGetLastError());
             if (quant_out) C32_LAUNCH(quantize_body,n,out,quant_out+size_t(start)*32,int(n));

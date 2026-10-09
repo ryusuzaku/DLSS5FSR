@@ -26,19 +26,29 @@ struct DeviceTensor {
     size_t count = 0;
 };
 
+// Device buffer of `count` floats, allocated on first use of `data` (S336):
+// many buffers serve only the staged / exact / verify paths, and allocating
+// them all up front took 5.7 GB at 1536x896 and more than the whole card at
+// 5120x1440. `data` converts to float* (allocating then); data.get() for
+// explicit pointer casts.
 struct Buffer {
-    float* data = nullptr;
+    struct Lazy {
+        mutable float* p = nullptr;
+        size_t n = 0;
+        float* get() const {
+            if (!p && n) { HIP_CHECK(hipMalloc(&p, n * sizeof(float))); ++traffic.allocations; }
+            return p;
+        }
+        operator float*() const { return get(); }
+    } data;
     size_t count;
-    explicit Buffer(size_t n) : count(n) {
-        HIP_CHECK(hipMalloc(&data, n * sizeof(float)));
-        ++traffic.allocations;
-    }
+    explicit Buffer(size_t n) : count(n) { data.n = n; }
     Buffer(const std::string& dir, const char* name, size_t n) : Buffer(n) {
         auto values = read(dir, name, n);
-        HIP_CHECK(hipMemcpy(data, values.data(), n * sizeof(float), hipMemcpyHostToDevice));
+        HIP_CHECK(hipMemcpy(data.get(), values.data(), n * sizeof(float), hipMemcpyHostToDevice));
         traffic.h2d_bytes += n * sizeof(float);
     }
-    ~Buffer() { if (data) (void)hipFree(data); }  // destructors never throw or exit
+    ~Buffer() { if (data.p) (void)hipFree(data.p); }  // destructors never throw or exit
     Buffer(const Buffer&) = delete;
     Buffer& operator=(const Buffer&) = delete;
 };
@@ -74,7 +84,7 @@ class Chain {
     // E4M3 byte copies of the FP8 activations the GEMMs pass on (S336): the
     // consuming GEMM reads a quarter of the bytes and converts nothing.
     Buffer mixed8, hidden8, branch8, feature8, ping8, pong8, crop8;
-    static unsigned char* bytes(Buffer& b) { return reinterpret_cast<unsigned char*>(b.data); }
+    static unsigned char* bytes(Buffer& b) { return reinterpret_cast<unsigned char*>(b.data.get()); }
 
     bool check(const std::string& dir, const char* name, float* device, size_t count, bool verify) {
         if (!verify) return true;
