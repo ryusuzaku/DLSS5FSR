@@ -39,9 +39,17 @@ struct Buffer {
     struct Lazy {
         mutable float* p = nullptr;
         size_t n = 0;
+        mutable std::vector<float> host;  // file contents not yet on the device
+        // The host copy while there is no device one (WeightRef: weight caches).
+        const std::vector<float>* host_vec() const { return !p && !host.empty() ? &host : nullptr; }
         float* get() const {
             if (!p && n) {
                 HIP_CHECK(hipMalloc(&p, n * sizeof(float))); ++traffic.allocations;
+                if (!host.empty()) {
+                    HIP_CHECK(hipMemcpy(p, host.data(), n * sizeof(float), hipMemcpyHostToDevice));
+                    traffic.h2d_bytes += n * sizeof(float);
+                    std::vector<float>().swap(host);
+                }
                 if (alloc_log_mb >= 0 && n*4.0/1e6 >= alloc_log_mb) fprintf(stderr, "alloc %-28s %9.1f MB\n", alloc_tag, n*4.0/1e6);
             }
             return p;
@@ -50,12 +58,16 @@ struct Buffer {
     } data;
     size_t count;
     explicit Buffer(size_t n) : count(n) { data.n = n; }
+    // File contents stay on the host until the device copy is first used: GEMM
+    // weights then go to the E4M3 caches straight from the host (WeightRef) and
+    // never take a device fp32 copy (S336).
     Buffer(const std::string& dir, const char* name, size_t n) : Buffer(n) {
-        auto values = read(dir, name, n);
-        HIP_CHECK(hipMemcpy(data.get(), values.data(), n * sizeof(float), hipMemcpyHostToDevice));
-        traffic.h2d_bytes += n * sizeof(float);
+        data.host = read(dir, name, n);
     }
-    ~Buffer() { if (data.p) (void)hipFree(data.p); }  // destructors never throw or exit
+    ~Buffer() {  // destructors never throw or exit
+        for (auto hook : free_hooks()) { hook(&data); if (data.p) hook(data.p); }
+        if (data.p) (void)hipFree(data.p);
+    }
     Buffer(const Buffer&) = delete;
     Buffer& operator=(const Buffer&) = delete;
 };

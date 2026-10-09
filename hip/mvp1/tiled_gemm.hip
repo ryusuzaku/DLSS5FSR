@@ -113,7 +113,7 @@ __global__ __launch_bounds__(256) void k_gemm(
 }
 
 template<class P, int EPI, bool RESIDUAL>
-inline void gemm(hipStream_t stream, const float* X, int ldx, const float* W, int K,
+inline void gemm(hipStream_t stream, const float* X, int ldx, c512_resident::WeightRef W, int K,
                  const float* R, int ldr, const float* S, float* out, float* out2, int ldo,
                  int T, int O, int groups = 1, long long gx = 0, long long gw = 0, long long go = 0,
                  int parts = 1, const unsigned char* X8 = nullptr, unsigned char* out8 = nullptr) {

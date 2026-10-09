@@ -459,8 +459,8 @@ __global__ void k_wmma_combine(const float* partial, int parts, int T, int O, fl
 // Half copies of weight matrices, keyed by source pointer and size. Weights
 // stay resident for an engine's lifetime; clear() when they are freed.
 struct State {
-    std::map<const float*, std::pair<h16*, size_t>> weights;
-    std::map<const float*, std::pair<unsigned char*, size_t>> weights8;  // E4M3 copies
+    std::map<const void*, std::pair<h16*, size_t>> weights;               // keyed by WeightRef::key()
+    std::map<const void*, std::pair<unsigned char*, size_t>> weights8;  // E4M3 copies
     float* partial = nullptr;  // split-K partition totals
     size_t partial_count = 0;
     ~State() { clear(); }
@@ -487,31 +487,60 @@ inline bool fp8 = false;  // half-activation build: f16 operands only
 inline bool fp8 = [] { const char* v = getenv("RESIDENT_GEMM_F16"); return !(v && *v == '1'); }();
 #endif
 
-// Cached E4M3 copy of `count` weights at W (converted once on `stream`).
-inline const unsigned char* fp8_weights(hipStream_t stream, const float* W, size_t count) {
+// The fp32 source of a weight conversion: the device copy, or a host copy
+// uploaded to a temporary (freed again once converted).
+template<class F>
+inline void convert_from(hipStream_t stream, c512_resident::WeightRef W, size_t count, F launch) {
+    if (const auto* host = W.host()) {
+        float* tmp = nullptr;
+        HIP_CHECK(hipMalloc(&tmp, count*sizeof(float)));
+        HIP_CHECK(hipMemcpyAsync(tmp, host->data(), count*sizeof(float), hipMemcpyHostToDevice, stream));
+        launch(tmp);
+        HIP_CHECK(hipStreamSynchronize(stream));
+        HIP_CHECK(hipFree(tmp));
+    } else {
+        launch(W.device());
+    }
+}
+// A freed buffer's copies leave the caches (a later buffer may reuse its address).
+inline void evict(const void* key) {
     auto& s = state();
-    auto found = s.weights8.find(W);
+    auto a = s.weights.find(key);
+    if (a != s.weights.end()) { (void)hipFree(a->second.first); s.weights.erase(a); }
+    auto b = s.weights8.find(key);
+    if (b != s.weights8.end()) { (void)hipFree(b->second.first); s.weights8.erase(b); }
+}
+inline void register_evict() { static const bool once = (c512_resident::free_hooks().push_back(&evict), true); (void)once; }
+
+// Cached E4M3 copy of `count` weights at W (converted once on `stream`).
+inline const unsigned char* fp8_weights(hipStream_t stream, c512_resident::WeightRef W, size_t count) {
+    register_evict();
+    auto& s = state();
+    auto found = s.weights8.find(W.key());
     if (found == s.weights8.end() || found->second.second != count) {
         unsigned char* packed = nullptr;
         HIP_CHECK(hipMalloc(&packed, count));
-        hipLaunchKernelGGL(k_to_e4m3, dim3((count+255)/256), dim3(256), 0, stream, W, packed, count);
+        convert_from(stream, W, count, [&](const float* src) {
+            hipLaunchKernelGGL(k_to_e4m3, dim3((count+255)/256), dim3(256), 0, stream, src, packed, count); });
         if (found != s.weights8.end()) (void)hipFree(found->second.first);
-        s.weights8[W] = {packed, count};
+        s.weights8[W.key()] = {packed, count};
         return packed;
     }
     return found->second.first;
 }
 
 // Cached half copy of `count` weights at W (converted once on `stream`).
-inline const h16* half_weights(hipStream_t stream, const float* W, size_t count) {
+inline const h16* half_weights(hipStream_t stream, c512_resident::WeightRef W, size_t count) {
+    register_evict();
     auto& s = state();
-    auto found = s.weights.find(W);
+    auto found = s.weights.find(W.key());
     if (found == s.weights.end() || found->second.second != count) {
         h16* packed = nullptr;
         HIP_CHECK(hipMalloc(&packed, count*sizeof(h16)));
-        hipLaunchKernelGGL(k_to_half, dim3((count+255)/256), dim3(256), 0, stream, W, packed, count);
+        convert_from(stream, W, count, [&](const float* src) {
+            hipLaunchKernelGGL(k_to_half, dim3((count+255)/256), dim3(256), 0, stream, src, packed, count); });
         if (found != s.weights.end()) (void)hipFree(found->second.first);
-        s.weights[W] = {packed, count};
+        s.weights[W.key()] = {packed, count};
         return packed;
     }
     return found->second.first;
@@ -521,7 +550,7 @@ template<class P, int EPI, bool RESIDUAL>
 // X8 (optional): X's E4M3 bytes, same layout (read instead of X by the
 // transposed kernel). out8 (optional, FP8 / GATE): the FP8 output's bytes;
 // *wrote8 says whether this call wrote them.
-inline bool gemm(hipStream_t stream, const float* X, int ldx, const float* W, int K,
+inline bool gemm(hipStream_t stream, const float* X, int ldx, c512_resident::WeightRef W, int K,
                  const float* R, int ldr, const float* S, float* out, float* out2, int ldo,
                  int T, int O, int groups, long long gx, long long gw, long long go, int parts,
                  const unsigned char* X8 = nullptr, unsigned char* out8 = nullptr, bool* wrote8 = nullptr) {
