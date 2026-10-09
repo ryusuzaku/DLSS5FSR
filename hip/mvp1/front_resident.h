@@ -155,6 +155,8 @@ public:
     // skip4_native: also write skip4 in native order (skip4_view); the
     // network reads skip4_peer_view instead and turns this off.
     bool skip4_native = true;
+    // pool4: block4 pools its raw body itself (k_c32_t fz.pool), no raw4 buffer.
+    bool pool4 = [] { const char* v = getenv("RESIDENT_POOL4"); return !(v && *v == '0'); }();
 private:
     unsigned loaded_seed = 0;
     static int checked(int w, int h) {
@@ -242,6 +244,7 @@ public:
         // Stem, block0, pool and skip0 in one launch (k_c32_t MODE 1).
         const bool pre = fused && Weights::fusable();
         skip_is_half = pre && half_skip;
+        const bool p4 = pool4 && Weights::fusable();  // the FP8 body (k_c32_t) pools; the f16 one does not
         if (!pre) FRONT_LAUNCH(k_front_stem,pixels*32,rgb.data,noise.data,stem.data,tokens.data,width,height,controls,history);
         auto io = [](int in_hwc, int w, int h, int shift) {
             C32Io v; v.in_hwc = in_hwc; v.out_hwc = 1; v.width = w; v.height = h;
@@ -271,7 +274,10 @@ public:
             int rows = ((w+px+7)/8)*((h+py+7)/8)*64;
             std::string block = dir+"/block"+std::to_string(b);
             if (fused) {
-                weights[b]->body(image.data, rows, b == 4 ? raw4.data : nullptr, image.data, io(1, w, h, shifts[b]));
+                // block4: the 2x2 pool of its raw body in the epilogue (no raw4).
+                C32Fuse pz; pz.pool = b == 4 && p4 ? down_pool.data.get() : nullptr;
+                weights[b]->body(image.data, rows, b == 4 && !p4 ? raw4.data.get() : nullptr, image.data,
+                                 io(1, w, h, shifts[b]), pz);
                 continue;
             }
             FRONT_LAUNCH(k_front_gather,size_t(rows)*32,image.data,tokens.data,w,h,shifts[b]);
@@ -282,7 +288,7 @@ public:
             if (!check(block,"image",image.data,size_t(w)*h*32,verify,comparisons) ||
                 (b == 4 && !check(block,"raw",raw4.data,size_t(w)*h*32,verify,comparisons))) return false;
         }
-        FRONT_LAUNCH(k_front_pool,size_t(w/2)*(h/2)*32,raw4.data,down_pool.data,w,h,32);
+        if (!(fused && p4)) FRONT_LAUNCH(k_front_pool,size_t(w/2)*(h/2)*32,raw4.data,down_pool.data,w,h,32);
         if (!verify) {
             // k_front_down + k_front_native64 in one GEMM: output column n of the
             // permuted matrix is peer column mh^-1(n), the same sums.

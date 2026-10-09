@@ -90,7 +90,8 @@ struct Weights {
         if (c512_resident::launch_hook) c512_resident::launch_hook(MODE == 1 ? "k_c32_t<pre>" : "k_c32_t<head>");
     }
     // Fused body of one launch: WMMA unless c512_resident::exact_math.
-    void body(const float* input,int rows,float* raw_out,float* quant_out,const C32Io& io=C32Io()) const {
+    // fz: only fz.pool is read here (k_c32_t's fused 2x2 pool of the raw body).
+    void body(const float* input,int rows,float* raw_out,float* quant_out,const C32Io& io=C32Io(),const C32Fuse& fz=C32Fuse()) const {
         if (c512_resident::exact_math && !io.in_hwc && !io.out_hwc && !io.permute) {
             hipLaunchKernelGGL(k_c32_fused,dim3(rows/64),dim3(256),0,c512_resident::stream,
                                input,data.data,scale,raw_out,quant_out);
@@ -103,7 +104,7 @@ struct Weights {
             // FP8 WMMA form, transposed: bit-identical to k_c32_fp8 / k_c32_wmma,
             // 2.9x faster than k_c32_fp8 (S336).
             hipLaunchKernelGGL(k_c32_t<1>,dim3(rows/64),dim3(128),0,c512_resident::stream,
-                               input,data.data,reinterpret_cast<const unsigned char*>(fp8.data.get()),scale,raw_out,quant_out,io);
+                               input,data.data,reinterpret_cast<const unsigned char*>(fp8.data.get()),scale,raw_out,quant_out,io,fz);
         }
         HIP_CHECK(hipGetLastError());
         if (c512_resident::launch_hook) c512_resident::launch_hook(c512_resident::exact_math?"k_c32_fused":"k_c32_t");

@@ -77,12 +77,28 @@ struct Weights {
     HIP_CHECK(hipGetLastError()); if (c512_resident::launch_hook) c512_resident::launch_hook(#kernel); } while (0)
 
 class Chain {
+public:
+    // The intermediates of one run: two chains of the same grid that never run
+    // at the same time (the encoder and the decoder) can share them (S336).
+    struct Scratch {
+        size_t n; int window_tokens;
+        Buffer pre, mixed, hidden, branch, feature, window, qkv, normalized, scores, exponents, probabilities,
+               inverse, context, crop, mixed8, hidden8, branch8, feature8, ping8, pong8, crop8;
+        Scratch(size_t n_, int tokens, int mwt) : n(n_), window_tokens(mwt), pre(n), mixed(n),
+            hidden(size_t(tokens)*2048), branch(n), feature(n), window(size_t(mwt)*512),
+            qkv(size_t(mwt)*1536), normalized(size_t(mwt)*1536), scores(size_t(mwt)*1024), exponents(size_t(mwt)*1024),
+            probabilities(size_t(mwt)*1024), inverse(size_t(mwt)*32), context(size_t(mwt)*512), crop(n),
+            mixed8(n/4), hidden8(size_t(tokens)*512), branch8(n/4), feature8(n/4), ping8(n/4), pong8(n/4), crop8(n/4) {}
+    };
+private:
     int width, height, tokens, max_window_tokens;
     size_t n;
     std::unique_ptr<Buffer> seed;  // standalone replay input, loaded on first run()
     std::string seed_dir;
-    Buffer ping, pong, pre, mixed, hidden, branch, feature, window, qkv,
-           normalized, scores, exponents, probabilities, inverse, context, crop;
+    std::shared_ptr<Scratch> sc;
+    Buffer ping, pong;
+    Buffer &pre, &mixed, &hidden, &branch, &feature, &window, &qkv,
+           &normalized, &scores, &exponents, &probabilities, &inverse, &context, &crop;
     std::vector<std::unique_ptr<Weights>> weights;
     std::unique_ptr<Buffer> head_weights, pooled, head_output;
     std::string head_dir;
@@ -90,7 +106,7 @@ class Chain {
     Buffer raw_output;
     // E4M3 byte copies of the FP8 activations the GEMMs pass on (S336): the
     // consuming GEMM reads a quarter of the bytes and converts nothing.
-    Buffer mixed8, hidden8, branch8, feature8, ping8, pong8, crop8;
+    Buffer &mixed8, &hidden8, &branch8, &feature8, &ping8, &pong8, &crop8;
     static unsigned char* bytes(Buffer& b) { return reinterpret_cast<unsigned char*>(b.data.get()); }
 
     bool check(const std::string& dir, const char* name, float* device, size_t count, bool verify) {
@@ -107,18 +123,19 @@ class Chain {
 
 public:
     size_t comparisons = 0;
+    // share: another chain's scratch of the same grid (they must not run concurrently).
     Chain(int w, int h, const std::vector<std::pair<std::string, int>>& blocks,
-          const std::string& head = "") :
+          const std::string& head = "", std::shared_ptr<Scratch> share = nullptr) :
         width(w), height(h), tokens(w*h),
         max_window_tokens(((w+11)/8)*8*((h+11)/8)*8), n(size_t(tokens)*512),
-        seed_dir(blocks.front().first), ping(n), pong(n), pre(n), mixed(n),
-        hidden(size_t(tokens)*2048), branch(n), feature(n), window(size_t(max_window_tokens)*512),
-        qkv(size_t(max_window_tokens)*1536), normalized(size_t(max_window_tokens)*1536),
-        scores(size_t(max_window_tokens)*1024), exponents(size_t(max_window_tokens)*1024),
-        probabilities(size_t(max_window_tokens)*1024), inverse(size_t(max_window_tokens)*32),
-        context(size_t(max_window_tokens)*512),
-        crop(n), head_dir(head), raw_output(n), mixed8(n/4), hidden8(size_t(tokens)*512), branch8(n/4),
-        feature8(n/4), ping8(n/4), pong8(n/4), crop8(n/4) {
+        seed_dir(blocks.front().first),
+        sc(share && share->n == n && share->window_tokens == max_window_tokens ? share
+           : std::make_shared<Scratch>(n, tokens, max_window_tokens)),
+        ping(n), pong(n), pre(sc->pre), mixed(sc->mixed), hidden(sc->hidden), branch(sc->branch), feature(sc->feature),
+        window(sc->window), qkv(sc->qkv), normalized(sc->normalized), scores(sc->scores), exponents(sc->exponents),
+        probabilities(sc->probabilities), inverse(sc->inverse), context(sc->context), crop(sc->crop),
+        head_dir(head), raw_output(n), mixed8(sc->mixed8), hidden8(sc->hidden8), branch8(sc->branch8),
+        feature8(sc->feature8), ping8(sc->ping8), pong8(sc->pong8), crop8(sc->crop8) {
         for (const auto& block : blocks)
             weights.emplace_back(new Weights(block.first, block.second));
         if (!head.empty()) {
@@ -263,6 +280,7 @@ public:
         return true;
     }
 
+    std::shared_ptr<Scratch> scratch() const { return sc; }
     DeviceTensor final_view() const { return result ? DeviceTensor{result, n} : DeviceTensor{}; }
     DeviceTensor raw_view() const { return result ? DeviceTensor{raw_output.data, n} : DeviceTensor{}; }
     DeviceTensor head_view() const {

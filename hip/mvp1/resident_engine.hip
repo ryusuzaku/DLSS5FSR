@@ -838,7 +838,7 @@ struct Network {
         HIP_CHECK(hipMemset(bridge->data, 0, bridge->count*sizeof(float)));
         vit.reset(new vit_resident::Chain(vit_tokens,folders(a[5],8),vit_valid));
         entry.reset(new decoder39_resident::Entry(w32/2,h32/2,a[6],inverse));
-        decoder.reset(new Chain(w32,h32,blocks(a[7],8)));
+        decoder.reset(new Chain(w32,h32,blocks(a[7],8),"",chain->scratch()));  // the encoder's intermediates
         prefix48.reset(new c256_resident::Prefix(w32,h32,a[8],width*2,height*2));
         c256.reset(new c256_resident::Chain(width*2,height*2,blocks(a[9],8)));
         prefix56.reset(new c128_resident::Prefix(width*2,height*2,a[10]));

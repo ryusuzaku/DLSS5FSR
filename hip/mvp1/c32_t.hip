@@ -404,15 +404,31 @@ __global__ __launch_bounds__(128/TT) void k_c32_t(const float* in, const float* 
             continue;
         }
         const int ob = out_base[token[u]];
+        // fz.pool (TT 1, HWC output, no permutation): also k_front_pool of the raw
+        // body into fz.pool (fz.width/2 wide). With windows on even pixel
+        // coordinates (shift 0 or 4) a 2x2 cell lies in one window and one wave:
+        // lanes n, n^1, n^8; cells are wholly inside or outside the image.
+        int pool_at = -1;
+        if (TT == 1 && fz.pool) {
+            const int x = (win % (io.pw/8))*8 + token[u]%8 - io.px, y = (win / (io.pw/8))*8 + token[u]/8 - io.py;
+            if (ob >= 0 && x % 2 == 0 && y % 2 == 0) pool_at = ((y/2)*(io.width/2) + x/2)*32;
+        }
         for (int o = 0; o < 2; ++o) {
             acc8 c = {};
             c = mma(arow(Wp + o*16*32, 32, 16), cb[1], mma(arow(Wp + o*16*32, 32, 0), cb[0], c));
-            if (ob < 0) continue;
             float body[8], quant[8];
             for (int e = 0; e < 8; ++e) {
                 body[e] = split512_half_sum(c[e], c32f_h(ffn[u][o][e]*g2[o*16 + h*8 + e]));
                 quant[e] = h70_f(body[e]);
             }
+            if (TT == 1 && fz.pool) {
+                for (int e = 0; e < 8; ++e) {  // all lanes: the shuffles need the partners
+                    const float a = h70_h(body[e] + __shfl_xor(body[e], 1));
+                    const float below = __shfl_xor(a, 8);
+                    if (pool_at >= 0) fz.pool[pool_at + o*16 + h*8 + e] = h70_f(h70_h(h70_h(a + below)*.25f));
+                }
+            }
+            if (ob < 0) continue;
             if (!io.permute) {
                 const int a = ob + o*16 + h*8;
                 if (raw_out) {
