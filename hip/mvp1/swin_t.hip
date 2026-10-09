@@ -391,9 +391,10 @@ __global__ __launch_bounds__(128/TT) void k_swin_tt(const float* __restrict__ in
 // swin_fp8::run's contract; false means "run the reference kernels".
 template<int C>
 inline bool run(const float* input, float* output, float* raw_out, int width, int height, int shift,
-                const swin_fused::Block& w, void* scratch) {
+                const swin_fused::Block& w, const c512_resident::Buffer::Lazy& scratch) {
+    // scratch serves only the swin_fp8 fallback (taken lazily: no allocation otherwise).
     if (c512_resident::exact_math) return false;
-    if (!enabled) return swin_fp8::run<C>(input, output, raw_out, width, height, shift, w, scratch);
+    if (!enabled) return swin_fp8::run<C>(input, output, raw_out, width, height, shift, w, scratch.get());
     hipStream_t s = c512_resident::stream;
     Geometry g{width, height, (shift&1) ? 4 : 0, (shift&2) ? 4 : 0, 0};
     g.pw = ((width+g.px+7)/8)*8;

@@ -752,6 +752,14 @@ __global__ void k_pad_hwc(const float* src, float* dst, int w, int h, int dw, in
 }
 
 struct Network {
+    // RESIDENT_MEMSAVE=0: the S336 memory savings off (A/B): sources consumed by
+    // the chains, skip0 as halves, skip4 read in peer order.
+    // A number selects parts (bits: 1 consume, 2 half skip0, 4 skip4 peer, 8 head
+    // out). Bit 8 is off by default: the engine's compose can still be reading the
+    // network's RGB buffers of the previous job while the next one runs (it broke
+    // resident_engine_test), so the head keeps its own and the end-of-run copy.
+    static inline const int memsave_bits = [] { const char* v = getenv("RESIDENT_MEMSAVE"); return v ? atoi(v) : 7; }();
+    static inline const bool memsave = memsave_bits != 0;
     // width x height: the image at 1/32; w32 x h32: NVIDIA's C512 grid (multiples
     // of 4); tokens: the C512 head's (w32/2 x h32/2); vit_valid: NVIDIA's ViT
     // sequence (up4(w32/2) x up4(h32/2)); vit_tokens: that padded to a multiple
@@ -843,6 +851,17 @@ struct Network {
         color.reset(new Buffer(size_t(W)*H*3));
         rgb_native.reset(new Buffer(size_t(W)*H*3));
         rgb_public.reset(new Buffer(size_t(W)*H*3));
+        // Every chain's source is read by that chain only (front c64, the downsamples,
+        // the entry, the prefixes), so the chains may use it as their second buffer.
+        if (memsave_bits & 1) {
+            encoder8->consume_source = encoder14->consume_source = encoder22->consume_source = true;
+            // Not the C512 chain (its padded grid keeps zero rows from construction)
+            // nor the ViT (the bridge keeps zero padding tokens): both small.
+            decoder->consume_source = true;
+            c256->consume_source = c128->consume_source = c64->consume_source = c32->consume_source = true;
+        }
+        if (memsave_bits & 4) front->skip4_native = false;  // prefix66 reads block4's image in peer order
+        if (memsave_bits & 8) { head70->out_native = rgb_native->data.get(); head70->out_public = rgb_public->data.get(); }
     }
 
     // sw x sh: the network content (the frame, or its downscale); 0 = the frame.
@@ -865,6 +884,7 @@ struct Network {
                                    color->data, history_clamp, sw, sh, W, H);
         }
         HIP_CHECK(hipGetLastError());
+        front->half_skip = (memsave_bits & 2) && head70->fusable();  // skip0 as halves when the fused head reads them (half the memory)
         bool ok = front->run_from_device({color->data,color->count}) &&
             encoder8->run_from_device(front->c64_view()) && down8->run_from_device(encoder8->raw_view()) &&
             encoder14->run_from_device(down8->final_view()) && down14->run_from_device(encoder14->raw_view()) &&
@@ -884,15 +904,18 @@ struct Network {
                 c128->run_from_device(prefix56->final_view()) &&
                 prefix62->run_from_device(c128->final_view(), encoder8->final_view()) &&
                 c64->run_from_device(prefix62->final_view()) &&
-                prefix66->run_from_device(c64->final_view(), front->skip4_view()) &&
+                prefix66->run_from_device(c64->final_view(), (memsave_bits & 4) ? front->skip4_peer_view() : front->skip4_view(), false, (memsave_bits & 4) != 0) &&
                 c32->run_from_device(prefix66->final_view()) &&
-                head70->run_from_device(c32->final_view(), front->skip0_view(), {color->data,color->count});
+                head70->run_from_device(c32->final_view(), front->skip0_view(), {color->data,color->count}, false,
+                                        front->skip0_half());
         }
         if (!ok) throw std::runtime_error("resident execution rejected a device view");
-        HIP_CHECK(hipMemcpyAsync(rgb_native->data, head70->final_view().data, rgb_native->count*sizeof(float),
-                                 hipMemcpyDeviceToDevice, stream));
-        HIP_CHECK(hipMemcpyAsync(rgb_public->data, head70->public_view().data, rgb_public->count*sizeof(float),
-                                 hipMemcpyDeviceToDevice, stream));
+        if (head70->final_view().data != rgb_native->data.p)  // the head writes them directly (out_native)
+            HIP_CHECK(hipMemcpyAsync(rgb_native->data, head70->final_view().data, rgb_native->count*sizeof(float),
+                                     hipMemcpyDeviceToDevice, stream));
+        if (head70->public_view().data != rgb_public->data.p)
+            HIP_CHECK(hipMemcpyAsync(rgb_public->data, head70->public_view().data, rgb_public->count*sizeof(float),
+                                     hipMemcpyDeviceToDevice, stream));
     }
 };
 

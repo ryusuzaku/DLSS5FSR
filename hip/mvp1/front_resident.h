@@ -149,6 +149,12 @@ public:
     // noise_function: the original's noise also at seed 0 (computed over the
     // whole extent, as the original) instead of the fixtures' 256x256 tile.
     bool noise_function = false, loaded_function = false;
+    // half_skip: the fused block0 writes skip0 as halves only (skip0_half), for
+    // a head that reads them (Head::fusable); skip0_view is then empty.
+    bool half_skip = false;
+    // skip4_native: also write skip4 in native order (skip4_view); the
+    // network reads skip4_peer_view instead and turns this off.
+    bool skip4_native = true;
 private:
     unsigned loaded_seed = 0;
     static int checked(int w, int h) {
@@ -158,7 +164,9 @@ private:
     int width, height;
     size_t pixels;
     std::string dir;
-    Buffer noise, stem, matrix, tokens, raw0, image, raw4, down_pool, down, c64, skip4, skip0;
+    Buffer noise, stem, matrix, tokens, raw0, image, raw4, down_pool, down, c64, skip4, skip0, skip0h;
+    Buffer matrix_native;  // matrix rows in the native order: the down GEMM writes c64 directly
+    bool skip_is_half = false;  // this run wrote skip0 only as halves
     std::vector<std::unique_ptr<Weights>> weights;
     Body body;
     std::unique_ptr<Buffer> body_raw, body_quant;  // chunked body outputs above the cap
@@ -167,12 +175,21 @@ public:
     size_t comparisons = 0;
     // max_rows caps the C32 body scratch; larger frames run in chunks without stage checks.
     FrontEnd(int w, int h, const std::string& fixture, int max_rows = 0) : width(checked(w,h)), height(h), pixels(size_t(w)*h),
-        dir(fixture), noise(pixels*3), stem(dir,"stem_weights",15*32), matrix(dir,"matrix",64*32),
+        dir(fixture), noise(pixels*3), stem(dir,"stem_weights",15*32), matrix(dir,"matrix",64*32), matrix_native(64*32),
         tokens(size_t(w/2+8)*(h/2+8)*32 > pixels*32 ? size_t(w/2+8)*(h/2+8)*32 : pixels*32),
         raw0(pixels*32), image(pixels/4*32), raw4(pixels/4*32), down_pool(pixels/16*32), down(pixels/16*64),
-        c64(pixels/16*64), skip4(pixels/4*32), skip0(pixels*32),
+        c64(pixels/16*64), skip4(pixels/4*32), skip0(pixels*32), skip0h(pixels*16),
         body(max_rows > 0 && size_t(max_rows) < pixels ? max_rows : int(pixels)) {
         for (int b = 0; b < 5; ++b) weights.emplace_back(new Weights(dir+"/block"+std::to_string(b)));
+        {
+            const auto m = read(dir, "matrix", 64*32);
+            std::vector<float> nat(64*32);
+            for (int r = 0; r < 64; ++r) {
+                const int n = (r/16)*16 + (r%8)*2 + (r%16)/8;  // front_multihead64(r)
+                for (int k = 0; k < 32; ++k) nat[size_t(n)*32 + k] = m[size_t(r)*32 + k];
+            }
+            HIP_CHECK(hipMemcpy(matrix_native.data.get(), nat.data(), nat.size()*sizeof(float), hipMemcpyHostToDevice));
+        }
         load_noise();
         if (size_t(body.rows_capacity()) < pixels) {
             body_raw.reset(new Buffer(tokens.count));
@@ -224,6 +241,7 @@ public:
         const bool fused = !verify && !c512_resident::exact_math;  // bodies gather/scatter themselves
         // Stem, block0, pool and skip0 in one launch (k_c32_t MODE 1).
         const bool pre = fused && Weights::fusable();
+        skip_is_half = pre && half_skip;
         if (!pre) FRONT_LAUNCH(k_front_stem,pixels*32,rgb.data,noise.data,stem.data,tokens.data,width,height,controls,history);
         auto io = [](int in_hwc, int w, int h, int shift) {
             C32Io v; v.in_hwc = in_hwc; v.out_hwc = 1; v.width = w; v.height = h;
@@ -232,7 +250,8 @@ public:
         };
         if (pre) {
             C32Fuse fz; fz.width = width; fz.height = height; fz.rgb = rgb.data; fz.noise = noise.data;
-            fz.stem = stem.data; fz.history = history; fz.skip0 = skip0.data; fz.pool = image.data;
+            fz.stem = stem.data; fz.history = history; fz.pool = image.data;
+            if (half_skip) fz.skip0h = reinterpret_cast<_Float16*>(skip0h.data.get()); else fz.skip0 = skip0.data;
             for (int k = 0; k < 5; ++k) fz.controls[k] = controls.v[k];
             weights[0]->fused<1>(int(pixels), fz);
         } else if (fused) {
@@ -264,10 +283,17 @@ public:
                 (b == 4 && !check(block,"raw",raw4.data,size_t(w)*h*32,verify,comparisons))) return false;
         }
         FRONT_LAUNCH(k_front_pool,size_t(w/2)*(h/2)*32,raw4.data,down_pool.data,w,h,32);
-        tiled::gemm<c32_resident::H70Raw,tiled::FP8,false>(c512_resident::stream,down_pool.data,32,matrix.data,32,nullptr,0,nullptr,
-            down.data,nullptr,64,(w/2)*(h/2),64);  // k_front_down
-        FRONT_LAUNCH(k_front_native64,down.count,down.data,c64.data,int(down.count));
-        FRONT_LAUNCH(k_front_native32,skip4.count,image.data,skip4.data,int(skip4.count),0);
+        if (!verify) {
+            // k_front_down + k_front_native64 in one GEMM: output column n of the
+            // permuted matrix is peer column mh^-1(n), the same sums.
+            tiled::gemm<c32_resident::H70Raw,tiled::FP8,false>(c512_resident::stream,down_pool.data,32,matrix_native.data,32,
+                nullptr,0,nullptr,c64.data,nullptr,64,(w/2)*(h/2),64);
+        } else {
+            tiled::gemm<c32_resident::H70Raw,tiled::FP8,false>(c512_resident::stream,down_pool.data,32,matrix.data,32,nullptr,0,nullptr,
+                down.data,nullptr,64,(w/2)*(h/2),64);  // k_front_down
+            FRONT_LAUNCH(k_front_native64,down.count,down.data,c64.data,int(down.count));
+        }
+        if (skip4_native) FRONT_LAUNCH(k_front_native32,skip4.count,image.data,skip4.data,int(skip4.count),0);
         if (!pre) FRONT_LAUNCH(k_front_native32,skip0.count,raw0.data,skip0.data,int(skip0.count),1);
         if (!check(dir,"down_pool",down_pool.data,down_pool.count,verify,comparisons) ||
             !check(dir,"down",down.data,down.count,verify,comparisons) ||
@@ -278,8 +304,13 @@ public:
         return true;
     }
     DeviceTensor c64_view() const { return ready ? DeviceTensor{c64.data,c64.count} : DeviceTensor{}; }
-    DeviceTensor skip4_view() const { return ready ? DeviceTensor{skip4.data,skip4.count} : DeviceTensor{}; }
-    DeviceTensor skip0_view() const { return ready ? DeviceTensor{skip0.data,skip0.count} : DeviceTensor{}; }
+    DeviceTensor skip4_view() const { return ready && skip4_native ? DeviceTensor{skip4.data,skip4.count} : DeviceTensor{}; }
+    // The same values in the peer channel order (block4's image), for a reader
+    // that maps the channels itself (k_upsample66_merge skip_peer).
+    DeviceTensor skip4_peer_view() const { return ready ? DeviceTensor{image.data.get(),skip4.count} : DeviceTensor{}; }
+    DeviceTensor skip0_view() const { return ready && !skip_is_half ? DeviceTensor{skip0.data,skip0.count} : DeviceTensor{}; }
+    // skip0 as halves (the fused block0 with half_skip set), else null.
+    const _Float16* skip0_half() const { return ready && skip_is_half ? reinterpret_cast<const _Float16*>(skip0h.data.get()) : nullptr; }
 };
 #undef FRONT_LAUNCH
 } // namespace front_resident

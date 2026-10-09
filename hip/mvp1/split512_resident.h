@@ -18,6 +18,10 @@ struct Traffic {
     size_t allocations = 0, h2d_bytes = 0, d2h_bytes = 0, d2d_bytes = 0;
 };
 inline Traffic traffic;
+// RESIDENT_ALLOC_LOG=MB: print every buffer allocation of at least MB
+// megabytes, tagged with alloc_tag (resident_profile sets the stage name).
+inline const char* alloc_tag = "";
+inline const double alloc_log_mb = [] { const char* v = getenv("RESIDENT_ALLOC_LOG"); return v ? atof(v) : -1.0; }();
 
 
 // Borrowed default-stream device view; it never owns or frees its pointer.
@@ -36,7 +40,10 @@ struct Buffer {
         mutable float* p = nullptr;
         size_t n = 0;
         float* get() const {
-            if (!p && n) { HIP_CHECK(hipMalloc(&p, n * sizeof(float))); ++traffic.allocations; }
+            if (!p && n) {
+                HIP_CHECK(hipMalloc(&p, n * sizeof(float))); ++traffic.allocations;
+                if (alloc_log_mb >= 0 && n*4.0/1e6 >= alloc_log_mb) fprintf(stderr, "alloc %-28s %9.1f MB\n", alloc_tag, n*4.0/1e6);
+            }
             return p;
         }
         operator float*() const { return get(); }
@@ -93,6 +100,10 @@ class Chain {
         auto expected = read(dir, name, count);
         return compare((dir + ": " + name).c_str(), device, expected);
     }
+    // A lazy buffer is only touched (allocated) when verifying.
+    bool check(const std::string& dir, const char* name, const Buffer::Lazy& device, size_t count, bool verify) {
+        return !verify || check(dir, name, device.get(), count, verify);
+    }
 
 public:
     size_t comparisons = 0;
@@ -125,13 +136,18 @@ public:
     // Input must remain valid through the ordered copy on this HIP device's
     // default stream. Outputs are borrowed until the next run or destruction.
     // The copy isolates caller-owned input from ping-pong writes.
+    // consume_source: the fast path may use the source as its second buffer
+    // (one buffer less; set when nothing reads the source afterwards).
+    bool consume_source = false;
     bool run_from_device(DeviceTensor source, bool verify = false) {
         result = nullptr;
         if (!source.data || source.count != n) return false;
         float *input = const_cast<float*>(source.data), *output = pong.data;
         // The first block reads the source in place (no copy into ping), the
         // rest ping-pong between pong and ping: the source is never written.
-        auto advance = [&] { float* old = input; input = output; output = old == ping.data || old == pong.data ? old : ping.data; };
+        auto advance = [&] { float* old = input; input = output;
+            output = old == ping.data.p || old == pong.data.p ? old
+                   : consume_source && !verify && !c512_resident::exact_math ? const_cast<float*>(source.data) : ping.data.get(); };
         // Byte copies only on the fast path; the block input has none until a
         // block of this chain wrote it.
         const bool b8 = !c512_resident::exact_math && !verify && wmma_gemm::fp8;  // FP8 build only

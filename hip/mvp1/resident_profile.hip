@@ -38,7 +38,8 @@ int main(int argc, char** argv) {
         std::vector<std::pair<const char*, std::function<bool()>>> stages = {
             {"input", [&]{ hipLaunchKernelGGL(k_candidate_input_full, dim3((W*H+255)/256), dim3(256), 0, stream,
                                               src, net.color->data, fw, fh, pitch, bpp, W, H, fw, fh); return true; }},
-            {"front C32 (stem, block0-4, down4)", [&]{ return net.front->run_from_device({net.color->data,net.color->count}); }},
+            {"front C32 (stem, block0-4, down4)", [&]{ net.front->half_skip = Network::memsave && net.head70->fusable();
+                                                       return net.front->run_from_device({net.color->data,net.color->count}); }},
             {"encoder5-8 C64", [&]{ return net.encoder8->run_from_device(net.front->c64_view()); }},
             {"down8", [&]{ return net.down8->run_from_device(net.encoder8->raw_view()); }},
             {"encoder9-14 C128", [&]{ return net.encoder14->run_from_device(net.down8->final_view()); }},
@@ -58,10 +59,11 @@ int main(int argc, char** argv) {
             {"decoder56-61 C128", [&]{ return net.c128->run_from_device(net.prefix56->final_view()); }},
             {"prefix62", [&]{ return net.prefix62->run_from_device(net.c128->final_view(), net.encoder8->final_view()); }},
             {"decoder62-65 C64", [&]{ return net.c64->run_from_device(net.prefix62->final_view()); }},
-            {"prefix66", [&]{ return net.prefix66->run_from_device(net.c64->final_view(), net.front->skip4_view()); }},
+            {"prefix66", [&]{ return net.prefix66->run_from_device(net.c64->final_view(), Network::memsave ? net.front->skip4_peer_view() : net.front->skip4_view(), false, Network::memsave); }},
             {"decoder66-69 C32", [&]{ return net.c32->run_from_device(net.prefix66->final_view()); }},
             {"head70", [&]{ return net.head70->run_from_device(net.c32->final_view(), net.front->skip0_view(),
-                                                                 {net.color->data,net.color->count}); }},
+                                                                 {net.color->data,net.color->count}, false,
+                                                                 net.front->skip0_half()); }},
         };
         std::vector<hipEvent_t> events(stages.size()+1);
         for (auto& e : events) HIP_CHECK(hipEventCreate(&e));
@@ -71,6 +73,7 @@ int main(int argc, char** argv) {
             HIP_CHECK(hipEventRecord(events[0], stream));
             const auto t0 = std::chrono::steady_clock::now();
             for (size_t i = 0; i < stages.size(); ++i) {
+                c512_resident::alloc_tag = stages[i].first;
                 if (!stages[i].second()) throw std::runtime_error(std::string("stage failed: ") + stages[i].first);
                 HIP_CHECK(hipGetLastError());
                 HIP_CHECK(hipEventRecord(events[i+1], stream));

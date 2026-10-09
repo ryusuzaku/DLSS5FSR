@@ -28,6 +28,11 @@ inline bool check(const std::string& dir, const char* name, const float* device,
     traffic.d2h_bytes += count*sizeof(float);
     return compare((dir+": "+name).c_str(), const_cast<float*>(device), read(dir, name, count));
 }
+// A lazy buffer is only touched (allocated) when verifying.
+inline bool check(const std::string& dir, const char* name, const c512_resident::Buffer::Lazy& device,
+                  size_t count, bool verify, size_t& comparisons) {
+    return !verify || check(dir, name, (const float*)device.get(), count, verify, comparisons);
+}
 
 class Prefix {
     static int checked(int w, int h) {
@@ -101,13 +106,18 @@ public:
         if (encoder) { raw_windows.reset(new Buffer(windows.count)); raw.reset(new Buffer(n)); }
         for (const auto& b:blocks) weights.emplace_back(new Weights(b.first,b.second));
     }
+    // consume_source: the fast path may use the source as its second buffer
+    // (one buffer less; set when nothing reads the source afterwards).
+    bool consume_source = false;
     bool run_from_device(DeviceTensor source,bool verify=false) {
         result = nullptr;
         if (!source.data || source.count != n) return false;
         float *input = const_cast<float*>(source.data), *output = pong.data;
         // The first block reads the source in place (no copy into ping), the
         // rest ping-pong between pong and ping: the source is never written.
-        auto advance = [&] { float* old = input; input = output; output = old == ping.data || old == pong.data ? old : ping.data; };
+        auto advance = [&] { float* old = input; input = output;
+            output = old == ping.data.p || old == pong.data.p ? old
+                   : consume_source && !verify && !c512_resident::exact_math ? const_cast<float*>(source.data) : ping.data.get(); };
         for (size_t index=0;index<weights.size();++index) {
             const auto& w=*weights[index];
             bool last_raw=encoder && index+1==weights.size();

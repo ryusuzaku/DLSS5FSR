@@ -40,6 +40,11 @@ inline bool check(const std::string& dir,const char* name,const float* data,
     ++comparisons;traffic.d2h_bytes+=count*sizeof(float);
     return compare((dir+": "+name).c_str(),const_cast<float*>(data),read(dir,name,count));
 }
+// A lazy buffer is only touched (allocated) when verifying.
+inline bool check(const std::string& dir,const char* name,const c512_resident::Buffer::Lazy& data,
+                  size_t count,bool verify,size_t& comparisons) {
+    return !verify||check(dir,name,(const float*)data.get(),count,verify,comparisons);
+}
 // Same elementwise operations as the standalone C32/head test drivers.
 __global__ void quantize_body(const float* body,float* output,int n) {
     int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)output[i]=h70_f(body[i]);
@@ -208,14 +213,14 @@ public:
     Prefix(int w, int h, const std::string& fixture) : width(checked(w,h)), height(h),
         n(size_t(w)*h*64), out_n(n*2), dir(fixture), weights(dir,"weights",32*64),
         scale(dir,"scale",32), low(n/2), merged(out_n) {}
-    bool run_from_device(DeviceTensor input, DeviceTensor skip, bool verify = false) {
+    bool run_from_device(DeviceTensor input, DeviceTensor skip, bool verify = false, bool skip_peer = false) {
         ready = false;
         if (!input.data || input.count != n || !skip.data || skip.count != out_n) return false;
         if (!check(dir,"input",input.data,n,verify,comparisons) ||
             !check(dir,"skip",skip.data,out_n,verify,comparisons)) return false;
         tiled::gemm<tiled::Split,tiled::RAW,false>(c512_resident::stream,input.data,64,weights.data,64,nullptr,0,nullptr,
             low.data,nullptr,32,width*height,32);  // k_upsample66_project
-        C32_LAUNCH(k_upsample66_merge, out_n, low.data,skip.data,scale.data,merged.data,width,height);
+        C32_LAUNCH(k_upsample66_merge, out_n, low.data,skip.data,scale.data,merged.data,width,height,int(skip_peer));
         if (!check(dir,"low",low.data,n/2,verify,comparisons) ||
             !check(dir,"merged",merged.data,out_n,verify,comparisons)) return false;
         ready = true;
@@ -244,12 +249,17 @@ public:
         n(size_t(w)*h*32),ping(n),pong(n),windows(size_t(w+8)*(h+8)*32),body((w+8)*(h+8)) {
         for(auto& b:blocks){weights.emplace_back(new Weights(b.first+"/body"));shifts.push_back(b.second);}
     }
+    // consume_source: the fast path may use the source as its second buffer
+    // (one buffer less; set when nothing reads the source afterwards).
+    bool consume_source = false;
     bool run_from_device(DeviceTensor source,bool verify=false) {
         result=nullptr;if(!source.data||source.count!=n)return false;
         float *input = const_cast<float*>(source.data), *output = pong.data;
         // The first block reads the source in place (no copy into ping), the
         // rest ping-pong between pong and ping: the source is never written.
-        auto advance = [&] { float* old = input; input = output; output = old == ping.data || old == pong.data ? old : ping.data; };
+        auto advance = [&] { float* old = input; input = output;
+            output = old == ping.data.p || old == pong.data.p ? old
+                   : consume_source && !verify && !c512_resident::exact_math ? const_cast<float*>(source.data) : ping.data.get(); };
         for(size_t i=0;i<weights.size();++i){
             auto& w=*weights[i];int shift=shifts[i],px=(shift&1)?4:0,py=(shift&2)?4:0;
             int rows=((width+px+7)/8)*8*((height+py+7)/8)*8;size_t count=size_t(rows)*32;
@@ -288,7 +298,12 @@ class Head {
     bool ready=false;
     bool coeff_half=false;  // half-valued coefficients allow the fused finish pass
 public:
-    bool keep_native=true;  // the fused head writes the native body only when set (native_view)
+    bool keep_native=true;
+    // out_native/out_public (optional): write the two RGB images there instead
+    // of this head's own buffers (the network's, saving a copy and the memory).
+    float* out_native=nullptr; float* out_public=nullptr;
+    float* dn()const{return out_native?out_native:rgb_native.data.get();}
+    float* dp()const{return out_public?out_public:rgb_public.data.get();}  // the fused head writes the native body only when set (native_view)
     size_t comparisons=0;
     // max_rows caps the body scratch; larger frames run in chunks without stage checks.
     Head(int w,int h,const std::string& fixture,int max_rows=0):width(checked(w,h)),height(h),n(size_t(w)*h*32),nrgb(size_t(w)*h*3),dir(fixture),
@@ -298,15 +313,19 @@ public:
         coeff_half=true;
         for (float c:read(dir,"coeff",96)) coeff_half=coeff_half&&float(_Float16(c))==c;
     }
-    bool run_from_device(DeviceTensor main,DeviceTensor skip,DeviceTensor color,bool verify=false){
+    // The fused head can read the skip as halves (skip_half, FrontEnd::skip0_half).
+    bool fusable()const{return coeff_half&&Weights::fusable();}
+    bool run_from_device(DeviceTensor main,DeviceTensor skip,DeviceTensor color,bool verify=false,
+                         const _Float16* skip_half=nullptr){
         ready=false;
-        if(!main.data||main.count!=n/4||!skip.data||skip.count!=n||!color.data||color.count!=nrgb)return false;
-        if(!check(dir,"main",main.data,n/4,verify,comparisons)||!check(dir,"skip",skip.data,n,verify,comparisons)||
+        if(skip_half&&(verify||!fusable()))return false;
+        if(!main.data||main.count!=n/4||(!skip_half&&(!skip.data||skip.count!=n))||!color.data||color.count!=nrgb)return false;
+        if(!check(dir,"main",main.data,n/4,verify,comparisons)||(!skip_half&&!check(dir,"skip",skip.data,n,verify,comparisons))||
            !check(dir,"color",color.data,nrgb,verify,comparisons))return false;
         if(!verify&&coeff_half&&Weights::fusable()){
             // Merge, body and finish in one launch (k_c32_t MODE 2).
-            C32Fuse fz;fz.width=width;fz.height=height;fz.main=main.data;fz.skip=skip.data;fz.sm=sm.data;fz.ss=ss.data;
-            fz.coeff=coeff.data;fz.color=color.data;fz.rgb_native=rgb_native.data;fz.rgb_public=rgb_public.data;
+            C32Fuse fz;fz.width=width;fz.height=height;fz.main=main.data;fz.skip=skip.data;fz.skiph=skip_half;fz.sm=sm.data;fz.ss=ss.data;
+            fz.coeff=coeff.data;fz.color=color.data;fz.rgb_native=dn();fz.rgb_public=dp();
             fz.native=keep_native?native.data:nullptr;fz.native_scale=.03125f;
             weights.fused<2>(width*height,fz);
             ready=true;return true;
@@ -326,21 +345,21 @@ public:
         }
         if(coeff_half){
             C32_LAUNCH(k_head70_finish_pair,size_t(width)*height,native.data,coeff.data,color.data,
-                       rgb_native.data,rgb_public.data,width,height,.03125f);
+                       dn(),dp(),width,height,.03125f);
         }else{
-            C32_LAUNCH(k_head70_finish,nrgb,native.data,coeff.data,color.data,rgb_native.data,width,height,.03125f);
-            C32_LAUNCH(k_head70_finish,nrgb,native.data,coeff.data,color.data,rgb_public.data,width,height,1.f);
+            C32_LAUNCH(k_head70_finish,nrgb,native.data,coeff.data,color.data,dn(),width,height,.03125f);
+            C32_LAUNCH(k_head70_finish,nrgb,native.data,coeff.data,color.data,dp(),width,height,1.f);
         }
-        if(!check(dir,"native",native.data,n,verify,comparisons)||!check(dir,"rgb_native",rgb_native.data,nrgb,verify,comparisons)||
-           !check(dir,"rgb_public",rgb_public.data,nrgb,verify,comparisons))return false;
+        if(!check(dir,"native",native.data,n,verify,comparisons)||!check(dir,"rgb_native",dn(),nrgb,verify,comparisons)||
+           !check(dir,"rgb_public",dp(),nrgb,verify,comparisons))return false;
         ready=true;return true;
     }
     DeviceTensor merged_view()const{return ready?DeviceTensor{merged.data,n}:DeviceTensor{};}
     DeviceTensor peer_view()const{return ready?DeviceTensor{peer.data,n}:DeviceTensor{};}
     DeviceTensor body_view()const{return ready?DeviceTensor{chunked?chunked->data:body.raw(),n}:DeviceTensor{};}
     DeviceTensor native_view()const{return ready?DeviceTensor{native.data,n}:DeviceTensor{};}
-    DeviceTensor final_view()const{return ready?DeviceTensor{rgb_native.data,nrgb}:DeviceTensor{};}
-    DeviceTensor public_view()const{return ready?DeviceTensor{rgb_public.data,nrgb}:DeviceTensor{};}
+    DeviceTensor final_view()const{return ready?DeviceTensor{dn(),nrgb}:DeviceTensor{};}
+    DeviceTensor public_view()const{return ready?DeviceTensor{dp(),nrgb}:DeviceTensor{};}
 };
 #undef C32_LAUNCH
 } // namespace c32_resident

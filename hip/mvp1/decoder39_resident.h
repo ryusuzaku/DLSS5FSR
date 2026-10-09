@@ -29,6 +29,10 @@ class Entry {
         traffic.d2h_bytes += count*sizeof(float);
         return compare((dir + ": " + name).c_str(), const_cast<float*>(device), read(dir, name, count));
     }
+    // A lazy buffer is only touched (allocated) when verifying.
+    bool check(const char* name, const c512_resident::Buffer::Lazy& device, size_t count, bool verify) {
+        return !verify || check(name, (const float*)device.get(), count, verify);
+    }
 
 public:
     size_t comparisons = 0;

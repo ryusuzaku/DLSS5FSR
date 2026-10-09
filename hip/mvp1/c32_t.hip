@@ -55,7 +55,9 @@ struct C32Fuse {
     const float *rgb = nullptr, *noise = nullptr, *stem = nullptr, *history = nullptr;
     float controls[5] = {};
     float *skip0 = nullptr, *pool = nullptr;
+    _Float16* skip0h = nullptr;        // MODE 1: skip0 as halves instead (exact: clamped half values)
     const float *main = nullptr, *skip = nullptr, *sm = nullptr, *ss = nullptr, *coeff = nullptr, *color = nullptr;
+    const _Float16* skiph = nullptr;   // MODE 2: the skip as halves instead
     float *rgb_native = nullptr, *rgb_public = nullptr, *native = nullptr;
     float native_scale = 1.0f;
 };
@@ -207,12 +209,24 @@ __global__ __launch_bounds__(128/TT) void k_c32_t(const float* in, const float* 
                     x[e] = h70_h(part);
                 }
             } else if constexpr (MODE == 2) {  // k_head70_merge
+                // peer s*16 + h*8 + e is native s*16 + 4(e>>1) + 2h + (e&1): pairs.
                 const size_t m = (size_t(fy/2)*(fz.width/2) + fx/2)*32;
-                for (int e = 0; e < 8; ++e) {
-                    const int nc = peer_to_native32(s*16 + h*8 + e);
-                    float main_product = fz.main[m + nc]*fz.sm[nc];
-                    float skip_product = fz.skip[fp*32 + nc]*fz.ss[nc];
-                    x[e] = head70_half(head70_half(main_product) + skip_product);
+                for (int q = 0; q < 4; ++q) {
+                    const int nb = s*16 + 4*q + 2*h;
+                    const float2 mv = *reinterpret_cast<const float2*>(fz.main + m + nb);
+                    float2 sv;
+                    if (fz.skiph) {
+                        const _Float16* hp = fz.skiph + fp*32 + nb;
+                        sv = make_float2(float(hp[0]), float(hp[1]));
+                    } else {
+                        sv = *reinterpret_cast<const float2*>(fz.skip + fp*32 + nb);
+                    }
+                    const float mvs[2] = {mv.x, mv.y}, svs[2] = {sv.x, sv.y};
+                    for (int t = 0; t < 2; ++t) {
+                        float main_product = mvs[t]*fz.sm[nb+t];
+                        float skip_product = svs[t]*fz.ss[nb+t];
+                        x[2*q+t] = head70_half(head70_half(main_product) + skip_product);
+                    }
                 }
             } else if (b < 0) {
                 for (int e = 0; e < 8; ++e) x[e] = 0.0f;
@@ -341,10 +355,21 @@ __global__ __launch_bounds__(128/TT) void k_c32_t(const float* in, const float* 
                 const bool corner = (token[u] % 2) == 0 && (token[u] / 8) % 2 == 0;
                 float* pool = fz.pool + (size_t(fy/2)*(fz.width/2) + fx/2)*32;
                 for (int o = 0; o < 2; ++o)
+                    for (int q = 0; q < 4; ++q) {  // native pairs (see MODE 2's input)
+                        const int nb = o*16 + 4*q + 2*h;
+                        const float v0 = fminf(448.0f, fmaxf(-448.0f, body[o][2*q]));
+                        const float v1 = fminf(448.0f, fmaxf(-448.0f, body[o][2*q+1]));
+                        if (fz.skip0h) {
+                            _Float16* hp = fz.skip0h + fp*32 + nb;
+                            hp[0] = split512_to_half(v0); hp[1] = split512_to_half(v1);
+                        } else {
+                            *reinterpret_cast<float2*>(fz.skip0 + fp*32 + nb) = make_float2(v0, v1);
+                        }
+                    }
+                for (int o = 0; o < 2; ++o)
                     for (int e = 0; e < 8; ++e) {
                         const int c = o*16 + h*8 + e;
                         const float v = body[o][e];
-                        fz.skip0[fp*32 + peer_to_native32(c)] = fminf(448.0f, fmaxf(-448.0f, v));
                         const float a = h70_h(v + __shfl_xor(v, 1));
                         const float below = __shfl_xor(a, 8);
                         if (corner) pool[c] = h70_f(h70_h(h70_h(a + below)*.25f));
