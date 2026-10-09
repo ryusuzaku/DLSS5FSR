@@ -1,6 +1,7 @@
 // Per-stage GPU timing of the resident network at a chosen extent.
 // Usage: resident_profile config.txt capture.bin [repeats] [compact]
 // Compiles the engine's own Network so the measured code is the shipped code.
+#include <chrono>
 #include "resident_engine.hip"
 #include <cstdio>
 #include <map>
@@ -63,19 +64,36 @@ int main(int argc, char** argv) {
         std::vector<hipEvent_t> events(stages.size()+1);
         for (auto& e : events) HIP_CHECK(hipEventCreate(&e));
         std::vector<double> total(stages.size(), 0.0);
+        double enqueue_ms = 0;  // host time to issue a run (near the GPU time: launch bound)
         for (int r = 0; r < repeats+1; ++r) {
             HIP_CHECK(hipEventRecord(events[0], stream));
+            const auto t0 = std::chrono::steady_clock::now();
             for (size_t i = 0; i < stages.size(); ++i) {
                 if (!stages[i].second()) throw std::runtime_error(std::string("stage failed: ") + stages[i].first);
                 HIP_CHECK(hipGetLastError());
                 HIP_CHECK(hipEventRecord(events[i+1], stream));
             }
+            if (r) enqueue_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
             HIP_CHECK(hipStreamSynchronize(stream));
             if (r == 0) continue;  // warm-up
             for (size_t i = 0; i < stages.size(); ++i) {
                 float ms = 0;
                 HIP_CHECK(hipEventElapsedTime(&ms, events[i], events[i+1]));
                 total[i] += ms;
+            }
+        }
+        // PROFILE_STAGE=name: that stage alone, 20 times back to back (after the
+        // full runs above), against its time inside the network.
+        if (const char* only = getenv("PROFILE_STAGE")) {
+            for (size_t i = 0; i < stages.size(); ++i) {
+                if (std::string(stages[i].first) != only) continue;
+                HIP_CHECK(hipEventRecord(events[0], stream));
+                for (int r = 0; r < 20; ++r) if (!stages[i].second()) throw std::runtime_error("stage failed");
+                HIP_CHECK(hipEventRecord(events[1], stream));
+                HIP_CHECK(hipStreamSynchronize(stream));
+                float ms = 0;
+                HIP_CHECK(hipEventElapsedTime(&ms, events[0], events[1]));
+                printf("stage %s alone: %.3f ms (in the network %.3f ms)\n", only, ms/20, total[i]/repeats);
             }
         }
         // Per-kernel: one more run with an event after every resident launch.
@@ -111,7 +129,7 @@ int main(int argc, char** argv) {
                    kernels[ranked[i].second].second);
         double sum = 0;
         for (double t : total) sum += t;
-        printf("network %dx%d for %dx%d frame, mean of %d runs: %.1f ms\n", W, H, fw, fh, repeats, sum/repeats);
+        printf("network %dx%d for %dx%d frame, mean of %d runs: %.1f ms (host enqueue %.1f ms)\n", W, H, fw, fh, repeats, sum/repeats, enqueue_ms/repeats);
         for (size_t i = 0; i < stages.size(); ++i)
             printf("  %-36s %8.2f ms  %5.1f%%\n", stages[i].first, total[i]/repeats, 100.0*total[i]/sum);
     } catch (const std::exception& e) {

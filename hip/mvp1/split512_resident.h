@@ -118,12 +118,10 @@ public:
     bool run_from_device(DeviceTensor source, bool verify = false) {
         result = nullptr;
         if (!source.data || source.count != n) return false;
-        if (source.data != ping.data) {
-            HIP_CHECK(hipMemcpyAsync(ping.data, source.data, n*sizeof(float), hipMemcpyDeviceToDevice,c512_resident::stream));
-            traffic.d2d_bytes += n*sizeof(float);
-        }
-        float* input = ping.data;
-        float* output = pong.data;
+        float *input = const_cast<float*>(source.data), *output = pong.data;
+        // The first block reads the source in place (no copy into ping), the
+        // rest ping-pong between pong and ping: the source is never written.
+        auto advance = [&] { float* old = input; input = output; output = old == ping.data || old == pong.data ? old : ping.data; };
         // Byte copies only on the fast path; the block input has none until a
         // block of this chain wrote it.
         const bool b8 = !c512_resident::exact_math && !verify && wmma_gemm::fp8;  // FP8 build only
@@ -185,7 +183,7 @@ public:
                     w.final_skip.data, output, raw_output.data, 512, tokens, 512, 1, 0, 0, 0, 1,
                     crop_bytes ? bytes(crop8) : nullptr, output8);
                 HIP_CHECK(hipGetLastError());
-                std::swap(input, output);
+                advance();
                 input8 = output8; std::swap(output8, spare8);
                 continue;
             }
@@ -224,7 +222,7 @@ public:
             }
             if (!check(w.dir, "final_raw", raw_output.data, n, verify) ||
                 !check(w.dir, "final", output, n, verify)) return false;
-            std::swap(input, output);
+            advance();
             input8 = nullptr;  // this path wrote no bytes
         }
         if (head_weights) {

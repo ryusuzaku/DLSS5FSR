@@ -105,11 +105,10 @@ public:
     bool run_from_device(DeviceTensor source,bool verify=false) {
         result = nullptr;
         if (!source.data || source.count != n) return false;
-        if (source.data != ping.data) {
-            HIP_CHECK(hipMemcpyAsync(ping.data,source.data,n*sizeof(float),hipMemcpyDeviceToDevice,c512_resident::stream));
-            traffic.d2d_bytes += n*sizeof(float);
-        }
-        float *input=ping.data,*output=pong.data;
+        float *input = const_cast<float*>(source.data), *output = pong.data;
+        // The first block reads the source in place (no copy into ping), the
+        // rest ping-pong between pong and ping: the source is never written.
+        auto advance = [&] { float* old = input; input = output; output = old == ping.data || old == pong.data ? old : ping.data; };
         for (size_t index=0;index<weights.size();++index) {
             const auto& w=*weights[index];
             bool last_raw=encoder && index+1==weights.size();
@@ -121,7 +120,7 @@ public:
             if (!verify && swin_t::run<256>(input,output,last_raw?raw->data:nullptr,width,height,w.shift,
                     {w.w1.data,w.w2.data,w.w3.data,w.skip.data,w.qkv.data,w.scales.data,w.bias.data,
                      w.projection.data,w.attention_skip.data},middle.data)) {
-                std::swap(input,output);
+                advance();
                 continue;
             }
             C256_LAUNCH(k_spatial256_gather,count,input,windows.data,width,height,w.shift);
@@ -169,7 +168,7 @@ public:
                 !check(w.dir+"/output","output",output,n,verify,comparisons)) return false;
             if (last_raw && (!check(w.dir+"/attention","projection_raw",raw_windows->data,count,verify,comparisons) ||
                              !check(w.dir+"/raw_output","output",raw->data,n,verify,comparisons))) return false;
-            std::swap(input,output);
+            advance();
         }
         result=input;
         return true;

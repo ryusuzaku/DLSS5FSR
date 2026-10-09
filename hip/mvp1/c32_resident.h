@@ -239,10 +239,10 @@ public:
     }
     bool run_from_device(DeviceTensor source,bool verify=false) {
         result=nullptr;if(!source.data||source.count!=n)return false;
-        if(source.data!=ping.data){
-            HIP_CHECK(hipMemcpyAsync(ping.data,source.data,n*sizeof(float),hipMemcpyDeviceToDevice,c512_resident::stream));traffic.d2d_bytes+=n*sizeof(float);
-        }
-        float* input=ping.data;float* output=pong.data;
+        float *input = const_cast<float*>(source.data), *output = pong.data;
+        // The first block reads the source in place (no copy into ping), the
+        // rest ping-pong between pong and ping: the source is never written.
+        auto advance = [&] { float* old = input; input = output; output = old == ping.data || old == pong.data ? old : ping.data; };
         for(size_t i=0;i<weights.size();++i){
             auto& w=*weights[i];int shift=shifts[i],px=(shift&1)?4:0,py=(shift&2)?4:0;
             int rows=((width+px+7)/8)*8*((height+py+7)/8)*8;size_t count=size_t(rows)*32;
@@ -252,7 +252,7 @@ public:
                 C32Io io;io.in_hwc=io.out_hwc=io.permute=1;io.width=width;io.height=height;io.px=px;io.py=py;
                 io.pw=((width+px+7)/8)*8;
                 w.body(input,rows,nullptr,output,io);
-                std::swap(input,output);
+                advance();
                 continue;
             }
             C32_LAUNCH(k_spatial32_peer_gather,count,input,windows.data,width,height,shift);
@@ -260,7 +260,7 @@ public:
                !body.run(w,windows.data,rows,verify,comparisons))return false;
             C32_LAUNCH(k_spatial32_peer_scatter,n,body.quantized(),output,width,height,shift);
             if(!check(dir+"/output","output",output,n,verify,comparisons))return false;
-            std::swap(input,output);
+            advance();
         }
         result=input;return true;
     }

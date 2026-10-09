@@ -65,11 +65,10 @@ public:
     bool run_from_device(DeviceTensor source, bool verify = false) {
         result = nullptr;
         if (!source.data || source.count != n) return false;
-        if (source.data != ping.data) {
-            HIP_CHECK(hipMemcpyAsync(ping.data, source.data, n*sizeof(float), hipMemcpyDeviceToDevice,c512_resident::stream));
-            traffic.d2d_bytes += n*sizeof(float);
-        }
-        float *input = ping.data, *output = pong.data;
+        float *input = const_cast<float*>(source.data), *output = pong.data;
+        // The first block reads the source in place (no copy into ping), the
+        // rest ping-pong between pong and ping: the source is never written.
+        auto advance = [&] { float* old = input; input = output; output = old == ping.data || old == pong.data ? old : ping.data; };
         const bool b8 = !c512_resident::exact_math && !verify && wmma_gemm::fp8;  // FP8 build only
         unsigned char *input8 = nullptr, *output8 = b8 ? bytes(pong8) : nullptr, *spare8 = b8 ? bytes(ping8) : nullptr;
         for (const auto& owned : weights) {
@@ -143,7 +142,7 @@ public:
                 !check(w.dir, "exponents", exponents.data, sn, verify) ||
                 !check(w.dir, "attention", attention.data, n, verify) ||
                 !check(w.dir, "projection", output, n, verify)) return false;
-            std::swap(input, output);
+            advance();
             if (small) input8 = nullptr;
             else { input8 = output8; std::swap(output8, spare8); }
         }
