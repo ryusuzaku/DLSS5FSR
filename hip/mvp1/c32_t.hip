@@ -35,25 +35,8 @@ __device__ inline op8 arow(const unsigned char* m, int ld, int k) {
     const int l = threadIdx.x % 32;
     return *reinterpret_cast<const op8*>(m + (l % 16) * ld + (l / 16) * 8 + k);
 }
-// The gate of the expand output (one hidden value, half in and out).
-__device__ inline float gate(float c) {
-    float a = c32f_h(c);
-    float g = fminf(4.0f, fmaxf(-4.0f, a));
-    float inner = c32f_h(fabsf(g)*(-0.055908203125f)+0.447265625f);
-    float poly = c32f_h(g*inner+0.89453125f);
-    return c32f_h(a*poly);
-}
-// The exponent transform of a logit plus its bias (a half).
-__device__ inline float expo(float c, float bias) {
-    float score = c32f_h(c+bias);
-    float b = score*.044921875f+1.30078125f;
-    float clipped = fminf(1.5693359375f, fmaxf(1.03125f, c32f_h(b)));
-    _Float16 hc = split512_to_half(clipped);
-    unsigned short bits; __builtin_memcpy(&bits, &hc, 2);
-    bits = (unsigned short)((unsigned(bits)<<5)+0x8000u);
-    __builtin_memcpy(&hc, &bits, 2);
-    return float(hc);
-}
+using wmma_t::gate;  // the shared f16 forms (wmma_t.hip)
+using wmma_t::expo;
 }  // namespace c32t
 
 // Fused full-resolution blocks (MODE, one 16-token tile per wave). Windows
@@ -297,14 +280,10 @@ __global__ __launch_bounds__(128/TT) void k_c32_t(const float* in, const float* 
             }
             float v0[8], v1[8], p[4], s[8];
             for (int e = 0; e < 8; ++e) { v0[e] = c32f_h(c0[e]); v1[e] = c32f_h(c1[e]); }
-            for (int e = 0; e < 8; ++e) s[e] = split512_half_sum(v0[e]*v0[e], c32f_h(v1[e]*v1[e]));
-            for (int q = 0; q < 4; ++q) p[q] = c32f_h(s[2*q] + s[2*q+1]);
-            for (int q = 0; q < 4; ++q) p[q] = c32f_h(p[q] + __shfl_xor(p[q], 16));
-            const float total = c32f_h(c32f_h(p[0] + p[2]) + c32f_h(p[1] + p[3]));
-            const float inverse = c32f_h(1.f/sqrtf(fmaxf(total, .00006198883056640625f)));
+            const float inverse = wmma_t::norm_inverse(v0, v1);
             for (int e = 0; e < 8; ++e) {
-                float q0 = c32f_h(v0[e]*inverse), q1 = c32f_h(v1[e]*inverse);
-                if (m == 0) { q0 = c32f_h(q0*head_scale); q1 = c32f_h(q1*head_scale); }
+                float q0 = wmma_t::hmul(v0[e], inverse), q1 = wmma_t::hmul(v1[e], inverse);
+                if (m == 0) { q0 = wmma_t::hmul(q0, head_scale); q1 = wmma_t::hmul(q1, head_scale); }
                 v0[e] = q0; v1[e] = q1;
             }
             if (m == 0) {
@@ -332,31 +311,11 @@ __global__ __launch_bounds__(128/TT) void k_c32_t(const float* in, const float* 
         // (k%16)/8, element k%8; partial b (b in 0-3 and 8-11, + {0,16,4,20,
         // 32,48,36,52}) stays inside one lane half: this half computes the
         // partials (odd, l) for l = h*8 + {0,2}; the other half's two come across.
-        float den;
-        {
-            float mine[2][2];
-            for (int odd = 0; odd < 2; ++odd)
-                for (int j = 0; j < 2; ++j) {
-                    const int o = odd + 2*j;
-                    float value = c32f_h(ex[0][o]+ex[1][o]);
-                    value = c32f_h(value+c32f_h(ex[0][o+4]+ex[1][o+4]));
-                    value = c32f_h(value+c32f_h(ex[2][o]+ex[3][o]));
-                    value = c32f_h(value+c32f_h(ex[2][o+4]+ex[3][o+4]));
-                    mine[odd][j] = value;
-                }
-            float parity[2];
-            for (int odd = 0; odd < 2; ++odd) {
-                const float o0 = __shfl_xor(mine[odd][0], 16), o1 = __shfl_xor(mine[odd][1], 16);
-                const float p0 = h ? o0 : mine[odd][0], p1 = h ? o1 : mine[odd][1];
-                const float p2 = h ? mine[odd][0] : o0, p3 = h ? mine[odd][1] : o1;
-                parity[odd] = c32f_h(c32f_h(c32f_h(p0+p1)+p2)+p3);
-            }
-            den = c32f_h(1.f/c32f_h(parity[0]+parity[1]));
-        }
+        const float den = wmma_t::den_inverse(ex);
         op8 pb[4];
         for (int k = 0; k < 4; ++k) {
             float v[8];
-            for (int e = 0; e < 8; ++e) v[e] = c32f_h(ex[k][e]*den);
+            for (int e = 0; e < 8; ++e) v[e] = wmma_t::hmul(ex[k][e], den);
             pb[k] = pack(v);
         }
         // Context^T in two 32-key slices, then the projection.

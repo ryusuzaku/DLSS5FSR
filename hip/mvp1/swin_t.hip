@@ -133,15 +133,11 @@ __global__ __launch_bounds__(128) void k_swin_t(const float* __restrict__ input,
             }
             // split512_norm_inverse_fast as a column reduction (see k_c32_t).
             float s[8], p[4];
-            for (int e = 0; e < 8; ++e) s[e] = split512_half_sum(c0[e]*c0[e], c32f_h(c1[e]*c1[e]));
-            for (int q = 0; q < 4; ++q) p[q] = c32f_h(s[2*q] + s[2*q+1]);
-            for (int q = 0; q < 4; ++q) p[q] = c32f_h(p[q] + __shfl_xor(p[q], 16));
-            const float total = c32f_h(c32f_h(p[0] + p[2]) + c32f_h(p[1] + p[3]));
-            const float inverse = c32f_h(1.f/sqrtf(fmaxf(total, .00006198883056640625f)));
+            const float inverse = wmma_t::norm_inverse(c0, c1);
             const float scale = c32f_h(scales[hd]);
             for (int e = 0; e < 8; ++e) {
-                float q0 = c32f_h(c0[e]*inverse), q1 = c32f_h(c1[e]*inverse);
-                if (m == 0) { q0 = c32f_h(q0*scale); q1 = c32f_h(q1*scale); }
+                float q0 = wmma_t::hmul(c0[e], inverse), q1 = wmma_t::hmul(c1[e], inverse);
+                if (m == 0) { q0 = wmma_t::hmul(q0, scale); q1 = wmma_t::hmul(q1, scale); }
                 c0[e] = q0; c1[e] = q1;
             }
             if (m == 0) {
@@ -160,31 +156,11 @@ __global__ __launch_bounds__(128) void k_swin_t(const float* __restrict__ input,
             load8(bias + (size_t(hd*64 + token))*64 + k*16 + h*8, bv);
             for (int e = 0; e < 8; ++e) ex[k][e] = c32t::expo(c[e], bv[e]);
         }
-        float den;
-        {   // split512_den order (see k_c32_t).
-            float mine[2][2];
-            for (int odd = 0; odd < 2; ++odd)
-                for (int j = 0; j < 2; ++j) {
-                    const int o = odd + 2*j;
-                    float value = c32f_h(ex[0][o]+ex[1][o]);
-                    value = c32f_h(value+c32f_h(ex[0][o+4]+ex[1][o+4]));
-                    value = c32f_h(value+c32f_h(ex[2][o]+ex[3][o]));
-                    value = c32f_h(value+c32f_h(ex[2][o+4]+ex[3][o+4]));
-                    mine[odd][j] = value;
-                }
-            float parity[2];
-            for (int odd = 0; odd < 2; ++odd) {
-                const float o0 = __shfl_xor(mine[odd][0], 16), o1 = __shfl_xor(mine[odd][1], 16);
-                const float p0 = h ? o0 : mine[odd][0], p1 = h ? o1 : mine[odd][1];
-                const float p2 = h ? mine[odd][0] : o0, p3 = h ? mine[odd][1] : o1;
-                parity[odd] = c32f_h(c32f_h(c32f_h(p0+p1)+p2)+p3);
-            }
-            den = c32f_h(1.f/c32f_h(parity[0]+parity[1]));
-        }
+        const float den = wmma_t::den_inverse(ex);
         op8 pb[4];
         for (int k = 0; k < 4; ++k) {
             float v[8];
-            for (int e = 0; e < 8; ++e) v[e] = c32f_h(ex[k][e]*den);
+            for (int e = 0; e < 8; ++e) v[e] = wmma_t::hmul(ex[k][e], den);
             pb[k] = pack(v);
         }
         op8 cb[2];
@@ -342,16 +318,12 @@ __global__ __launch_bounds__(128/TT) void k_swin_tt(const float* __restrict__ in
                     continue;
                 }
                 float sq[8], p[4];
-                for (int e = 0; e < 8; ++e) sq[e] = split512_half_sum(c0[u][e]*c0[u][e], c32f_h(c1[u][e]*c1[u][e]));
-                for (int q = 0; q < 4; ++q) p[q] = c32f_h(sq[2*q] + sq[2*q+1]);
-                for (int q = 0; q < 4; ++q) p[q] = c32f_h(p[q] + __shfl_xor(p[q], 16));
-                const float total = c32f_h(c32f_h(p[0] + p[2]) + c32f_h(p[1] + p[3]));
-                const float inverse = c32f_h(1.f/sqrtf(fmaxf(total, .00006198883056640625f)));
+                const float inverse = wmma_t::norm_inverse(c0[u], c1[u]);
                 const float scale = c32f_h(scales[hd]);
                 float q0[8], q1[8];
                 for (int e = 0; e < 8; ++e) {
-                    q0[e] = c32f_h(c0[u][e]*inverse); q1[e] = c32f_h(c1[u][e]*inverse);
-                    if (m == 0) { q0[e] = c32f_h(q0[e]*scale); q1[e] = c32f_h(q1[e]*scale); }
+                    q0[e] = wmma_t::hmul(c0[u][e], inverse); q1[e] = wmma_t::hmul(c1[u][e], inverse);
+                    if (m == 0) { q0[e] = wmma_t::hmul(q0[e], scale); q1[e] = wmma_t::hmul(q1[e], scale); }
                 }
                 if (m == 0) {
                     qb[u][0] = pack(q0); qb[u][1] = pack(q1);
@@ -372,31 +344,11 @@ __global__ __launch_bounds__(128/TT) void k_swin_tt(const float* __restrict__ in
                 load8(bias + (size_t(hd*64 + token[u]))*64 + k*16 + h*8, bv);
                 for (int e = 0; e < 8; ++e) ex[k][e] = c32t::expo(c[e], bv[e]);
             }
-            float den;
-            {
-                float mine[2][2];
-                for (int odd = 0; odd < 2; ++odd)
-                    for (int j = 0; j < 2; ++j) {
-                        const int o = odd + 2*j;
-                        float value = c32f_h(ex[0][o]+ex[1][o]);
-                        value = c32f_h(value+c32f_h(ex[0][o+4]+ex[1][o+4]));
-                        value = c32f_h(value+c32f_h(ex[2][o]+ex[3][o]));
-                        value = c32f_h(value+c32f_h(ex[2][o+4]+ex[3][o+4]));
-                        mine[odd][j] = value;
-                    }
-                float parity[2];
-                for (int odd = 0; odd < 2; ++odd) {
-                    const float o0 = __shfl_xor(mine[odd][0], 16), o1 = __shfl_xor(mine[odd][1], 16);
-                    const float p0 = h ? o0 : mine[odd][0], p1 = h ? o1 : mine[odd][1];
-                    const float p2 = h ? mine[odd][0] : o0, p3 = h ? mine[odd][1] : o1;
-                    parity[odd] = c32f_h(c32f_h(c32f_h(p0+p1)+p2)+p3);
-                }
-                den = c32f_h(1.f/c32f_h(parity[0]+parity[1]));
-            }
+            const float den = wmma_t::den_inverse(ex);
             op8 pb[4];
             for (int k = 0; k < 4; ++k) {
                 float v[8];
-                for (int e = 0; e < 8; ++e) v[e] = c32f_h(ex[k][e]*den);
+                for (int e = 0; e < 8; ++e) v[e] = wmma_t::hmul(ex[k][e], den);
                 pb[k] = pack(v);
             }
             for (int d = 0; d < 2; ++d) {
