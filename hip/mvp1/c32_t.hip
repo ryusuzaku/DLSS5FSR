@@ -90,6 +90,56 @@ __device__ inline float half_of(double d) {
     }
     return split512_half(f);
 }
+// half_of(double(S) * 2^k + double(acc)) without doubles (S an int, acc a
+// half). The reference rounds the exact sum to double, then to half; since
+// 53 >= 2*11 + 2 that equals one rounding of the exact sum, which this
+// takes in integers: the exact value as T * 2^ex (plus a sticky bit when
+// acc lies far below S's grid), rounded to float by odd (truncate to 24
+// bits, set the last when inexact), then to half.
+__device__ inline float half_exact(int S, int k, float acc) {
+    bool neg, sticky = false;
+    unsigned long long T;
+    int ex;
+    if (acc == 0.0f) {
+        if (S == 0) return 0.0f;
+        neg = S < 0; T = (unsigned long long)(neg ? -(long long)S : (long long)S); ex = k;
+    } else {
+        int ae;
+        const float mant = frexpf(acc, &ae);
+        const long long A = (long long)(mant * 2048.0f);  // exact: a half has <= 11 significant bits
+        const int j = ae - 11;                             // acc = A * 2^j
+        long long V;
+        if (k >= j && k - j > 32) {
+            if (S == 0) return acc;
+            // |acc| < 2^ae < 2^(k-21): the value lies strictly inside the step
+            // of 2^(k-21) above (or, opposite signs, below) |S| * 2^k, a grid
+            // far finer than any half rounding boundary there (|S| * 2^21 has
+            // 22+ bits), so that step's lower end plus the sticky bit rounds
+            // like the exact value.
+            neg = S < 0;
+            const long long mag = (neg ? -(long long)S : (long long)S) << 21;
+            const bool same = (S > 0) == (A > 0);
+            T = (unsigned long long)(mag - (same ? 0 : 1)); ex = k - 21; sticky = true;
+        } else {
+            if (k >= j) { V = (long long)S * (1LL << (k - j)) + A; ex = j; }
+            else        { V = (long long)S + A * (1LL << (j - k)); ex = k; }
+            if (V == 0) return 0.0f;
+            neg = V < 0; T = (unsigned long long)(neg ? -V : V);
+        }
+    }
+    const int n = 64 - __clzll((long long)T);
+    unsigned mant;
+    if (n > 24) {
+        const int sh = n - 24;
+        sticky |= (T & ((1ULL << sh) - 1)) != 0;
+        mant = unsigned(T >> sh); ex += sh;
+    } else {
+        mant = unsigned(T << (24 - n)); ex -= 24 - n;
+    }
+    if (sticky) mant |= 1u;
+    const float f = ldexpf(float(mant), ex);
+    return split512_half(neg ? -f : f);
+}
 // head70_aligned_half over the 16 products of a lane pair: this lane's 8
 // (a[k], b[k]) and the other lane half's 8, with the running acc. ea / eb are
 // frexp exponents of a / b (a value's own once, not per colour). Every
@@ -112,7 +162,7 @@ __device__ inline float aligned_pair(const float* a, const int* ea, const float*
     int sum = 0;
     for (int k = 0; k < 8; ++k) sum += int(truncf(ldexpf(a[k] * b[k], 27 - e)));
     sum += __shfl_xor(sum, 16);
-    return half_of(double(sum) * ldexp(1.0, e - 27) + double(acc));
+    return half_exact(sum, e - 27, acc);  // == half_of(double(sum) * 2^(e-27) + double(acc))
 }
 }  // namespace c32t
 
