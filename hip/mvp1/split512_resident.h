@@ -73,7 +73,7 @@ class Chain {
     Buffer raw_output;
     // E4M3 byte copies of the FP8 activations the GEMMs pass on (S336): the
     // consuming GEMM reads a quarter of the bytes and converts nothing.
-    Buffer mixed8, hidden8, branch8, feature8, ping8, pong8;
+    Buffer mixed8, hidden8, branch8, feature8, ping8, pong8, crop8;
     static unsigned char* bytes(Buffer& b) { return reinterpret_cast<unsigned char*>(b.data); }
 
     bool check(const std::string& dir, const char* name, float* device, size_t count, bool verify) {
@@ -97,7 +97,7 @@ public:
         probabilities(size_t(max_window_tokens)*1024), inverse(size_t(max_window_tokens)*32),
         context(size_t(max_window_tokens)*512),
         crop(n), head_dir(head), raw_output(n), mixed8(n/4), hidden8(size_t(tokens)*512), branch8(n/4),
-        feature8(n/4), ping8(n/4), pong8(n/4) {
+        feature8(n/4), ping8(n/4), pong8(n/4), crop8(n/4) {
         for (const auto& block : blocks)
             weights.emplace_back(new Weights(block.first, block.second));
         if (!head.empty()) {
@@ -126,7 +126,7 @@ public:
         float* output = pong.data;
         // Byte copies only on the fast path; the block input has none until a
         // block of this chain wrote it.
-        const bool b8 = !c512_resident::exact_math && !verify;
+        const bool b8 = !c512_resident::exact_math && !verify && wmma_gemm::fp8;  // FP8 build only
         unsigned char *input8 = nullptr, *output8 = b8 ? bytes(pong8) : nullptr, *spare8 = b8 ? bytes(ping8) : nullptr;
         for (const auto& entry : weights) {
             const Weights& w = *entry;
@@ -174,13 +174,16 @@ public:
                 // windows (zero rows for padding) and writes the context to
                 // HWC: no gather or scatter pass.
                 tiled::gemm<tiled::Split,tiled::RAW,false>(c512_resident::stream, feature.data, 512, w.qkv.data, 512, nullptr, 0, nullptr,
-                    qkv.data, nullptr, 1536, tokens, 1536, 1, 0, 0, 0, 1, bytes(feature8));
+                    qkv.data, nullptr, 1536, tokens, 1536, 1, 0, 0, 0, 1, b8 ? bytes(feature8) : nullptr);
                 WindowIo io;
                 io.hwc = 1; io.width = width; io.height = height; io.px = px; io.py = py;
                 io.pw = ((width+px+7)/8)*8;
-                c512_resident::fused_attention(qkv.data, w.scales.data, w.bias.data, crop.data, wt, 512, &io);
+                bool crop_bytes = false;
+                c512_resident::fused_attention(qkv.data, w.scales.data, w.bias.data, crop.data, wt, 512, &io,
+                                               b8 ? bytes(crop8) : nullptr, &crop_bytes);
                 tiled::gemm<tiled::Split,tiled::FP8,true>(c512_resident::stream, crop.data, 512, w.final.data, 512, feature.data, 512,
-                    w.final_skip.data, output, raw_output.data, 512, tokens, 512, 1, 0, 0, 0, 1, nullptr, output8);
+                    w.final_skip.data, output, raw_output.data, 512, tokens, 512, 1, 0, 0, 0, 1,
+                    crop_bytes ? bytes(crop8) : nullptr, output8);
                 HIP_CHECK(hipGetLastError());
                 std::swap(input, output);
                 input8 = output8; std::swap(output8, spare8);

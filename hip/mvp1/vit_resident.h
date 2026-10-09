@@ -37,7 +37,9 @@ class Chain {
     std::vector<std::unique_ptr<Weights>> weights;
     float* result = nullptr;
     // E4M3 byte copies of the FP8 activations between the GEMMs (S336).
-    Buffer hidden8, contract8, ping8, pong8;
+    Buffer hidden8, contract8, ping8, pong8, kv8, attention8;
+    // RESIDENT_ATTN_T=0: k_vit_attention_fused instead of k_vit_kv8 + k_vit_attention_t.
+    static inline const bool attention_t = [] { const char* v = getenv("RESIDENT_ATTN_T"); return !(v && *v == '0'); }();
     static unsigned char* bytes(Buffer& b) { return reinterpret_cast<unsigned char*>(b.data); }
 
     bool check(const std::string& dir, const char* name, float* device, size_t count, bool verify) {
@@ -54,7 +56,7 @@ public:
         n(size_t(tokens)*1024),
         sn(size_t(32)*tokens*tokens), ping(n), pong(n), expanded(4*n), hidden(4*n),
         contract(n), projected(3*n), qkv(3*n), scores(sn), exponents(sn), attention(n),
-        hidden8(n), contract8(n/4), ping8(n/4), pong8(n/4) {
+        hidden8(n), contract8(n/4), ping8(n/4), pong8(n/4), kv8(n/2), attention8(n/4) {
         for (const auto& dir : blocks) weights.emplace_back(new Weights(dir));
     }
 
@@ -68,7 +70,7 @@ public:
             traffic.d2d_bytes += n*sizeof(float);
         }
         float *input = ping.data, *output = pong.data;
-        const bool b8 = !c512_resident::exact_math && !verify;
+        const bool b8 = !c512_resident::exact_math && !verify && wmma_gemm::fp8;  // FP8 build only
         unsigned char *input8 = nullptr, *output8 = b8 ? bytes(pong8) : nullptr, *spare8 = b8 ? bytes(ping8) : nullptr;
         for (const auto& owned : weights) {
             const auto& w = *owned;
@@ -94,7 +96,19 @@ public:
             }
             const bool fused = tokens % 64 == 0 && !c512_resident::exact_math && !verify;
             if (valid < tokens && !fused) return false;  // only the fused attention masks padding
-            if (fused) {
+            bool attention_bytes = false;
+            if (fused && attention_t && b8) {
+                // K/V bytes once, then the transposed attention (S336d).
+                hipLaunchKernelGGL(k_vit_kv8, dim3((tokens*32+255)/256), dim3(256), 0, c512_resident::stream,
+                                   projected.data, bytes(kv8), bytes(kv8) + n, tokens);
+                if (c512_resident::launch_hook) c512_resident::launch_hook("k_vit_kv8");
+                hipLaunchKernelGGL(k_vit_attention_t, dim3(tokens/64, 32), dim3(128), 0, c512_resident::stream,
+                                   projected.data, bytes(kv8), bytes(kv8) + n, w.scales.data, attention.data,
+                                   bytes(attention8), tokens, valid);
+                HIP_CHECK(hipGetLastError());
+                attention_bytes = true;
+                if (c512_resident::launch_hook) c512_resident::launch_hook("k_vit_attention_t");
+            } else if (fused) {
                 // Normalize, scores, exponents and attention in one launch.
                 hipLaunchKernelGGL(k_vit_attention_fused, dim3(tokens/64, 32), dim3(256), 0, c512_resident::stream,
                                    projected.data, w.scales.data, attention.data, tokens, valid);
@@ -116,7 +130,8 @@ public:
                            w.projection.data, w.projection_skip.data, output, tokens, 1024);
             } else {
                 tiled::gemm<tiled::Split,tiled::FP8,true>(c512_resident::stream, attention.data, 1024, w.projection.data, 1024, contract.data, 1024,
-                    w.projection_skip.data, output, nullptr, 1024, tokens, 1024, 1, 0, 0, 0, 4, nullptr, output8);
+                    w.projection_skip.data, output, nullptr, 1024, tokens, 1024, 1, 0, 0, 0, 4,
+                    attention_bytes ? bytes(attention8) : nullptr, output8);
                 HIP_CHECK(hipGetLastError());
             }
             if (!check(w.dir, "expanded", expanded.data, 4*n, verify) ||

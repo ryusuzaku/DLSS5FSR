@@ -10,6 +10,8 @@
 // bias [head][64][64], context [token][C]. Needs split512_attention.hip and
 // rocwmma (tiled_gemm.hip) first.
 
+#include "wmma_t.hip"
+
 // Where window tokens live: window order (hwc = 0, row win*64 + t), or an
 // HWC image (qkv rows y*width + x, context written there) through a shifted
 // 8x8 partition, padding tokens reading zero qkv (what the gather produced)
@@ -138,14 +140,108 @@ __global__ __launch_bounds__(256) void k_split512_attention_wmma(
     }
 }
 
+// k_split512_attention_wmma transposed (S336d): the same stages, rounding
+// and orders as [d][token] FP8 WMMA (see wmma_t.hip). Each wave owns 16
+// queries; only K and V go through LDS (4 KB); the Q/K norms and the
+// denominator are per-lane column reductions. context8 (optional): the
+// context's E4M3 bytes for the next GEMM.
+__global__ __launch_bounds__(128) void k_split512_attention_t(
+        const float* __restrict__ qkv, const float* __restrict__ scales, const float* __restrict__ bias,
+        float* context, unsigned char* context8, int channels, WindowIo io) {
+    using namespace wmma_t;
+    __shared__ __attribute__((aligned(16))) unsigned char Ks[64*32];  // [key][d]
+    __shared__ __attribute__((aligned(16))) unsigned char Vt[32*64];  // [d][key]
+    const int win = blockIdx.x, head = blockIdx.y;
+    const int tid = threadIdx.x, wave = tid/32, lane = tid%32, n = lane%16, h = lane/16;
+    const int token = wave*16 + n;
+    const long long r = io.row(win, token);
+    const float* row = qkv + (r < 0 ? 0 : r)*3*channels + head*32;
+    // Raw qkv is half-valued (RAW GEMM epilogue); padding tokens read zero.
+    float x[3][2][8];
+    for (int m = 0; m < 3; ++m)
+        for (int t = 0; t < 2; ++t) {
+            const float4* p = reinterpret_cast<const float4*>(row + m*channels + t*16 + h*8);
+            const float4 lo = p[0], hi = p[1];
+            const float v[8] = {lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
+            for (int e = 0; e < 8; ++e) x[m][t][e] = r < 0 ? 0.0f : hf(v[e]);
+        }
+    op8 qb[2];
+    {
+        const float inv = norm_inverse(x[0][0], x[0][1]), scale = hf(scales[head]);
+        for (int t = 0; t < 2; ++t) {
+            float v[8];
+            for (int e = 0; e < 8; ++e) v[e] = hf(hf(x[0][t][e]*inv)*scale);
+            qb[t] = pack(v);
+        }
+    }
+    {
+        const float inv = norm_inverse(x[1][0], x[1][1]);
+        for (int t = 0; t < 2; ++t) {
+            float v[8];
+            for (int e = 0; e < 8; ++e) v[e] = hf(x[1][t][e]*inv);
+            *reinterpret_cast<op8*>(Ks + token*32 + t*16 + h*8) = pack(v);
+        }
+    }
+    for (int t = 0; t < 2; ++t)
+        for (int e = 0; e < 8; ++e) Vt[(t*16+h*8+e)*64 + token] = byte8(x[2][t][e]);
+    __syncthreads();
+    float ex[4][8];
+    for (int k = 0; k < 4; ++k) {
+        acc8 c = {};
+        c = mma(arow(Ks + k*16*32, 32, 16), qb[1], mma(arow(Ks + k*16*32, 32, 0), qb[0], c));
+        const float4* b = reinterpret_cast<const float4*>(bias + (size_t(head*64 + token))*64 + k*16 + h*8);
+        const float4 lo = b[0], hi = b[1];
+        const float bv[8] = {lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
+        for (int e = 0; e < 8; ++e) ex[k][e] = expo(c[e], bv[e]);
+    }
+    const float den = den_inverse(ex);
+    op8 pb[4];
+    for (int k = 0; k < 4; ++k) {
+        float v[8];
+        for (int e = 0; e < 8; ++e) v[e] = hf(ex[k][e]*den);
+        pb[k] = pack(v);
+    }
+    for (int d = 0; d < 2; ++d) {
+        float acc[8] = {};
+        for (int s2 = 0; s2 < 2; ++s2) {
+            acc8 part = {};
+            part = mma(arow(Vt + d*16*64, 64, (2*s2+1)*16), pb[2*s2+1], mma(arow(Vt + d*16*64, 64, (2*s2)*16), pb[2*s2], part));
+            for (int e = 0; e < 8; ++e) acc[e] = hf(acc[e]+part[e]);
+        }
+        if (r < 0) continue;
+        const size_t at = size_t(r)*channels + head*32 + d*16 + h*8;
+        float q[8];
+        for (int e = 0; e < 8; ++e) q[e] = split512_fp8(acc[e]);
+        reinterpret_cast<float4*>(context + at)[0] = make_float4(q[0], q[1], q[2], q[3]);
+        reinterpret_cast<float4*>(context + at)[1] = make_float4(q[4], q[5], q[6], q[7]);
+        if (context8) *reinterpret_cast<op8*>(context8 + at) = pack(acc);
+    }
+}
+
 namespace c512_resident {
 // Launches the fused attention unless exact_math; false means "run the
 // reference kernels". tokens: whole 64-token windows in window order.
 // io (optional): qkv and context in HWC order instead (tokens = the padded
 // window token count, which sets the grid).
+// RESIDENT_ATTN_T=0 keeps k_split512_attention_wmma instead of the transposed
+// k_split512_attention_t. context8 (optional, transposed only): the
+// context's E4M3 bytes; *wrote8 says whether they were written.
+inline bool attention_t = [] { const char* v = getenv("RESIDENT_ATTN_T"); return !(v && *v == '0'); }();
 inline bool fused_attention(const float* qkv, const float* scales, const float* bias,
-                            float* context, int tokens, int channels, const WindowIo* io = nullptr) {
+                            float* context, int tokens, int channels, const WindowIo* io = nullptr,
+                            unsigned char* context8 = nullptr, bool* wrote8 = nullptr) {
+    if (wrote8) *wrote8 = false;
     if (exact_math || tokens % 64 || channels % 32) return false;
+#if !defined(H70_NO_FP8)
+    if (attention_t) {
+        hipLaunchKernelGGL(k_split512_attention_t, dim3(tokens/64, channels/32), dim3(128), 0, stream,
+                           qkv, scales, bias, context, context8, channels, io ? *io : WindowIo());
+        HIP_CHECK(hipGetLastError());
+        if (wrote8) *wrote8 = context8 != nullptr;
+        if (launch_hook) launch_hook("k_split512_attention_t");
+        return true;
+    }
+#endif
     hipLaunchKernelGGL(k_split512_attention_wmma, dim3(tokens/64, channels/32), dim3(256), 0, stream,
                        qkv, scales, bias, context, channels, io ? *io : WindowIo());
     HIP_CHECK(hipGetLastError());

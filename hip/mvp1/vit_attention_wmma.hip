@@ -186,3 +186,114 @@ __global__ __launch_bounds__(256) void k_vit_attention_fused(const float* __rest
         output[size_t(q0+q)*1024+head*32+c] = split512_fp8(split512_half(acc[e]*split512_half(1.0f/den[q])));
     }
 }
+
+// Transposed form of k_vit_attention_fused (S336d), same values and orders.
+// k_vit_kv8 first normalizes K (vit order) and quantizes K and V once
+// per launch: K8 [head][token][32], V8 [head][32][tokens] (E4M3 bytes).
+// k_vit_attention_t: grid (tokens/64, 32 heads), 4 waves of 16 queries,
+// [d][query] FP8 WMMA with K and V^T read as A operands straight from
+// those bytes; the permuted-order reductions (the Q norm, each chunk's
+// denominator) go through a small per-wave LDS row, one lane a query.
+// out8 (optional): the output's E4M3 bytes for the projection GEMM.
+__global__ void k_vit_kv8(const float* __restrict__ projected, unsigned char* k8, unsigned char* v8, int tokens) {
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= tokens*32) return;
+    const int token = i % tokens, head = i / tokens;  // consecutive tokens: coalesced V^T bytes
+    const float4* k = reinterpret_cast<const float4*>(projected + size_t(token)*3072 + 1024 + head*32);
+    const float4* v = reinterpret_cast<const float4*>(projected + size_t(token)*3072 + 2048 + head*32);
+    float raw[32], vv[32];
+    for (int c = 0; c < 8; ++c) {
+        const float4 a = k[c], b = v[c];
+        raw[4*c] = a.x; raw[4*c+1] = a.y; raw[4*c+2] = a.z; raw[4*c+3] = a.w;
+        vv[4*c] = b.x; vv[4*c+1] = b.y; vv[4*c+2] = b.z; vv[4*c+3] = b.w;
+    }
+    const float inv = vit_inverse_norm(raw);
+    for (int c = 0; c < 32; c += 8) {
+        float q[8];
+        for (int e = 0; e < 8; ++e) q[e] = split512_half(raw[c+e]*inv);
+        *reinterpret_cast<wmma_t::op8*>(k8 + (size_t(head)*tokens + token)*32 + c) = wmma_t::pack(q);
+    }
+    for (int c = 0; c < 32; ++c) v8[(size_t(head)*32 + c)*tokens + token] = wmma_t::byte8(split512_half(vv[c]));
+}
+
+__global__ __launch_bounds__(128) void k_vit_attention_t(const float* __restrict__ projected,
+        const unsigned char* __restrict__ k8, const unsigned char* __restrict__ v8,
+        const float* __restrict__ scales, float* output, unsigned char* out8, int tokens, int valid) {
+    using namespace wmma_t;
+    __shared__ float row[4][16][33];  // per wave: Q values, then a chunk's exponents (as floats)
+    __shared__ float erow[4][16][65];
+    const int head = blockIdx.y, q0 = blockIdx.x*64;
+    const int tid = threadIdx.x, wave = tid/32, lane = tid%32, n = lane%16, h = lane/16;
+    const int query = q0 + wave*16 + n;
+    // Q: raw values (half), the norm in vit order by one lane a query.
+    float qv[2][8];
+    {
+        const float* src = projected + size_t(query)*3072 + head*32;
+        for (int t = 0; t < 2; ++t)
+            for (int e = 0; e < 8; ++e) { qv[t][e] = src[t*16 + h*8 + e]; row[wave][n][t*16 + h*8 + e] = qv[t][e]; }
+    }
+    __syncthreads();
+    float inv = 0.0f;
+    if (h == 0) {
+        float raw[32];
+        for (int c = 0; c < 32; ++c) raw[c] = row[wave][n][c];
+        inv = vit_inverse_norm(raw);
+    }
+    inv = __shfl(inv, n);  // lanes n and n+16 share the query
+    op8 qb[2];
+    {
+        const float scale = hf(scales[head]);
+        for (int t = 0; t < 2; ++t) {
+            float v[8];
+            for (int e = 0; e < 8; ++e) v[e] = hf(hf(hf(qv[t][e]*inv)*5.65625f)*scale);
+            qb[t] = pack(v);
+        }
+    }
+    const unsigned char* K = k8 + size_t(head)*tokens*32;
+    const unsigned char* V = v8 + size_t(head)*32*tokens;
+    float d = 0.0f, acc[2][8] = {};
+    for (int k0 = 0; k0 < tokens; k0 += 64) {
+        float ex[4][8];
+        for (int kt = 0; kt < 4; ++kt) {
+            const unsigned char* kr = K + size_t(k0 + kt*16)*32;
+            acc8 c = {};
+            c = mma(arow(kr, 32, 16), qb[1], mma(arow(kr, 32, 0), qb[0], c));
+            for (int e = 0; e < 8; ++e) {
+                float score = hf(c[e]);
+                float affine = fminf(1.9775390625f, fmaxf(1.439453125f, hf(score*.08953857421875f+1.708984375f)));
+                _Float16 hc = split512_to_half(affine);
+                unsigned short bits; __builtin_memcpy(&bits, &hc, 2);
+                bits = (unsigned short)((unsigned(bits)<<4)+0x4000u);
+                __builtin_memcpy(&hc, &bits, 2);
+                const int key = k0 + kt*16 + h*8 + e;
+                ex[kt][e] = key >= valid ? 0.0f : float(hc);
+                erow[wave][n][kt*16 + h*8 + e] = ex[kt][e];
+            }
+        }
+        __syncthreads();  // (wave-local rows; a block barrier keeps it simple)
+        float part = 0.0f;
+        if (h == 0) part = vit_denominator(&erow[wave][n][0]);
+        part = __shfl(part, n);
+        d = k0 ? hf(d + part) : part;
+        __syncthreads();  // erow is rewritten by the next chunk
+        op8 pb[4];
+        for (int kt = 0; kt < 4; ++kt) pb[kt] = pack(ex[kt]);  // fp8(exponent): exact halves
+        for (int dt = 0; dt < 2; ++dt)
+            for (int s0 = 0; s0 < 2; ++s0) {
+                const unsigned char* vr = V + size_t(dt*16)*tokens + k0 + s0*32;
+                acc8 p = {};
+                p = mma(arow(vr, tokens, 16), pb[2*s0+1], mma(arow(vr, tokens, 0), pb[2*s0], p));
+                const bool first = k0 == 0 && s0 == 0;
+                for (int e = 0; e < 8; ++e) acc[dt][e] = hf(first ? p[e] : acc[dt][e] + p[e]);
+            }
+    }
+    const float r = hf(1.0f/d);
+    for (int dt = 0; dt < 2; ++dt) {
+        float v[8], q[8];
+        for (int e = 0; e < 8; ++e) { v[e] = hf(acc[dt][e]*r); q[e] = split512_fp8(v[e]); }
+        const size_t at = size_t(query)*1024 + head*32 + dt*16 + h*8;
+        reinterpret_cast<float4*>(output + at)[0] = make_float4(q[0], q[1], q[2], q[3]);
+        reinterpret_cast<float4*>(output + at)[1] = make_float4(q[4], q[5], q[6], q[7]);
+        if (out8) *reinterpret_cast<op8*>(out8 + at) = pack(v);
+    }
+}
