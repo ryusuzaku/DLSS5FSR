@@ -11,6 +11,8 @@
 #include <rocwmma/rocwmma.hpp>
 #include <cstdlib>
 #include <map>
+#include <type_traits>
+#include "wmma_t.hip"
 
 namespace wmma_gemm {
 using h16 = rocwmma::float16_t;
@@ -295,7 +297,9 @@ __global__ __launch_bounds__(256) void k_wmma_gemm8(
 #endif
 constexpr int TKC = GEMMT_TKC;
 // TK: the K chunk; TK > 64 only with X8 (bytes need a quarter of the registers).
-template<class P, int EPI, bool RESIDUAL, int WAVES, int TK = TKC>
+// SR: the slices onto half accumulators in one rounding each (wmma_t::acc_add;
+// the split512 policy only).
+template<class P, int EPI, bool RESIDUAL, int WAVES, int TK = TKC, bool SR = false>
 __global__ __launch_bounds__(32*WAVES) void k_wmma_gemm8t(
         const float* __restrict__ X, int ldx, const unsigned char* __restrict__ W, int K,
         const float* __restrict__ R, int ldr, const float* __restrict__ S,
@@ -315,6 +319,7 @@ __global__ __launch_bounds__(32*WAVES) void k_wmma_gemm8t(
     if (RESIDUAL) R += group*go;
     const int span = K / parts, kbegin = partial ? part*span : 0, kend = partial ? kbegin+span : K;
     float acc[4][8], total[4][8];
+    wmma_t::h8 hacc[4];
     for (int u = 0; u < 4; ++u) {
         const int t = t0+u*16+n;
         float r[8] = {};
@@ -326,6 +331,7 @@ __global__ __launch_bounds__(32*WAVES) void k_wmma_gemm8t(
         for (int e = 0; e < 8; ++e) {
             acc[u][e] = 0.0f; total[u][e] = 0.0f;
             if (RESIDUAL && part == 0 && t < T) acc[u][e] = P::half(r[e]*S[o0+h*8+e]);
+            hacc[u][e] = (_Float16)acc[u][e];
         }
     }
     const unsigned char* wrow = W + size_t(o0 + n)*K + h*8;
@@ -393,11 +399,13 @@ __global__ __launch_bounds__(32*WAVES) void k_wmma_gemm8t(
                 acc8v slice = {};
                 slice = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(a0, *reinterpret_cast<const op8v*>(xr), slice);
                 slice = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(a1, *reinterpret_cast<const op8v*>(xr + 16), slice);
-                for (int e = 0; e < 8; ++e) acc[u][e] = P::half(acc[u][e] + slice[e]);
+                if constexpr (SR) wmma_t::acc_add(hacc[u], slice);
+                else for (int e = 0; e < 8; ++e) acc[u][e] = P::half(acc[u][e] + slice[e]);
             }
             if ((kg+KS) % span == 0) {
                 for (int u = 0; u < 4; ++u)
                     for (int e = 0; e < 8; ++e) {
+                        if constexpr (SR) { acc[u][e] = float(hacc[u][e]); hacc[u][e] = (_Float16)0.0f; }
                         total[u][e] = kg+KS == kbegin+span ? acc[u][e] : P::half(total[u][e] + acc[u][e]);
                         acc[u][e] = 0.0f;
                     }
@@ -584,7 +592,13 @@ inline bool gemm(hipStream_t stream, const float* X, int ldx, c512_resident::Wei
         if (wrote8) *wrote8 = o8 != nullptr || (partial && EPI == FP8 && out8);
         // Byte input: 256-deep chunks (a quarter of the barriers) when K allows.
         const bool wide = X8 && chunk256 && (K/parts) % 256 == 0;
-#define GEMMT_LAUNCH(W, TKV) hipLaunchKernelGGL((k_wmma_gemm8t<P,EPI,RESIDUAL,W,TKV>), dim3(O/(16*W), (T+63)/64, zdim),                                dim3(32*W), 0, stream, X, ldx, w8, K, R, ldr, S, out, out2, ldo, T, O, gx, gw, go, parts, partial, X8, o8)
+        const bool sr = std::is_same<P, tiled::Split>::value && wmma_t::single_round;
+#define GEMMT_LAUNCH(W, TKV) do { \
+            if (sr) hipLaunchKernelGGL((k_wmma_gemm8t<P,EPI,RESIDUAL,W,TKV,true>), dim3(O/(16*W), (T+63)/64, zdim), \
+                                       dim3(32*W), 0, stream, X, ldx, w8, K, R, ldr, S, out, out2, ldo, T, O, gx, gw, go, parts, partial, X8, o8); \
+            else hipLaunchKernelGGL((k_wmma_gemm8t<P,EPI,RESIDUAL,W,TKV>), dim3(O/(16*W), (T+63)/64, zdim), \
+                                    dim3(32*W), 0, stream, X, ldx, w8, K, R, ldr, S, out, out2, ldo, T, O, gx, gw, go, parts, partial, X8, o8); \
+        } while (0)
         if (O % 128 == 0 && size_t(O/128)*((T+63)/64)*zdim >= 256) { if (wide) GEMMT_LAUNCH(8, 256); else GEMMT_LAUNCH(8, TKC); }
         else if (O % 64 == 0) { if (wide) GEMMT_LAUNCH(4, 256); else GEMMT_LAUNCH(4, TKC); }
         else { if (wide) GEMMT_LAUNCH(2, 256); else GEMMT_LAUNCH(2, TKC); }  // 32-wide outputs (prefix66)

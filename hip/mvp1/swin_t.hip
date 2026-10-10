@@ -26,6 +26,7 @@ inline bool enabled = false;
 inline bool enabled = [] { const char* v = getenv("RESIDENT_SWIN_T"); return !(v && *v == '0'); }();
 #endif
 // RESIDENT_SWIN_TT=0: one token tile a wave at C128 too (k_swin_t instead of k_swin_tt<128,2>).
+using wmma_t::single_round;  // RESIDENT_SR (wmma_t.hip)
 inline bool tiles2 = [] { const char* v = getenv("RESIDENT_SWIN_TT"); return !(v && *v == '0'); }();
 
 // Storage formats of a block's input, quantized output and raw output (S336):
@@ -39,7 +40,7 @@ __device__ inline void load8(const float* p, float* v) {
     v[0] = lo.x; v[1] = lo.y; v[2] = lo.z; v[3] = lo.w; v[4] = hi.x; v[5] = hi.y; v[6] = hi.z; v[7] = hi.w;
 }
 
-template<int C>
+template<int C, bool SR = false>
 __global__ __launch_bounds__(128) void k_swin_t(const float* __restrict__ input, Geometry g,
         const u8* __restrict__ w1, const u8* __restrict__ w2, const u8* __restrict__ w3,
         const float* __restrict__ skip, const u8* __restrict__ wqkv, const float* __restrict__ scales,
@@ -71,21 +72,35 @@ __global__ __launch_bounds__(128) void k_swin_t(const float* __restrict__ input,
         op8 hb[2];
         for (int u = 0; u < 2; ++u) {
             const u8* wr = w1 + size_t((2*j+u)*16)*C;
-            float acc[8] = {};
-            for (int k = 0; k < KS; ++k) {
-                acc8 part = {};
-                part = mma(arow(wr, C, 32*k+16), xb[2*k+1], mma(arow(wr, C, 32*k), xb[2*k], part));
-                for (int e = 0; e < 8; ++e) acc[e] = c32f_h(acc[e]+part[e]);
-            }
             float v[8];
-            for (int e = 0; e < 8; ++e) v[e] = c32t::gate(acc[e]);
+            if constexpr (SR) {
+                h8 ha = {};
+                for (int k = 0; k < KS; ++k) {
+                    acc8 part = {};
+                    part = mma(arow(wr, C, 32*k+16), xb[2*k+1], mma(arow(wr, C, 32*k), xb[2*k], part));
+                    wmma_t::acc_add(ha, part);
+                }
+                for (int e = 0; e < 8; ++e) v[e] = c32t::gate(float(ha[e]));
+            } else {
+                float acc[8] = {};
+                for (int k = 0; k < KS; ++k) {
+                    acc8 part = {};
+                    part = mma(arow(wr, C, 32*k+16), xb[2*k+1], mma(arow(wr, C, 32*k), xb[2*k], part));
+                    for (int e = 0; e < 8; ++e) acc[e] = c32f_h(acc[e]+part[e]);
+                }
+                for (int e = 0; e < 8; ++e) v[e] = c32t::gate(acc[e]);
+            }
             hb[u] = pack(v);
         }
         for (int f = 0; f < FT; ++f) {
             const u8* wr = w2 + size_t(f*16)*HID;
             acc8 part = {};
             part = mma(arow(wr, HID, 32*j+16), hb[1], mma(arow(wr, HID, 32*j), hb[0], part));
-            for (int e = 0; e < 8; ++e) mid[f][e] = (_Float16)c32f_h(float(mid[f][e])+part[e]);
+            if constexpr (SR) {
+                wmma_t::acc_add(mid[f], part);
+            } else {
+                for (int e = 0; e < 8; ++e) mid[f][e] = (_Float16)c32f_h(float(mid[f][e])+part[e]);
+            }
         }
     }
     op8 mb[FT];
@@ -104,10 +119,21 @@ __global__ __launch_bounds__(128) void k_swin_t(const float* __restrict__ input,
         for (int e = 0; e < 8; ++e) x[e] = valid ? x[e] : 0.0f;
         for (int e = 0; e < 8; ++e) acc[e] = c32f_h(x[e]*skip[f*16 + h*8 + e]);
         const u8* wr = w3 + size_t(f*16)*C;
-        for (int k = 0; k < KS; ++k) {
-            acc8 part = {};
-            part = mma(arow(wr, C, 32*k+16), mb[2*k+1], mma(arow(wr, C, 32*k), mb[2*k], part));
-            for (int e = 0; e < 8; ++e) acc[e] = c32f_h(acc[e]+part[e]);
+        if constexpr (SR) {
+            h8 ha;
+            for (int e = 0; e < 8; ++e) ha[e] = (_Float16)acc[e];
+            for (int k = 0; k < KS; ++k) {
+                acc8 part = {};
+                part = mma(arow(wr, C, 32*k+16), mb[2*k+1], mma(arow(wr, C, 32*k), mb[2*k], part));
+                wmma_t::acc_add(ha, part);
+            }
+            for (int e = 0; e < 8; ++e) acc[e] = float(ha[e]);
+        } else {
+            for (int k = 0; k < KS; ++k) {
+                acc8 part = {};
+                part = mma(arow(wr, C, 32*k+16), mb[2*k+1], mma(arow(wr, C, 32*k), mb[2*k], part));
+                for (int e = 0; e < 8; ++e) acc[e] = c32f_h(acc[e]+part[e]);
+            }
         }
         fb[f] = pack(acc);
         for (int e = 0; e < 8; ++e) res[f][e] = (_Float16)c32f_h(byte_of(fb[f], e)*attention_skip[f*16 + h*8 + e]);
@@ -121,11 +147,22 @@ __global__ __launch_bounds__(128) void k_swin_t(const float* __restrict__ input,
         for (int m = 0; m < 3; ++m) {
             const u8* wr = wqkv + size_t(m*C + hd*32)*C;
             float c0[8] = {}, c1[8] = {};
-            for (int k = 0; k < KS; ++k) {
-                acc8 p0 = {}, p1 = {};
-                p0 = mma(arow(wr, C, 32*k+16), fb[2*k+1], mma(arow(wr, C, 32*k), fb[2*k], p0));
-                p1 = mma(arow(wr + 16*C, C, 32*k+16), fb[2*k+1], mma(arow(wr + 16*C, C, 32*k), fb[2*k], p1));
-                for (int e = 0; e < 8; ++e) { c0[e] = c32f_h(c0[e]+p0[e]); c1[e] = c32f_h(c1[e]+p1[e]); }
+            if constexpr (SR) {
+                h8 h0 = {}, h1 = {};
+                for (int k = 0; k < KS; ++k) {
+                    acc8 p0 = {}, p1 = {};
+                    p0 = mma(arow(wr, C, 32*k+16), fb[2*k+1], mma(arow(wr, C, 32*k), fb[2*k], p0));
+                    p1 = mma(arow(wr + 16*C, C, 32*k+16), fb[2*k+1], mma(arow(wr + 16*C, C, 32*k), fb[2*k], p1));
+                    wmma_t::acc_add(h0, p0); wmma_t::acc_add(h1, p1);
+                }
+                for (int e = 0; e < 8; ++e) { c0[e] = float(h0[e]); c1[e] = float(h1[e]); }
+            } else {
+                for (int k = 0; k < KS; ++k) {
+                    acc8 p0 = {}, p1 = {};
+                    p0 = mma(arow(wr, C, 32*k+16), fb[2*k+1], mma(arow(wr, C, 32*k), fb[2*k], p0));
+                    p1 = mma(arow(wr + 16*C, C, 32*k+16), fb[2*k+1], mma(arow(wr + 16*C, C, 32*k), fb[2*k], p1));
+                    for (int e = 0; e < 8; ++e) { c0[e] = c32f_h(c0[e]+p0[e]); c1[e] = c32f_h(c1[e]+p1[e]); }
+                }
             }
             if (m == 2) {
                 for (int e = 0; e < 8; ++e) {
@@ -181,7 +218,11 @@ __global__ __launch_bounds__(128) void k_swin_t(const float* __restrict__ input,
             const u8* wr = wp + size_t(f*16)*C;
             acc8 part = {};
             part = mma(arow(wr, C, hd*32+16), cb[1], mma(arow(wr, C, hd*32), cb[0], part));
-            for (int e = 0; e < 8; ++e) res[f][e] = (_Float16)c32f_h(float(res[f][e])+part[e]);
+            if constexpr (SR) {
+                wmma_t::acc_add(res[f], part);
+            } else {
+                for (int e = 0; e < 8; ++e) res[f][e] = (_Float16)c32f_h(float(res[f][e])+part[e]);
+            }
             }
     }
     if (!valid) return;
@@ -199,7 +240,7 @@ __global__ __launch_bounds__(128) void k_swin_t(const float* __restrict__ input,
 // 1/TT of the weight loads (half their time at TT = 1). Per tile the
 // arithmetic and order are k_swin_t's. Used at C128 (0.245 -> 0.222 ms a
 // block at 1536x896); at C256 the doubled operands spill.
-template<int C, int TT>
+template<int C, int TT, bool SR = false>
 __global__ __launch_bounds__(128/TT) void k_swin_tt(const float* __restrict__ input, Geometry g,
         const u8* __restrict__ w1, const u8* __restrict__ w2, const u8* __restrict__ w3,
         const float* __restrict__ skip, const u8* __restrict__ wqkv, const float* __restrict__ scales,
@@ -234,17 +275,19 @@ __global__ __launch_bounds__(128/TT) void k_swin_tt(const float* __restrict__ in
         for (int t = 0; t < 2; ++t) {
             const u8* wr = w1 + size_t((2*j+t)*16)*C;
             float acc[TT][8] = {};
+            h8 ha[TT] = {};
             for (int k = 0; k < KS; ++k) {
                 const op8 a0 = arow(wr, C, 32*k), a1 = arow(wr, C, 32*k+16);
                 for (int u = 0; u < TT; ++u) {
                     acc8 part = {};
                     part = mma(a1, xb[u][2*k+1], mma(a0, xb[u][2*k], part));
-                    for (int e = 0; e < 8; ++e) acc[u][e] = c32f_h(acc[u][e]+part[e]);
+                    if constexpr (SR) wmma_t::acc_add(ha[u], part);
+                    else for (int e = 0; e < 8; ++e) acc[u][e] = c32f_h(acc[u][e]+part[e]);
                 }
             }
             for (int u = 0; u < TT; ++u) {
                 float v[8];
-                for (int e = 0; e < 8; ++e) v[e] = c32t::gate(acc[u][e]);
+                for (int e = 0; e < 8; ++e) v[e] = c32t::gate(SR ? float(ha[u][e]) : acc[u][e]);
                 hb[u][t] = pack(v);
             }
         }
@@ -254,7 +297,8 @@ __global__ __launch_bounds__(128/TT) void k_swin_tt(const float* __restrict__ in
             for (int u = 0; u < TT; ++u) {
                 acc8 part = {};
                 part = mma(a1, hb[u][1], mma(a0, hb[u][0], part));
-                for (int e = 0; e < 8; ++e) mid[u][f][e] = (_Float16)c32f_h(float(mid[u][f][e])+part[e]);
+                if constexpr (SR) wmma_t::acc_add(mid[u][f], part);
+                else for (int e = 0; e < 8; ++e) mid[u][f][e] = (_Float16)c32f_h(float(mid[u][f][e])+part[e]);
             }
         }
     }
@@ -269,10 +313,12 @@ __global__ __launch_bounds__(128/TT) void k_swin_tt(const float* __restrict__ in
     h8 res[TT][FT];
     for (int f = 0; f < FT; ++f) {
         float acc[TT][8];
+        h8 ha[TT];
         for (int u = 0; u < TT; ++u) {
             float x[8];
             c32t::load_fmt<8>(input, sio.in_fmt, sb[u] + f*16 + h*8, x);
             for (int e = 0; e < 8; ++e) acc[u][e] = c32f_h((valid[u] ? x[e] : 0.0f)*skip[f*16 + h*8 + e]);
+            for (int e = 0; e < 8; ++e) ha[u][e] = (_Float16)acc[u][e];
         }
         const u8* wr = w3 + size_t(f*16)*C;
         for (int k = 0; k < KS; ++k) {
@@ -280,9 +326,11 @@ __global__ __launch_bounds__(128/TT) void k_swin_tt(const float* __restrict__ in
             for (int u = 0; u < TT; ++u) {
                 acc8 part = {};
                 part = mma(a1, mb[u][2*k+1], mma(a0, mb[u][2*k], part));
-                for (int e = 0; e < 8; ++e) acc[u][e] = c32f_h(acc[u][e]+part[e]);
+                if constexpr (SR) wmma_t::acc_add(ha[u], part);
+                else for (int e = 0; e < 8; ++e) acc[u][e] = c32f_h(acc[u][e]+part[e]);
             }
         }
+        if constexpr (SR) for (int u = 0; u < TT; ++u) for (int e = 0; e < 8; ++e) acc[u][e] = float(ha[u][e]);
         for (int u = 0; u < TT; ++u) {
             fb[u][f] = pack(acc[u]);
             for (int e = 0; e < 8; ++e) res[u][f][e] = (_Float16)c32f_h(byte_of(fb[u][f], e)*attention_skip[f*16 + h*8 + e]);
@@ -297,6 +345,7 @@ __global__ __launch_bounds__(128/TT) void k_swin_tt(const float* __restrict__ in
         for (int m = 0; m < 3; ++m) {
             const u8* wr = wqkv + size_t(m*C + hd*32)*C;
             float c0[TT][8] = {}, c1[TT][8] = {};
+            h8 h0[TT] = {}, h1[TT] = {};
             for (int k = 0; k < KS; ++k) {
                 const op8 a00 = arow(wr, C, 32*k), a01 = arow(wr, C, 32*k+16);
                 const op8 a10 = arow(wr + 16*C, C, 32*k), a11 = arow(wr + 16*C, C, 32*k+16);
@@ -304,9 +353,12 @@ __global__ __launch_bounds__(128/TT) void k_swin_tt(const float* __restrict__ in
                     acc8 p0 = {}, p1 = {};
                     p0 = mma(a01, fb[u][2*k+1], mma(a00, fb[u][2*k], p0));
                     p1 = mma(a11, fb[u][2*k+1], mma(a10, fb[u][2*k], p1));
-                    for (int e = 0; e < 8; ++e) { c0[u][e] = c32f_h(c0[u][e]+p0[e]); c1[u][e] = c32f_h(c1[u][e]+p1[e]); }
+                    if constexpr (SR) { wmma_t::acc_add(h0[u], p0); wmma_t::acc_add(h1[u], p1); }
+                    else for (int e = 0; e < 8; ++e) { c0[u][e] = c32f_h(c0[u][e]+p0[e]); c1[u][e] = c32f_h(c1[u][e]+p1[e]); }
                 }
             }
+            if constexpr (SR)
+                for (int u = 0; u < TT; ++u) for (int e = 0; e < 8; ++e) { c0[u][e] = float(h0[u][e]); c1[u][e] = float(h1[u][e]); }
             for (int u = 0; u < TT; ++u) {
                 if (m == 2) {
                     for (int e = 0; e < 8; ++e) {
@@ -365,7 +417,8 @@ __global__ __launch_bounds__(128/TT) void k_swin_tt(const float* __restrict__ in
             for (int u = 0; u < TT; ++u) {
                 acc8 part = {};
                 part = mma(a1, cb[u][1], mma(a0, cb[u][0], part));
-                for (int e = 0; e < 8; ++e) res[u][f][e] = (_Float16)c32f_h(float(res[u][f][e])+part[e]);
+                if constexpr (SR) wmma_t::acc_add(res[u][f], part);
+                else for (int e = 0; e < 8; ++e) res[u][f][e] = (_Float16)c32f_h(float(res[u][f][e])+part[e]);
             }
         }
     }
@@ -394,13 +447,17 @@ inline bool run(const float* input, float* output, float* raw_out, int width, in
     g.pw = ((width+g.px+7)/8)*8;
     int ph = ((height+g.py+7)/8)*8, windows = (g.pw/8)*(ph/8);
     auto f8w = [&](const float* W, size_t n) { return swin_fp8::weights(s, W, n); };
+    // One rounding where it measured faster (5120x1440 level sizes: C64
+    // 0.78 -> 0.73 ms, C128 at TT=2 0.615 -> 0.601); C256 sits at the
+    // register limit either way and is a little slower with it.
+    const bool sr = single_round && C != 256;
     if (C == 128 && tiles2)  // C256 at TT=2 spills (measured 2.8x slower)
-        hipLaunchKernelGGL((k_swin_tt<C,2>), dim3(windows), dim3(64), 0, s, input, g,
+        hipLaunchKernelGGL((sr ? k_swin_tt<C,2,true> : k_swin_tt<C,2,false>), dim3(windows), dim3(64), 0, s, input, g,
                            f8w(w.w1, size_t(4*C)*C), f8w(w.w2, size_t(C)*4*C), f8w(w.w3, size_t(C)*C), w.skip,
                            f8w(w.qkv, size_t(3*C)*C), w.scales, w.bias, f8w(w.projection, size_t(C)*C),
                            w.attention_skip, output, raw_out, sio);
     else
-    hipLaunchKernelGGL(k_swin_t<C>, dim3(windows), dim3(128), 0, s, input, g,
+    hipLaunchKernelGGL((sr ? k_swin_t<C, true> : k_swin_t<C, false>), dim3(windows), dim3(128), 0, s, input, g,
                        f8w(w.w1, size_t(4*C)*C), f8w(w.w2, size_t(C)*4*C), f8w(w.w3, size_t(C)*C), w.skip,
                        f8w(w.qkv, size_t(3*C)*C), w.scales, w.bias, f8w(w.projection, size_t(C)*C),
                        w.attention_skip, output, raw_out, sio);

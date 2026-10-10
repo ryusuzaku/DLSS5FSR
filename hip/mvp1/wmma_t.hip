@@ -72,6 +72,28 @@ __device__ inline float norm_inverse(const float* c0, const float* c1) {
     const float total = float((p[0] + p[2]) + (p[1] + p[3]));
     return hf(1.f/sqrtf(fmaxf(total, .00006198883056640625f)));
 }
+// The f16-accumulating MMA's step (S338): eight halves plus a K block's f32
+// partial sums, each exact sum rounded once to half (nearest even), two
+// v_fma_mix a register. NVIDIA's HMMA rounds its f16 accumulator once per
+// block; the f32-add-then-half form (c32f_h(acc + part), the reference
+// kernels') rounds twice and costs twice the instructions. Exact single
+// rounding: build/mix_round_test.exe.
+typedef _Float16 h8 __attribute__((ext_vector_type(8)));
+// RESIDENT_SR=0: the kernels keep the f32-add-then-half form. FP8 partial
+// sums of a 32-deep block are exact in f32 at the network's magnitudes, so the
+// two agree on real data (swin_t_bench, network_parity: byte-identical).
+inline bool single_round = [] { const char* v = getenv("RESIDENT_SR"); return !(v && *v == '0'); }();
+__device__ inline void acc_add(h8& acc, const acc8& part) {
+    typedef unsigned u4 __attribute__((ext_vector_type(4)));
+    u4 r = __builtin_bit_cast(u4, acc);
+    for (int q = 0; q < 4; ++q) {
+        unsigned v = r[q];
+        asm("v_fma_mixlo_f16 %0, %1, 1.0, %0 op_sel_hi:[0,0,1]" : "+v"(v) : "v"(part[2*q]));
+        asm("v_fma_mixhi_f16 %0, %1, 1.0, %0 op_sel:[0,0,1] op_sel_hi:[0,0,1]" : "+v"(v) : "v"(part[2*q+1]));
+        r[q] = v;
+    }
+    acc = __builtin_bit_cast(h8, r);
+}
 // h(a * b) and h(a + b) of two halves in one f16 instruction.
 __device__ inline float hmul(float a, float b) { return float((_Float16)a * (_Float16)b); }
 __device__ inline float hadd(float a, float b) { return float((_Float16)a + (_Float16)b); }
