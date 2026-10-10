@@ -28,6 +28,8 @@ inline bool enabled = [] { const char* v = getenv("RESIDENT_SWIN_T"); return !(v
 // RESIDENT_SWIN_TT=0: one token tile a wave at C128 too (k_swin_t instead of k_swin_tt<128,2>).
 using wmma_t::single_round;  // RESIDENT_SR (wmma_t.hip)
 inline bool tiles2 = [] { const char* v = getenv("RESIDENT_SWIN_TT"); return !(v && *v == '0'); }();
+// RESIDENT_SWIN_LP=0: the projection inside the head loop (k_swin_t's LP).
+inline bool late_projection = [] { const char* v = getenv("RESIDENT_SWIN_LP"); return !(v && *v == '0'); }();
 
 // Storage formats of a block's input, quantized output and raw output (S336):
 // 0 float, 1 E4M3 byte, 2 half (raw only); element addressing either way.
@@ -40,7 +42,11 @@ __device__ inline void load8(const float* p, float* v) {
     v[0] = lo.x; v[1] = lo.y; v[2] = lo.z; v[3] = lo.w; v[4] = hi.x; v[5] = hi.y; v[6] = hi.z; v[7] = hi.w;
 }
 
-template<int C, bool SR = false>
+// LP: the projection after all heads (S339). Each head's context goes to
+// this wave's slice of LDS, then every feature tile takes its residual and
+// the heads' K slices in order (the same sums): the 16-tile residual is no
+// longer live through the attention, which spilled at C256.
+template<int C, bool SR = false, bool LP = false>
 __global__ __launch_bounds__(128) void k_swin_t(const float* __restrict__ input, Geometry g,
         const u8* __restrict__ w1, const u8* __restrict__ w2, const u8* __restrict__ w3,
         const float* __restrict__ skip, const u8* __restrict__ wqkv, const float* __restrict__ scales,
@@ -49,6 +55,7 @@ __global__ __launch_bounds__(128) void k_swin_t(const float* __restrict__ input,
     constexpr int FT = C/16, KS = C/32, HEADS = C/32, HID = 4*C;
     __shared__ __attribute__((aligned(16))) u8 Ks[2][64*32];  // [key][d], per head parity
     __shared__ __attribute__((aligned(16))) u8 Vt[2][32*64];  // [d][key]
+    __shared__ op8 Cs[LP ? 4 : 1][LP ? HEADS : 1][2][32];      // LP: context B operands, per wave
     const int tid = threadIdx.x, wave = tid/32, lane = tid%32, n = lane%16, h = lane/16;
     const int token = wave*16 + n, win = blockIdx.x;
     int px, py;
@@ -136,7 +143,7 @@ __global__ __launch_bounds__(128) void k_swin_t(const float* __restrict__ input,
             }
         }
         fb[f] = pack(acc);
-        for (int e = 0; e < 8; ++e) res[f][e] = (_Float16)c32f_h(byte_of(fb[f], e)*attention_skip[f*16 + h*8 + e]);
+        if constexpr (!LP) for (int e = 0; e < 8; ++e) res[f][e] = (_Float16)c32f_h(byte_of(fb[f], e)*attention_skip[f*16 + h*8 + e]);
     }
 #pragma unroll 1
     for (int hd = 0; hd < HEADS; ++hd) {
@@ -213,6 +220,10 @@ __global__ __launch_bounds__(128) void k_swin_t(const float* __restrict__ input,
             }
             cb[d] = pack(acc);
         }
+        if constexpr (LP) {
+            Cs[wave][hd][0][lane] = cb[0]; Cs[wave][hd][1][lane] = cb[1];
+            continue;
+        }
         // Projection K slice `hd` onto the residual, heads in order.
         for (int f = 0; f < FT; ++f) {
             const u8* wr = wp + size_t(f*16)*C;
@@ -225,9 +236,22 @@ __global__ __launch_bounds__(128) void k_swin_t(const float* __restrict__ input,
             }
             }
     }
-    if (!valid) return;
+    // LP: the projection's WMMAs need every lane, so lanes outside the image
+    // drop out only at the stores.
+    if (!LP && !valid) return;
     const size_t ob = (size_t(py)*g.width + px)*C;
     for (int f = 0; f < FT; ++f) {
+        if constexpr (LP) {
+            for (int e = 0; e < 8; ++e) res[f][e] = (_Float16)c32f_h(byte_of(fb[f], e)*attention_skip[f*16 + h*8 + e]);
+            const u8* wr = wp + size_t(f*16)*C;
+            for (int hd = 0; hd < HEADS; ++hd) {
+                acc8 part = {};
+                part = mma(arow(wr, C, hd*32+16), Cs[wave][hd][1][lane], mma(arow(wr, C, hd*32), Cs[wave][hd][0][lane], part));
+                if constexpr (SR) wmma_t::acc_add(res[f], part);
+                else for (int e = 0; e < 8; ++e) res[f][e] = (_Float16)c32f_h(float(res[f][e])+part[e]);
+            }
+            if (!valid) continue;
+        }
         float v[8], q[8];
         for (int e = 0; e < 8; ++e) { v[e] = float(res[f][e]); q[e] = split512_fp8(v[e]); }
         c32t::store_fmt<8>(output, sio.out_fmt, ob + f*16 + h*8, q);
@@ -456,11 +480,17 @@ inline bool run(const float* input, float* output, float* raw_out, int width, in
                            f8w(w.w1, size_t(4*C)*C), f8w(w.w2, size_t(C)*4*C), f8w(w.w3, size_t(C)*C), w.skip,
                            f8w(w.qkv, size_t(3*C)*C), w.scales, w.bias, f8w(w.projection, size_t(C)*C),
                            w.attention_skip, output, raw_out, sio);
-    else
-    hipLaunchKernelGGL((sr ? k_swin_t<C, true> : k_swin_t<C, false>), dim3(windows), dim3(128), 0, s, input, g,
-                       f8w(w.w1, size_t(4*C)*C), f8w(w.w2, size_t(C)*4*C), f8w(w.w3, size_t(C)*C), w.skip,
-                       f8w(w.qkv, size_t(3*C)*C), w.scales, w.bias, f8w(w.projection, size_t(C)*C),
-                       w.attention_skip, output, raw_out, sio);
+    else {
+        // The late projection at C256 (no spills: 256 VGPRs + 368 B scratch ->
+        // 250; a 320x92 block, E4M3 in and out, 0.63 -> 0.60 ms). C64 has no
+        // spills to remove and measured no faster; at C128, TT=2, slower.
+        auto kernel = sr ? k_swin_t<C, true, false> : k_swin_t<C, false, false>;
+        if constexpr (C == 256) if (late_projection) kernel = k_swin_t<C, false, true>;
+        hipLaunchKernelGGL(kernel, dim3(windows), dim3(128), 0, s, input, g,
+                           f8w(w.w1, size_t(4*C)*C), f8w(w.w2, size_t(C)*4*C), f8w(w.w3, size_t(C)*C), w.skip,
+                           f8w(w.qkv, size_t(3*C)*C), w.scales, w.bias, f8w(w.projection, size_t(C)*C),
+                           w.attention_skip, output, raw_out, sio);
+    }
     HIP_CHECK(hipGetLastError());
     if (c512_resident::launch_hook) c512_resident::launch_hook(C == 64 ? "k_swin_t<64>" : C == 128 ? "k_swin_t<128>" : "k_swin_t<256>");
     return true;
