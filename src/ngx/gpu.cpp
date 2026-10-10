@@ -1067,7 +1067,8 @@ bool GpuNeuralChain(ID3D12GraphicsCommandList* cl, ID3D12Resource* output,
                    g.motionHistoryFrame[(n - steps) % k] == (long long)(n - steps))
                 ++steps;
         }
-        c.Pad1 = 1;
+        // Map mode 4: the engine's transfer=nvidia delta map (params[3] == 2).
+        c.Pad1 = g.hipMapParams[3] >= 2.0f ? 5u : 1u;
         float invGate = g.hipMapParams[2];
         memcpy(&c.Pad2, &invGate, sizeof(float));
         c.MvScaleX = c.MvScaleY = 0.0f;

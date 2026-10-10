@@ -47,7 +47,8 @@ cbuffer Params : register(b0)
     float gCompareZoom;      // side by side: 1 fits the frame, 2 fills the half
     uint  gCompareSwap;      // put the edited frame on the other side
     uint  gProxyMode;        // proxy curve: 0 soft knee, 1 hybrid, 2 scale+encode
-    uint  gMapMode;          // resolve: the model texture is a ratio map (ratio, Y_in), not a picture
+    uint  gMapMode;          // resolve: the model texture is a ratio map (ratio, Y_in), not a picture;
+                             // | 2 depth test, | 4 a delta map (encoded rgb change, Y_in): transfer=nvidia
     float gMapInvGate;       // resolve, map mode: 1 / the luminance gate
 };
 
@@ -311,6 +312,13 @@ void main(uint3 id : SV_DispatchThreadID)
     // and gated on how well the luminance it was computed on matches this frame's, so whatever the
     // carry cannot place fades to no edit instead of ghosting. The white fade and the untouched
     // values at or above white are the engine's own compose rules.
+    // Map mode 4 (the engine's transfer=nvidia): the map holds NVIDIA's own
+    // output as a change of the encoded frame the network was shown
+    // (sat(src + sat(Intensity) * (nr - src)) - src) and Y_in; it is carried
+    // and gated as the ratio map is, then added (faithfulBase: the proxy it
+    // applies to, in the composition's linear space).
+    const bool faithful = (gMapMode & 4u) != 0;
+    float3 faithfulBase = proxy;
     if (gMapMode != 0)
     {
         const float2 size = float2(gWidth, gHeight);
@@ -328,6 +336,7 @@ void main(uint3 id : SV_DispatchThreadID)
         float depthWeight = 1.0;
         bool filled = false;
         float2 fillValue = float2(1.0, -1.0);
+        float3 fillDelta = float3(0.0, 0.0, 0.0);
         if (gGuideWidth > 0)
         {
             // Walk back one frame at a time through the motion history (newest
@@ -388,8 +397,9 @@ void main(uint3 id : SV_DispatchThreadID)
                             const float r = abs(dCur - dq) / max(max(dCur, dq), 1e-7);
                             if (r < best)
                             {
-                                const float2 c = gModel.Load(int3(q, 0)).xy;
-                                if (c.y >= 0.0) { best = r; fillValue = c; filled = true; }
+                                const float4 c4 = gModel.Load(int3(q, 0));
+                                const float2 c = faithful ? float2(1.0, c4.w) : c4.xy;
+                                if (c.y >= 0.0) { best = r; fillValue = c; fillDelta = c4.rgb; filled = true; }
                             }
                         }
                     }
@@ -404,10 +414,13 @@ void main(uint3 id : SV_DispatchThreadID)
             if (any(isnan(mv)) || any(isinf(mv))) mv = float2(0.0, 0.0);
             mapUv = cmpUv + mv / size;
         }
-        const float2 m = filled ? fillValue : gModel.SampleLevel(gLinear, mapUv, 0).xy;
+        const float4 m4 = gModel.SampleLevel(gLinear, mapUv, 0);
+        const float2 m = filled ? fillValue : faithful ? float2(1.0, m4.w) : m4.xy;
+        const float3 delta = filled ? fillDelta : m4.rgb;
         const bool inside = all(mapUv >= 0.0) && all(mapUv <= 1.0);
         const float peak = max(proxySample.r, max(proxySample.g, proxySample.b));
-        const float fade = saturate((1.0 - peak) / 0.05);
+        // The white fade is the luma compose's rule; NVIDIA edits near white too.
+        const float fade = faithful ? 1.0 : saturate((1.0 - peak) / 0.05);
         // The engine's map is in linear light (it decodes what it is handed). With passthrough the proxy
         // here is still display-encoded -- behind OptiScaler's DLSS-NR pass it is OptiScaler's encoded
         // proxy -- so the gate compares the decoded luminance, and the ratio is carried into the
@@ -463,6 +476,16 @@ void main(uint3 id : SV_DispatchThreadID)
         model = float3(proxySample.r >= 1.0 ? proxy.r : proxy.r * r,
                        proxySample.g >= 1.0 ? proxy.g : proxy.g * r,
                        proxySample.b >= 1.0 ? proxy.b : proxy.b * r);
+        if (faithful)
+        {
+            // The engine's src is the encoded proxy saturated; the delta is
+            // added there and decoded (with passthrough the proxy is encoded
+            // throughout, as the original is).
+            const float3 src = saturate(proxySample.rgb);
+            const float3 outEnc = src + delta * weight;  // the engine writes finite deltas
+            faithfulBase = gPassthrough != 0 ? src : SrgbToLinear(src);
+            model = gPassthrough != 0 ? outEnc : SrgbToLinear(saturate(outEnc));
+        }
     }
     float4 originalSample = gCompareMode == 1 ? gOriginal.SampleLevel(gLinear, cmpUv, 0)
                                               : gOriginal.Load(int3(id.xy, 0));
@@ -513,54 +536,64 @@ void main(uint3 id : SV_DispatchThreadID)
     // original's luminance says it should. Adding a difference is what let colour run away: nothing
     // bounded where the sum landed, so a warm subject could arrive green. Here both ends of every
     // blend are well-formed pictures, so everything between them is one too.
-    float modelLuma = dot(model, kLuma);
-    float3 upgraded;
-
-    if (modelLuma <= 1e-5)
+    float3 result;
+    if (faithful)
     {
-        // The model can return an empty frame for an input it cannot read. Rescaling that collapses
-        // the picture to black, so the frame is handed back untouched instead.
-        upgraded = original;
+        // NVIDIA's picture where the proxy held the frame; above white the
+        // frame keeps its headroom and takes the same change.
+        result = original + (model - faithfulBase);
     }
     else
     {
-        float ratio;
+        float modelLuma = dot(model, kLuma);
+        float3 upgraded;
 
-        if (originalLuma < proxyLuma)
+        if (modelLuma <= 1e-5)
         {
-            // Below what the proxy showed: the frame's own luminance is the target.
-            ratio = originalLuma / max(proxyLuma, 1e-6);
+            // The model can return an empty frame for an input it cannot read. Rescaling that collapses
+            // the picture to black, so the frame is handed back untouched instead.
+            upgraded = original;
         }
         else
         {
-            // Above it, the difference is headroom the proxy could not represent -- brightness the
-            // frame really has and the model never saw. It is handed back on top of the model's own
-            // answer rather than scaled away, which is what kept highlights from being muted.
-            ratio = (modelLuma + max(0.0, originalLuma - proxyLuma)) / modelLuma;
+            float ratio;
+
+            if (originalLuma < proxyLuma)
+            {
+                // Below what the proxy showed: the frame's own luminance is the target.
+                ratio = originalLuma / max(proxyLuma, 1e-6);
+            }
+            else
+            {
+                // Above it, the difference is headroom the proxy could not represent -- brightness the
+                // frame really has and the model never saw. It is handed back on top of the model's own
+                // answer rather than scaled away, which is what kept highlights from being muted.
+                ratio = (modelLuma + max(0.0, originalLuma - proxyLuma)) / modelLuma;
+            }
+
+            upgraded = lerp(original, HueOkLab(model * ratio, model), gTransferStrength);
         }
 
-        upgraded = lerp(original, HueOkLab(model * ratio, model), gTransferStrength);
+        // Transfer strength decides how much of the model's picture is reached at all; colour strength
+        // decides whether its colour comes with it. At 0 the frame keeps the game's own hue exactly and
+        // only its light carries the model's verdict; at 1 the model's colour arrives as well.
+        float upgradedLuma = dot(upgraded, kLuma);
+
+        // A ratio against a dark pixel is unbounded, and clamping it is not the same as taming it.
+        //
+        // In linear light divided by paper white a shadowed pixel sits around a thousandth, so a tiny
+        // absolute edit from the model becomes an enormous ratio, hits the clamp, and doubles that
+        // pixel's brightness. The next frame it lands slightly differently and the pixel drops back.
+        // That is the boiling: patches of lighter colour crawling over otherwise still geometry, worst
+        // where the picture is darkest.
+        //
+        // Adding the same floor above and below leaves bright pixels alone -- where luminance is far
+        // larger than the floor the term vanishes -- while making the ratio fall smoothly to one as
+        // luminance approaches zero. No edit at all is the right answer for a pixel with no light in it.
+        const float kRatioFloor = 1.0 / 512.0;
+        float lumaRatio = clamp((upgradedLuma + kRatioFloor) / (originalLuma + kRatioFloor), 0.0, gMaxRatio);
+        result = lerp(original * lumaRatio, upgraded, gColourStrength);
     }
-
-    // Transfer strength decides how much of the model's picture is reached at all; colour strength
-    // decides whether its colour comes with it. At 0 the frame keeps the game's own hue exactly and
-    // only its light carries the model's verdict; at 1 the model's colour arrives as well.
-    float upgradedLuma = dot(upgraded, kLuma);
-
-    // A ratio against a dark pixel is unbounded, and clamping it is not the same as taming it.
-    //
-    // In linear light divided by paper white a shadowed pixel sits around a thousandth, so a tiny
-    // absolute edit from the model becomes an enormous ratio, hits the clamp, and doubles that
-    // pixel's brightness. The next frame it lands slightly differently and the pixel drops back.
-    // That is the boiling: patches of lighter colour crawling over otherwise still geometry, worst
-    // where the picture is darkest.
-    //
-    // Adding the same floor above and below leaves bright pixels alone -- where luminance is far
-    // larger than the floor the term vanishes -- while making the ratio fall smoothly to one as
-    // luminance approaches zero. No edit at all is the right answer for a pixel with no light in it.
-    const float kRatioFloor = 1.0 / 512.0;
-    float lumaRatio = clamp((upgradedLuma + kRatioFloor) / (originalLuma + kRatioFloor), 0.0, gMaxRatio);
-    float3 result = lerp(original * lumaRatio, upgraded, gColourStrength);
 
     // Back out of the normalised space the composition worked in.
     result *= normScale;

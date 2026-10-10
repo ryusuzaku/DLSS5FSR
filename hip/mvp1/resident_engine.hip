@@ -156,6 +156,13 @@ unsigned char srgb8(float linear) { return (unsigned char)nearbyintf(srgb_encode
 // Full-frame output options (optional "key=value" lines after the 24 engine
 // config lines):
 //   transfer=full  the network's RGB (default)
+//   transfer=nvidia NVIDIA's own behaviour (S337): the network on the whole
+//                  frame (display-encoded, as the original is fed), its noise
+//                  per frame, its temporal recurrence, and its compose
+//                  sat(src + sat(Intensity)*(nr - src)) as a full-colour delta
+//                  map (luma plumbing: motion, depth, sync jobs); scale,
+//                  budget, smooth, temporal, tone, additive, input_temporal
+//                  and encoded are ignored
 //   transfer=luma  the game's colour with only the network's luminance change
 //                  applied (Y_out / Y_in on the linearized input); keeps the
 //                  game's hue where its colour is not display-referred
@@ -189,6 +196,7 @@ unsigned char srgb8(float linear) { return (unsigned char)nearbyintf(srgb_encode
 //                  for large frames (5120x1440 ultrawide) so the cost stays put
 struct OutputOptions {
     int luma = 0, denoise = 0, motion = 2, motion_sign = 1;  // motion 2 = auto, 3 = uv
+    int nvidia = 0;   // transfer=nvidia (luma is set too: it shares the map plumbing)
     int compact = 0;  // extent=compact: smallest multiple-of-64 extent (fast path only)
     float tone = 0.0f;  // tone=K: luma mode network input through auto exposure (key K) + ACES
     float controls[5] = {0, 0, 0, 0, 0};  // controls=a,b,c,d,e: stem features 10..14
@@ -733,6 +741,158 @@ __global__ void k_head_temporal(const float* tiles, const float* row, const floa
     }
 }
 
+// transfer=nvidia (S337): NVIDIA's temporal pipeline around the network
+// (peer DLSSNR-AMD fswin_t.comp NR_TEMPORAL_HISTORY, image_input.glsl,
+// temporal_history.glsl, transcribed from NVIDIA's PTX; validated offline by
+// network_sequence / tools/nvidia_sequence.py against NVIDIA's moving
+// sequences). Everything is in the display-encoded domain the network sees.
+//
+// Five-tap Catmull-Rom of `hist` (fw x fh RGB, texel centres at i + 0.5) at
+// pos (texel units), taps clamped per axis to [0.5, extent - 0.5], each tap a
+// bilinear fetch, normalised by the weight sum: the original's form.
+__device__ inline float3 hist_bilinear(const float* h, int fw, int fh, float px, float py) {
+    const float fx = px - 0.5f, fy = py - 0.5f;
+    const int x0 = int(floorf(fx)), y0 = int(floorf(fy));
+    const float tx = fx - x0, ty = fy - y0;
+    auto at = [&](int x, int y) {
+        x = min(max(x, 0), fw-1); y = min(max(y, 0), fh-1);
+        const float* p = h + (size_t(y)*fw + x)*3;
+        return make_float3(p[0], p[1], p[2]);
+    };
+    const float3 a = at(x0, y0), b = at(x0+1, y0), c = at(x0, y0+1), d = at(x0+1, y0+1);
+    auto mix = [](float3 u, float3 v, float t) { return make_float3(u.x+(v.x-u.x)*t, u.y+(v.y-u.y)*t, u.z+(v.z-u.z)*t); };
+    return mix(mix(a, b, tx), mix(c, d, tx), ty);
+}
+__device__ inline float3 hist_5tap(const float* h, int fw, int fh, float px, float py) {
+    const float cx = floorf(px - 0.5f) + 0.5f, cy = floorf(py - 0.5f) + 0.5f;
+    const float tx = fminf(fmaxf(px - cx, 0.0f), 1.0f), ty = fminf(fmaxf(py - cy, 0.0f), 1.0f);
+    auto w = [](float t, float& w0, float& w1, float& w2, float& w3) {
+        const float t2 = t*t, t3 = t2*t;
+        w0 = (t + t3) * -0.5f + t2; w1 = 1.5f*t3 - 2.5f*t2 + 1.0f; w3 = 0.5f*(t3 - t2); w2 = 1.0f - w0 - w1 - w3;
+    };
+    float w0x, w1x, w2x, w3x, w0y, w1y, w2y, w3y;
+    w(tx, w0x, w1x, w2x, w3x); w(ty, w0y, w1y, w2y, w3y);
+    const float wcx = w1x + w2x, wcy = w1y + w2y;
+    auto cl = [](float v, float hi) { return fminf(fmaxf(v, 0.5f), hi); };
+    const float hx = fw - 0.5f, hy = fh - 0.5f;
+    const float p0x = cl(cx - 1.0f, hx), p0y = cl(cy - 1.0f, hy);
+    const float pmx = cl(cx + w2x/wcx, hx), pmy = cl(cy + w2y/wcy, hy);
+    const float p2x = cl(cx + 2.0f, hx), p2y = cl(cy + 2.0f, hy);
+    const float3 left = hist_bilinear(h, fw, fh, p0x, pmy), up = hist_bilinear(h, fw, fh, pmx, p0y);
+    const float3 centre = hist_bilinear(h, fw, fh, pmx, pmy), down = hist_bilinear(h, fw, fh, pmx, p2y);
+    const float3 right = hist_bilinear(h, fw, fh, p2x, pmy);
+    const float kl = w0x*wcy, ku = w0y*wcx, kc = wcx*wcy, kd = w3y*wcx, kr = w3x*wcy;
+    const float s = kl + ku + kc + kd + kr;
+    return make_float3((kl*left.x + ku*up.x + kc*centre.x + kd*down.x + kr*right.x)/s,
+                       (kl*left.y + ku*up.y + kc*centre.y + kd*down.y + kr*right.y)/s,
+                       (kl*left.z + ku*up.z + kc*centre.z + kd*down.z + kr*right.z)/s);
+}
+
+// pre: the history features for every network pixel (W x H, the frame mirrored
+// past its edge as the colour is). mv: frame pixels after scaling by ms
+// (previous = current + mv*ms); depth (reversed-Z, optional): the vector is
+// read at whichever of the pixel and its four diagonal neighbours is nearest.
+__global__ void k_seq_pre(const float* hist, const float2* mv, const float* depth, float* out,
+                          int fw, int fh, int W, int H, float2 ms = make_float2(1.0f, 1.0f)) {
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= W*H) return;
+    const int x = i % W, y = i / W;
+    const int sx = max(0, x < fw ? x : 2*fw - x - 2), sy = max(0, y < fh ? y : 2*fh - y - 2);
+    int mx = sx, my = sy;
+    if (depth) {
+        float best = depth[size_t(sy)*fw + sx];
+        for (int dy = -1; dy <= 1; dy += 2)
+            for (int dx = -1; dx <= 1; dx += 2) {
+                const int qx = min(max(sx + dx, 0), fw-1), qy = min(max(sy + dy, 0), fh-1);
+                const float d = depth[size_t(qy)*fw + qx];
+                if (d > best) { best = d; mx = qx; my = qy; }  // reversed-Z: larger is nearer
+            }
+    }
+    float2 v = mv ? mv[size_t(my)*fw + mx] : make_float2(0.0f, 0.0f);
+    v.x *= ms.x; v.y *= ms.y;
+    if (!isfinite(v.x) || !isfinite(v.y)) v = make_float2(0.0f, 0.0f);
+    const float3 h = hist_5tap(hist, fw, fh, sx + 0.5f + v.x, sy + 0.5f + v.y);
+    out[size_t(i)*3] = h.x; out[size_t(i)*3+1] = h.y; out[size_t(i)*3+2] = h.z;
+}
+
+// post: blend and store. rgb_native is clamp(input + 0.25 * net.rgb) (W stride);
+// tiles the head's C32 features (8x8 window order, W wide); row the projection's
+// fourth row (the head's coefficient row 6). out (fw x fh) is the network's
+// image: the output at Intensity 1 and the next frame's history.
+__global__ void k_seq_post(const float* rgb_native, const float* tiles, const float* row, const float* hist,
+                           const float2* mv, float* out, int fw, int fh, int W, float scale, int temporal,
+                           float2 ms = make_float2(1.0f, 1.0f)) {
+    const int p = blockIdx.x*blockDim.x + threadIdx.x;
+    if (p >= fw*fh) return;
+    const int x = p % fw, y = p / fw;
+    const float* r = rgb_native + (size_t(y)*W + x)*3;
+    float3 rgb = make_float3(r[0], r[1], r[2]);
+    if (temporal) {
+        const float* t = tiles + size_t(((y/8)*(W/8) + x/8)*64 + (y%8)*8 + x%8)*32;
+        float o = 0.0f;
+        for (int k = 0; k < 32; ++k) o += t[k]*row[k];
+        const float w = fminf(fmaxf(scale / (1.0f + expf(-o)), 0.0f), 1.0f);
+        float2 v = mv ? mv[p] : make_float2(0.0f, 0.0f);
+        v.x *= ms.x; v.y *= ms.y;
+        if (!isfinite(v.x) || !isfinite(v.y)) v = make_float2(0.0f, 0.0f);
+        const float3 h = hist_5tap(hist, fw, fh, x + 0.5f + v.x, y + 0.5f + v.y);
+        rgb = make_float3(rgb.x + (h.x - rgb.x)*w, rgb.y + (h.y - rgb.y)*w, rgb.z + (h.z - rgb.z)*w);
+    }
+    out[size_t(p)*3] = rgb.x; out[size_t(p)*3+1] = rgb.y; out[size_t(p)*3+2] = rgb.z;
+}
+
+// transfer=nvidia, the application output: NVIDIA's compose
+// sat(src + sat(Intensity) * (nr - src)) (peer fswin_t.comp, read from the
+// DLL's PTX) as a delta map on the encoded input, (out - src, Y_in) per frame
+// pixel; Y_in is the linear luminance of src, for the consumer's lag gate.
+__global__ void k_nv_map(const float* image, const float* color, float4* map, int fw, int fh, int W, float intensity) {
+    const int p = blockIdx.x*blockDim.x + threadIdx.x;
+    if (p >= fw*fh) return;
+    const int x = p % fw, y = p / fw;
+    const float* s = color + (size_t(y)*W + x)*3;
+    const float* n = image + size_t(p)*3;
+    const float k = fminf(fmaxf(intensity, 0.0f), 1.0f);
+    float d[3];
+    for (int c = 0; c < 3; ++c) d[c] = fminf(fmaxf(s[c] + k*(n[c] - s[c]), 0.0f), 1.0f) - s[c];
+    const float yin = .2126f*srgb_decode_device(s[0]) + .7152f*srgb_decode_device(s[1]) + .0722f*srgb_decode_device(s[2]);
+    map[p] = make_float4(d[0], d[1], d[2], yin);
+}
+// The delta map as RGBA16F for the shim's resolve (map mode 4).
+__global__ void k_map4_out(const float4* map, unsigned char* out, size_t out_pitch, int w, int h) {
+    int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= w*h) return;
+    int x = i % w, y = i / w;
+    const float4 m = map[i];
+    const _Float16 v[4] = {(_Float16)m.x, (_Float16)m.y, (_Float16)m.z, (_Float16)m.w};
+    __builtin_memcpy(out + size_t(y)*out_pitch + size_t(x)*8, v, 8);
+}
+// The delta map applied to a frame on the engine's side (compose_device):
+// the encoded channels plus the delta (values above white keep their headroom).
+__global__ void k_compose4(const unsigned char* src, int pitch, int bpp, const float4* map,
+                           unsigned char* out, size_t out_pitch, int frame_w, int frame_h) {
+    int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= frame_w*frame_h) return;
+    int x = i % frame_w, y = i / frame_w;
+    const unsigned char* px = src + size_t(y)*pitch + size_t(x)*bpp;
+    out += size_t(y)*out_pitch + size_t(x)*bpp;
+    const float4 m = map[i];
+    const float d[3] = {m.x, m.y, m.z};
+    for (int c = 0; c < 4; ++c) {
+        float raw = c < 3 ? frame_channel(px, bpp, c) : 0.0f;
+        if (c == 3 || !(raw == raw)) {
+            for (int b = 0; b < bpp/4; ++b) out[c*(bpp/4) + b] = px[c*(bpp/4) + b];
+            continue;
+        }
+        const float s = fmaxf(raw, 0.0f) >= 1.0f ? raw + d[c] : fminf(fmaxf(raw + d[c], 0.0f), 1.0f);
+        if (bpp == 4) {
+            out[c] = (unsigned char)nearbyintf(fminf(fmaxf(s, 0.0f), 1.0f)*255.0f);
+        } else {
+            _Float16 h = (_Float16)s;
+            __builtin_memcpy(out + c*2, &h, 2);
+        }
+    }
+}
+
 // NVIDIA's level sizes (peer DLSSNR-AMD nr_native_plan.cpp, validated against
 // the DLL): every reduction maps a side d to up(ceil(d/2), 4). For the network
 // extents used here (multiples of 64) that changes nothing down to 1/16, but
@@ -1037,6 +1197,14 @@ struct Engine {
     int hist_W = 0, hist_H = 0, hist_sw = 0, hist_sh = 0;
     int coord_cur = -1;                // -1: no history for this job; 2: same frame (identity)
     unsigned temporal_seed = 0;
+    // transfer=nvidia: the network's image of the last run (frame pixels,
+    // ping-pong; the history), its frame, the stem's history features and
+    // the run counter that seeds the noise (0 on a reset).
+    std::unique_ptr<Buffer> nv_image[2], nv_feat;
+    int nv_cur = 0, nv_w = 0, nv_h = 0;
+    long long nv_frame = -1;
+    unsigned nv_seed = 0;
+    bool nv_history = false;
     // re_depth: the newest submitted frame's depth (frame pixels) and the
     // job's copy, taken when the job starts.
     std::unique_ptr<Buffer> depth_next, job_depth;
@@ -1063,7 +1231,10 @@ struct Engine {
             size_t eq = line.find('=');
             if (eq == std::string::npos) throw std::runtime_error("engine option needs key=value: " + line);
             std::string key = line.substr(0, eq), value = line.substr(eq+1);
-            if (key == "transfer" && (value == "luma" || value == "full")) options.luma = value == "luma";
+            if (key == "transfer" && (value == "luma" || value == "full" || value == "nvidia")) {
+                options.luma = value != "full";
+                options.nvidia = value == "nvidia";
+            }
             else if (key == "limit") options.limit = std::stof(value);
             else if (key == "smooth") options.smooth = std::stof(value);
             else if (key == "sigma") options.sigma = std::stof(value);
@@ -1116,6 +1287,15 @@ struct Engine {
             options.encoded < 0 || options.encoded > 1 || (options.encoded && !options.luma) ||
             options.temporal < 0.0f || options.temporal > 1.0f || (options.temporal > 0.0f && !options.luma))
             throw std::runtime_error("engine options out of range");
+        if (options.nvidia) {
+            options.encoded = 1;
+            options.scale = 1.0f; options.budget = 0.0f; options.smooth = 0.0f; options.temporal = 0.0f;
+            options.tone = 0.0f; options.additive = 0.0f; options.input_temporal = 0.0f;
+            // NGX defaults (Style 0, LocalTone 1, LocalStructure 1, Skin -1,
+            // automatic mask) as the validated sequence feeds them.
+            const float defaults[5] = {0.0f, 1.0f, 1.0f, 1.0f, 1.0f};
+            for (int k = 0; k < 5; ++k) options.controls[k] = defaults[k];
+        }
         // The caller's thread may carry a stale HIP error from its own work;
         // setup checks hipGetLastError() after its first launches.
         (void)hipGetLastError();
@@ -1437,20 +1617,43 @@ struct Engine {
             job_strength = options.strength;
         }
         const bool temporal = !job_crop && options.luma && options.temporal > 0.0f;
+        const bool nvidia = !job_crop && options.nvidia;
         bool use_history = false, hin_ok = false;
-        if (temporal) {
-            if (!hist_row) {
-                std::vector<float> row(32);
-                std::string path = config[16] + "/coeff_history.f32";
-                FILE* f = fopen(path.c_str(), "rb");
-                if (!f || fread(row.data(), sizeof(float), 32, f) != 32) {
-                    if (f) fclose(f);
-                    throw std::runtime_error("temporal needs " + path);
-                }
-                fclose(f);
-                hist_row.reset(new Buffer(32));
-                HIP_CHECK(hipMemcpy(hist_row->data, row.data(), 32*sizeof(float), hipMemcpyHostToDevice));
+        if ((temporal || nvidia) && !hist_row) {
+            std::vector<float> row(32);
+            std::string path = config[16] + "/coeff_history.f32";
+            FILE* f = fopen(path.c_str(), "rb");
+            if (!f || fread(row.data(), sizeof(float), 32, f) != 32) {
+                if (f) fclose(f);
+                throw std::runtime_error("temporal needs " + path);
             }
+            fclose(f);
+            hist_row.reset(new Buffer(32));
+            HIP_CHECK(hipMemcpy(hist_row->data, row.data(), 32*sizeof(float), hipMemcpyHostToDevice));
+        }
+        const int nv_slot = int(job_frame % kRing);
+        const float2 nv_ms = nvidia ? motion_scale(frame_w, frame_h) : make_float2(0.0f, 0.0f);
+        const float2* nv_mv = nvidia && mv_w == frame_w && mv_h == frame_h && ring_frame[nv_slot] == job_frame &&
+                              (nv_ms.x != 0.0f || nv_ms.y != 0.0f)
+                              ? reinterpret_cast<const float2*>(ring[nv_slot]->data.get()) : nullptr;
+        if (nvidia) {
+            // The previous run's image is the history when it is the previous
+            // frame's, at this size; otherwise a reset (seed 0, no history).
+            // Without motion the history is read in place.
+            const size_t fpx = size_t(frame_w)*frame_h;
+            for (auto& im : nv_image)
+                if (!im || im->count < fpx*3) { im.reset(new Buffer(fpx*3)); nv_frame = -1; }
+            if (!nv_feat || nv_feat->count < size_t(W)*H*3) nv_feat.reset(new Buffer(size_t(W)*H*3));
+            nv_history = nv_frame >= 0 && nv_frame == job_frame - 1 && nv_w == frame_w && nv_h == frame_h;
+            if (nv_history) {
+                hipLaunchKernelGGL(k_seq_pre, dim3((W*H+255)/256), dim3(256), 0, stream,
+                                   nv_image[nv_cur]->data, nv_mv, job_depth_valid ? job_depth->data : nullptr,
+                                   nv_feat->data, frame_w, frame_h, W, H, nv_ms);
+                HIP_CHECK(hipGetLastError());
+            }
+            nv_seed = nv_history ? nv_seed + 1 : 0;
+        }
+        if (temporal) {
             size_t count = size_t(W)*H*3;
             if (!hist_cur || hist_cur->count < count) hist_cur.reset(new Buffer(count));
             use_history = coord_cur >= 0 && hist_prev && hist_W == W && hist_H == H && hist_sw == sw && hist_sh == sh;
@@ -1467,9 +1670,11 @@ struct Engine {
             // after a reset (here: whenever there is no history to blend with).
             temporal_seed = use_history ? temporal_seed + 1 : 0;
         }
-        net->front->history = use_history ? hist_cur->data : nullptr;
-        net->front->noise_seed = temporal ? temporal_seed : 0;
-        net->head70->keep_native = temporal && use_history;  // k_head_temporal's input
+        net->front->history = nvidia ? (nv_history ? nv_feat->data.get() : nullptr)
+                                     : use_history ? hist_cur->data.get() : nullptr;
+        net->front->noise_seed = nvidia ? nv_seed : temporal ? temporal_seed : 0;
+        net->front->noise_function = nvidia;  // the original's noise from the first frame on
+        net->head70->keep_native = (temporal && use_history) || (nvidia && nv_history);  // the blend's input
         HIP_CHECK(hipEventRecord(start, stream));
         const unsigned char* net_src = reinterpret_cast<const unsigned char*>(raw_input->data.get());
         if (!job_crop && options.luma && options.input_temporal > 0.0f && frame_bpp == 8) {
@@ -1502,6 +1707,15 @@ struct Engine {
                  frame_bpp, job_crop, stream, sw, sh, tone, !job_crop && options.encoded,
                  use_history && options.history_clamp ? hist_cur->data : nullptr,
                  use_history && options.history_clamp == 2 && hin_ok ? hin_cur->data : nullptr, options.reject);
+        if (nvidia) {
+            const int next = nv_cur ^ 1;
+            hipLaunchKernelGGL(k_seq_post, dim3((frame_w*frame_h+255)/256), dim3(256), 0, stream,
+                               net->rgb_native->data, nv_history ? net->head70->native_view().data : nullptr,
+                               hist_row->data, nv_image[nv_cur]->data, nv_mv, nv_image[next]->data,
+                               frame_w, frame_h, W, 0.7397f, int(nv_history), nv_ms);
+            HIP_CHECK(hipGetLastError());
+            nv_cur = next; nv_frame = job_frame; nv_w = frame_w; nv_h = frame_h;
+        }
         if (temporal) {
             if (use_history) {
                 hipLaunchKernelGGL(k_head_temporal, dim3((W*H+255)/256), dim3(256), 0, stream,
@@ -1545,45 +1759,54 @@ struct Engine {
             if (options.luma) {
                 int next = published == 0 ? 1 : 0;
                 bool previous_valid = published >= 0 && map_w == frame_w && map_h == frame_h;
+                const size_t per = nvidia ? 4 : 2;  // (delta rgb, Y_in) or (ratio, Y_in)
                 for (auto& m : maps)
-                    if (!m || m->count < size_t(frame_w)*frame_h*2) m.reset(new Buffer(size_t(frame_w)*frame_h*2));
-                // smooth_depth: the history is the previous frame's map, both
-                // frames have depth, and this frame's motion is in the ring.
-                const float* prev_d = nullptr;
-                const float2* job_mv = nullptr;
-                float2 ms = make_float2(0.0f, 0.0f);
-                const int mslot = int(job_frame % kRing);
-                if (options.smooth_depth && previous_valid && job_depth_valid && prev_depth &&
-                    prev_depth_frame == job_frame - 1 && map_frame[published] == job_frame - 1 &&
-                    mv_w == frame_w && mv_h == frame_h && ring_frame[mslot] == job_frame) {
-                    ms = motion_scale(frame_w, frame_h);
-                    if (ms.x != 0.0f || ms.y != 0.0f) {
-                        prev_d = prev_depth->data;
-                        job_mv = reinterpret_cast<const float2*>(ring[mslot]->data.get());
+                    if (!m || m->count < size_t(frame_w)*frame_h*per) m.reset(new Buffer(size_t(frame_w)*frame_h*per));
+                if (nvidia) {
+                    hipLaunchKernelGGL(k_nv_map, dim3((frame_w*frame_h+255)/256), dim3(256), 0, stream,
+                                       nv_image[nv_cur]->data, net->color->data,
+                                       reinterpret_cast<float4*>(maps[next]->data.get()), frame_w, frame_h, W,
+                                       job_strength);
+                    HIP_CHECK(hipGetLastError());
+                } else {
+                    // smooth_depth: the history is the previous frame's map, both
+                    // frames have depth, and this frame's motion is in the ring.
+                    const float* prev_d = nullptr;
+                    const float2* job_mv = nullptr;
+                    float2 ms = make_float2(0.0f, 0.0f);
+                    const int mslot = int(job_frame % kRing);
+                    if (options.smooth_depth && previous_valid && job_depth_valid && prev_depth &&
+                        prev_depth_frame == job_frame - 1 && map_frame[published] == job_frame - 1 &&
+                        mv_w == frame_w && mv_h == frame_h && ring_frame[mslot] == job_frame) {
+                        ms = motion_scale(frame_w, frame_h);
+                        if (ms.x != 0.0f || ms.y != 0.0f) {
+                            prev_d = prev_depth->data;
+                            job_mv = reinterpret_cast<const float2*>(ring[mslot]->data.get());
+                        }
                     }
-                }
-                hipLaunchKernelGGL(k_ratio_map, dim3((frame_w*frame_h+255)/256), dim3(256), 0, stream,
-                                   linear, net->color->data,
-                                   reinterpret_cast<const unsigned char*>(raw_input->data.get()), frame_pitch, frame_bpp,
-                                   !previous_valid ? nullptr : history_cur >= 0
-                                       ? reinterpret_cast<const float2*>(history[history_cur]->data.get())
-                                       : reinterpret_cast<const float2*>(maps[published]->data.get()),
-                                   int(previous_valid), job_options(job_strength), reinterpret_cast<float2*>(maps[next]->data.get()),
-                                   frame_w, frame_h, sw, sh, W, tone,
-                                   job_depth_valid ? job_depth->data : nullptr,
-                                   job_albedo_valid ? job_albedo->data : nullptr,
-                                   job_mv ? prev_d : nullptr, job_mv, ms.x, ms.y);
-                HIP_CHECK(hipGetLastError());
-                if (options.smooth_depth || options.input_temporal > 0.0f) {
-                    // Keep this job's depth for the next one (same stream, in order).
-                    if (job_depth_valid) {
-                        if (!prev_depth || prev_depth->count < size_t(frame_w)*frame_h)
-                            prev_depth.reset(new Buffer(size_t(frame_w)*frame_h));
-                        HIP_CHECK(hipMemcpyAsync(prev_depth->data, job_depth->data, size_t(frame_w)*frame_h*sizeof(float),
-                                                 hipMemcpyDeviceToDevice, stream));
-                        prev_depth_frame = job_frame;
-                    } else {
-                        prev_depth_frame = -1;
+                    hipLaunchKernelGGL(k_ratio_map, dim3((frame_w*frame_h+255)/256), dim3(256), 0, stream,
+                                       linear, net->color->data,
+                                       reinterpret_cast<const unsigned char*>(raw_input->data.get()), frame_pitch, frame_bpp,
+                                       !previous_valid ? nullptr : history_cur >= 0
+                                           ? reinterpret_cast<const float2*>(history[history_cur]->data.get())
+                                           : reinterpret_cast<const float2*>(maps[published]->data.get()),
+                                       int(previous_valid), job_options(job_strength), reinterpret_cast<float2*>(maps[next]->data.get()),
+                                       frame_w, frame_h, sw, sh, W, tone,
+                                       job_depth_valid ? job_depth->data : nullptr,
+                                       job_albedo_valid ? job_albedo->data : nullptr,
+                                       job_mv ? prev_d : nullptr, job_mv, ms.x, ms.y);
+                    HIP_CHECK(hipGetLastError());
+                    if (options.smooth_depth || options.input_temporal > 0.0f) {
+                        // Keep this job's depth for the next one (same stream, in order).
+                        if (job_depth_valid) {
+                            if (!prev_depth || prev_depth->count < size_t(frame_w)*frame_h)
+                                prev_depth.reset(new Buffer(size_t(frame_w)*frame_h));
+                            HIP_CHECK(hipMemcpyAsync(prev_depth->data, job_depth->data, size_t(frame_w)*frame_h*sizeof(float),
+                                                     hipMemcpyDeviceToDevice, stream));
+                            prev_depth_frame = job_frame;
+                        } else {
+                            prev_depth_frame = -1;
+                        }
                     }
                 }
                 float elapsed = last_ms;
@@ -1688,7 +1911,7 @@ struct Engine {
     // re_depth: copy the frame's depth (float per pixel, rows of pitch bytes)
     // for the next job. Only kept when depth_sigma is on.
     int depth(const void* src, int w, int h, int pitch) {
-        if (options.depth_sigma <= 0.0f || !options.luma) return 0;
+        if ((options.depth_sigma <= 0.0f && !options.nvidia) || !options.luma) return 0;
         std::lock_guard<std::mutex> lock(mutex);
         try {
             if (!depth_next || depth_next->count < size_t(w)*h) depth_next.reset(new Buffer(size_t(w)*h));
@@ -1741,8 +1964,10 @@ struct Engine {
         options.controls[0] = style / 128.0f;
         options.controls[1] = fminf(fmaxf(v[3], 0.0f), 2.0f);
         options.controls[2] = fminf(fmaxf(v[2], 0.0f), 2.0f);
-        options.controls[3] = -1.0f;
-        options.controls[4] = -1.0f;
+        // transfer=nvidia: the features the validated sequence feeds for
+        // Skin -1 with the automatic mask.
+        options.controls[3] = options.nvidia ? 1.0f : -1.0f;
+        options.controls[4] = options.nvidia ? 1.0f : -1.0f;
         options.strength = fminf(fmaxf(v[0], 0.0f), 2.0f);
         return 1;
     }
@@ -1780,6 +2005,22 @@ struct Engine {
         if (!out || published < 0 || map_w != w || map_h != h || cur_w != w || cur_h != h || cur_bpp != bpp ||
             dst_pitch < size_t(w)*bpp || out_pitch < size_t(w)*bpp) return 0;
         try {
+            if (options.nvidia) {
+                // The delta map as it is: the shim's resolve carries it along
+                // the lag (map mode 4); the engine's compose adds it in place.
+                const float4* map4 = reinterpret_cast<const float4*>(maps[published]->data.get());
+                if (map_only)
+                    hipLaunchKernelGGL(k_map4_out, dim3((w*h+255)/256), dim3(256), 0, compose_stream,
+                                       map4, out, out_pitch, w, h);
+                else
+                    hipLaunchKernelGGL(k_compose4, dim3((w*h+255)/256), dim3(256), 0, compose_stream,
+                                       reinterpret_cast<const unsigned char*>(current->data.get()), cur_pitch, bpp,
+                                       map4, out, out_pitch, w, h);
+                HIP_CHECK(hipGetLastError());
+                if (sync) HIP_CHECK(hipStreamSynchronize(compose_stream));
+                else HIP_CHECK(hipEventRecord(compose_done, compose_stream));
+                return 1;
+            }
             const float2* map = reinterpret_cast<const float2*>(maps[published]->data.get());
             const float2 ms = motion_scale(w, h);
             const float mx = ms.x, my = ms.y;
@@ -2086,7 +2327,8 @@ __declspec(dllexport) int re_compose_ready() {
 
 // For a map consumer: params[0..1] scale the staged motion vectors to frame
 // pixels (prev = cur + mv*scale; 0 when motion is off or not detected yet),
-// params[2] = 1/gate, params[3] = 1 in luma mode. Returns 1, or -1.
+// params[2] = 1/gate, params[3] = 1 in luma mode (a ratio map), 2 with
+// transfer=nvidia (a delta map: encoded rgb change, Y_in). Returns 1, or -1.
 __declspec(dllexport) int re_luma_map_params(float* params) {
     std::lock_guard<std::mutex> lock(g_mutex);
     if (!g_engine || !params) return -1;
@@ -2099,7 +2341,7 @@ __declspec(dllexport) int re_luma_map_params(float* params) {
     params[1] = ms.y;
     // A negative value asks the resolve for the relative (log2) gate.
     params[2] = e.options.rel_gate > 0.0f ? -1.0f / e.options.rel_gate : 1.0f / e.options.gate;
-    params[3] = e.options.luma ? 1.0f : 0.0f;
+    params[3] = e.options.nvidia ? 2.0f : e.options.luma ? 1.0f : 0.0f;  // 2: a delta map (map mode 4)
     return 1;
 }
 
