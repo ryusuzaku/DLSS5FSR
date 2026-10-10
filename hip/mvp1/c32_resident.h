@@ -103,7 +103,10 @@ struct Weights {
         } else {
             // FP8 WMMA form, transposed: bit-identical to k_c32_fp8 / k_c32_wmma,
             // 2.9x faster than k_c32_fp8 (S336).
-            hipLaunchKernelGGL(k_c32_t<1>,dim3(rows/64),dim3(128),0,c512_resident::stream,
+            // Bytes in and out (the fast path between blocks) as a compile-time form.
+            const bool bytes = io.in_fmt == 1 && io.out_fmt == 1;
+            hipLaunchKernelGGL((bytes ? k_c32_t<1, 0, true> : k_c32_t<1, 0, false>),
+                               dim3(rows/64),dim3(128),0,c512_resident::stream,
                                input,data.data,reinterpret_cast<const unsigned char*>(fp8.data.get()),scale,raw_out,quant_out,io,fz);
         }
         HIP_CHECK(hipGetLastError());

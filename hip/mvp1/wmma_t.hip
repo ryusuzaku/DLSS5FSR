@@ -94,6 +94,37 @@ __device__ inline void acc_add(h8& acc, const acc8& part) {
     }
     acc = __builtin_bit_cast(h8, r);
 }
+// gate() of eight halves and their E4M3 bytes (pack's clamp to +-448), in
+// packed f16 instructions: the same f16 operations, two elements at a time.
+typedef _Float16 h2 __attribute__((ext_vector_type(2)));
+__device__ inline op8 gate_pack(h8 a) {
+    float v[8];
+    for (int q = 0; q < 4; ++q) {
+        const h2 x = {a[2*q], a[2*q+1]};
+        const h2 g = __builtin_elementwise_min(__builtin_elementwise_max(x, (h2)(_Float16)-4.0f), (h2)(_Float16)4.0f);
+        const h2 inner = __builtin_elementwise_fma(__builtin_elementwise_abs(g), (h2)(_Float16)-0.055908203125f, (h2)(_Float16)0.447265625f);
+        const h2 poly = __builtin_elementwise_fma(g, inner, (h2)(_Float16)0.89453125f);
+        const h2 r = __builtin_elementwise_min(__builtin_elementwise_max(x*poly, (h2)(_Float16)-448.0f), (h2)(_Float16)448.0f);
+        v[2*q] = float(r[0]); v[2*q+1] = float(r[1]);
+    }
+    int lo = 0, hi = 0;
+    lo = __builtin_amdgcn_cvt_pk_fp8_f32(v[0], v[1], lo, false);
+    lo = __builtin_amdgcn_cvt_pk_fp8_f32(v[2], v[3], lo, true);
+    hi = __builtin_amdgcn_cvt_pk_fp8_f32(v[4], v[5], hi, false);
+    hi = __builtin_amdgcn_cvt_pk_fp8_f32(v[6], v[7], hi, true);
+    return op8{lo, hi};
+}
+// The f32-add-then-half form of acc_add (RESIDENT_SR=0).
+__device__ inline void acc_add2(h8& acc, const acc8& part) {
+    for (int e = 0; e < 8; ++e) acc[e] = (_Float16)(float(acc[e]) + part[e]);
+}
+// h(a + b) of two floats, the exact sum rounded once (== split512_half_sum,
+// which takes it through TwoSum and rounding to odd): one v_fma_mix.
+__device__ inline float mix_sum(float a, float b) {
+    unsigned v;
+    asm("v_fma_mixlo_f16 %0, %1, 1.0, %2" : "=v"(v) : "v"(a), "v"(b));
+    return float(__builtin_bit_cast(_Float16, (unsigned short)(v & 0xFFFFu)));
+}
 // h(a * b) and h(a + b) of two halves in one f16 instruction.
 __device__ inline float hmul(float a, float b) { return float((_Float16)a * (_Float16)b); }
 __device__ inline float hadd(float a, float b) { return float((_Float16)a + (_Float16)b); }

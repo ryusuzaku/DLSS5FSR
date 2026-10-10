@@ -29,11 +29,22 @@ __device__ inline op8 pack(const float* v) {
     hi = __builtin_amdgcn_cvt_pk_fp8_f32(clamp448(v[6]), clamp448(v[7]), hi, true);
     return op8{lo, hi};
 }
+// pack of values already inside +-448 (the clamp would not change them).
+__device__ inline op8 pack_in(const float* v) {
+    int lo = 0, hi = 0;
+    lo = __builtin_amdgcn_cvt_pk_fp8_f32(v[0], v[1], lo, false);
+    lo = __builtin_amdgcn_cvt_pk_fp8_f32(v[2], v[3], lo, true);
+    hi = __builtin_amdgcn_cvt_pk_fp8_f32(v[4], v[5], hi, false);
+    hi = __builtin_amdgcn_cvt_pk_fp8_f32(v[6], v[7], hi, true);
+    return op8{lo, hi};
+}
 __device__ inline acc8 mma(op8 a, op8 b, acc8 c) { return __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(a, b, c); }
 // A operand: row l%16 of a [rows][ld] byte matrix, K step k.
+// The lane offset is unsigned and the uniform part (m + k) separate, so the
+// load takes the SGPR-base form (no 64-bit address arithmetic a load).
 __device__ inline op8 arow(const unsigned char* m, int ld, int k) {
-    const int l = threadIdx.x % 32;
-    return *reinterpret_cast<const op8*>(m + (l % 16) * ld + (l / 16) * 8 + k);
+    const unsigned l = threadIdx.x % 32u;
+    return *reinterpret_cast<const op8*>((m + k) + ((l % 16u) * unsigned(ld) + (l / 16u) * 8u));
 }
 // Loads and stores of `n` consecutive elements in a storage format (0 float,
 // 1 E4M3 byte, 2 half); E4M3 and half hold these values exactly.
@@ -84,6 +95,26 @@ __device__ inline void store_fmt(void* p, int fmt, size_t at, const float* v) {
         } else {
             for (int k = 0; k < N; ++k) q[k] = v[k];
         }
+    }
+}
+// The quantized block output h70_f(body) of N body values (halves) in a
+// storage format. For bytes the body converts directly: h70_f is the E4M3
+// value of the clamped half, and converting that value again is the same byte.
+template<int N>
+__device__ inline void store_quant(void* p, int fmt, size_t at, const float* body) {
+    if (fmt == 1) {
+        unsigned char* q = static_cast<unsigned char*>(p) + at;
+        if constexpr (N == 8) {
+            const op8 b = pack(body);
+            *reinterpret_cast<uint2*>(q) = make_uint2(unsigned(b[0]), unsigned(b[1]));
+        } else {
+            static_assert(N == 2, "pairs");
+            *reinterpret_cast<unsigned short*>(q) = (unsigned short)__builtin_amdgcn_cvt_pk_fp8_f32(clamp448(body[0]), clamp448(body[1]), 0, false);
+        }
+    } else {
+        float v[N];
+        for (int k = 0; k < N; ++k) v[k] = h70_f(body[k]);
+        store_fmt<N>(p, fmt, at, v);
     }
 }
 using wmma_t::gate;  // the shared f16 forms (wmma_t.hip)
@@ -203,7 +234,11 @@ __device__ inline float aligned_pair(const float* a, const int* ea, const float*
 }
 }  // namespace c32t
 
-template<int TT, int MODE = 0>
+// BYTES: io.in_fmt and io.out_fmt are 1 (E4M3 bytes), fixed at compile time.
+// The contract and context sums stay f32-add-then-half: at this level a
+// 32-deep FP8 partial sum is not always exact in f32, and wmma_t::acc_add's
+// single rounding then changes rare ties (network_parity at 1080p).
+template<int TT, int MODE = 0, bool BYTES = false>
 __global__ __launch_bounds__(128/TT) void k_c32_t(const float* in, const float* __restrict__ dw,
                                                   const unsigned char* __restrict__ w8, float scale,
                                                   float* raw_out, float* quant_out, C32Io io,
@@ -217,6 +252,7 @@ __global__ __launch_bounds__(128/TT) void k_c32_t(const float* in, const float* 
     const float *g1 = dw+16385, *g2 = dw+16417, *B = dw+12288;
     const int tid = threadIdx.x, wave = tid/32, lane = tid%32, n = lane%16, h = lane/16;
     const int win = blockIdx.x;
+    const int in_fmt = BYTES ? 1 : io.in_fmt, out_fmt = BYTES ? 1 : io.out_fmt;
     int token[TT];
     for (int u = 0; u < TT; ++u) token[u] = (wave*TT + u)*16 + n;
     if constexpr (MODE == 0) {
@@ -231,7 +267,7 @@ __global__ __launch_bounds__(128/TT) void k_c32_t(const float* in, const float* 
     // x^T as two B operands (channels s*16 + h*8 + e) and the FFN residual,
     // which sits in the contract output's layout (feature tile s, rows h*8+e).
     op8 xb[TT][2];
-    float ffn[TT][2][8];
+    wmma_t::h8 ffn[TT][2];  // halves
     for (int u = 0; u < TT; ++u) {
         const int b = MODE == 0 ? in_base[token[u]] : 0;
         float f[15];
@@ -257,7 +293,14 @@ __global__ __launch_bounds__(128/TT) void k_c32_t(const float* in, const float* 
                 for (int e = 0; e < 8; ++e) {
                     const int c = s*16 + h*8 + e;
                     float part = 0.0f;
-                    for (int k = 0; k < 15; ++k) part += f[k]*fz.stem[k*32+c];
+                    // f[k] and the stem weights are halves: each product is exact
+                    // in float, so the fma rounds as part + f*stem does. The empty
+                    // asm keeps the float: LLVM otherwise folds the last fma and
+                    // the half conversion into one v_fma_mixlo_f16, which rounds
+                    // the exact sum to half directly and breaks ties differently
+                    // (build/c32_mode_test.exe: 51 of 31M values).
+                    for (int k = 0; k < 15; ++k) part = __builtin_fmaf(f[k], fz.stem[k*32+c], part);
+                    asm("" : "+v"(part));
                     x[e] = h70_h(part);
                 }
             } else if constexpr (MODE == 2) {  // k_head70_merge
@@ -285,14 +328,14 @@ __global__ __launch_bounds__(128/TT) void k_c32_t(const float* in, const float* 
             } else if (b < 0) {
                 for (int e = 0; e < 8; ++e) x[e] = 0.0f;
             } else if (!io.permute) {
-                load_fmt<8>(in, io.in_fmt, size_t(b) + s*16 + h*8, x);
+                load_fmt<8>(in, in_fmt, size_t(b) + s*16 + h*8, x);
             } else {
                 // peer c = s*16 + h*8 + e is native s*16 + 4(e>>1) + 2h + (e&1): four pairs.
-                for (int q = 0; q < 4; ++q) load_fmt<2>(in, io.in_fmt, size_t(b) + s*16 + 4*q + 2*h, x + 2*q);
+                for (int q = 0; q < 4; ++q) load_fmt<2>(in, in_fmt, size_t(b) + s*16 + 4*q + 2*h, x + 2*q);
             }
             for (int e = 0; e < 8; ++e) {
                 v[e] = c32f_h(x[e]);
-                ffn[u][s][e] = c32f_h(x[e]*g1[s*16 + h*8 + e]);
+                ffn[u][s][e] = (_Float16)(x[e]*g1[s*16 + h*8 + e]);
             }
             xb[u][s] = pack(v);
         }
@@ -304,9 +347,7 @@ __global__ __launch_bounds__(128/TT) void k_c32_t(const float* in, const float* 
         for (int u = 0; u < TT; ++u) {
             acc8 c = {};
             c = mma(a1, xb[u][1], mma(a0, xb[u][0], c));
-            float v[8];
-            for (int e = 0; e < 8; ++e) v[e] = gate(c[e]);
-            hb[u][t] = pack(v);
+            hb[u][t] = wmma_t::gate_pack(__builtin_convertvector(c, wmma_t::h8));
         }
     }
     // Contract: four 32-deep slices in order onto the residual.
@@ -317,10 +358,14 @@ __global__ __launch_bounds__(128/TT) void k_c32_t(const float* in, const float* 
             for (int u = 0; u < TT; ++u) {
                 acc8 part = {};
                 part = mma(a1, hb[u][2*s+1], mma(a0, hb[u][2*s], part));
-                for (int e = 0; e < 8; ++e) ffn[u][f][e] = c32f_h(ffn[u][f][e]+part[e]);
+                wmma_t::acc_add2(ffn[u][f], part);
             }
         }
-        for (int u = 0; u < TT; ++u) fb[u][f] = pack(ffn[u][f]);
+        for (int u = 0; u < TT; ++u) {
+            float v[8];
+            for (int e = 0; e < 8; ++e) v[e] = float(ffn[u][f][e]);
+            fb[u][f] = pack(v);
+        }
     }
     // QKV: Q^T, K^T, V^T tiles (rows 0-31 Q, 32-63 K, 64-95 V), then the
     // Q/K norm per token: parts[j] = hsum(v[j]^2, h(v[j+16]^2)) for j = h*8+e,
@@ -352,8 +397,9 @@ __global__ __launch_bounds__(128/TT) void k_c32_t(const float* in, const float* 
             if (m == 0) {
                 qb[u][0] = pack(v0); qb[u][1] = pack(v1);
             } else {
-                *reinterpret_cast<op8*>(Ks + token[u]*32 + h*8) = pack(v0);
-                *reinterpret_cast<op8*>(Ks + token[u]*32 + 16 + h*8) = pack(v1);
+                // |k| <= 1 (over the token's norm): no clamp.
+                *reinterpret_cast<op8*>(Ks + token[u]*32 + h*8) = pack_in(v0);
+                *reinterpret_cast<op8*>(Ks + token[u]*32 + 16 + h*8) = pack_in(v1);
             }
         }
     }
@@ -379,25 +425,27 @@ __global__ __launch_bounds__(128/TT) void k_c32_t(const float* in, const float* 
         for (int k = 0; k < 4; ++k) {
             float v[8];
             for (int e = 0; e < 8; ++e) v[e] = wmma_t::hmul(ex[k][e], den);
-            pb[k] = pack(v);
+            pb[k] = pack_in(v);  // probabilities: in [0, 1]
         }
         // Context^T in two 32-key slices, then the projection.
         op8 cb[2];
         for (int d = 0; d < 2; ++d) {
-            float acc[8] = {};
+            wmma_t::h8 acc = {};
             for (int s = 0; s < 2; ++s) {
                 acc8 part = {};
                 part = mma(arow(Vt + d*16*64, 64, (2*s+1)*16), pb[2*s+1], mma(arow(Vt + d*16*64, 64, (2*s)*16), pb[2*s], part));
-                for (int e = 0; e < 8; ++e) acc[e] = c32f_h(acc[e]+part[e]);
+                wmma_t::acc_add2(acc, part);
             }
-            cb[d] = pack(acc);
+            float v[8];
+            for (int e = 0; e < 8; ++e) v[e] = float(acc[e]);
+            cb[d] = pack(v);
         }
         if constexpr (MODE != 0) {
             float body[2][8];
             for (int o = 0; o < 2; ++o) {
                 acc8 c = {};
                 c = mma(arow(Wp + o*16*32, 32, 16), cb[1], mma(arow(Wp + o*16*32, 32, 0), cb[0], c));
-                for (int e = 0; e < 8; ++e) body[o][e] = split512_half_sum(c[e], c32f_h(ffn[u][o][e]*g2[o*16 + h*8 + e]));
+                for (int e = 0; e < 8; ++e) body[o][e] = wmma_t::mix_sum(c[e], c32f_h(float(ffn[u][o][e])*g2[o*16 + h*8 + e]));
             }
             if constexpr (MODE == 1) {
                 // skip0 (k_front_native32, clamped) and the pool (k_front_pool).
@@ -469,11 +517,8 @@ __global__ __launch_bounds__(128/TT) void k_c32_t(const float* in, const float* 
         for (int o = 0; o < 2; ++o) {
             acc8 c = {};
             c = mma(arow(Wp + o*16*32, 32, 16), cb[1], mma(arow(Wp + o*16*32, 32, 0), cb[0], c));
-            float body[8], quant[8];
-            for (int e = 0; e < 8; ++e) {
-                body[e] = split512_half_sum(c[e], c32f_h(ffn[u][o][e]*g2[o*16 + h*8 + e]));
-                quant[e] = h70_f(body[e]);
-            }
+            float body[8];
+            for (int e = 0; e < 8; ++e) body[e] = wmma_t::mix_sum(c[e], c32f_h(float(ffn[u][o][e])*g2[o*16 + h*8 + e]));
             if (TT == 1 && fz.pool) {
                 for (int e = 0; e < 8; ++e) {  // all lanes: the shuffles need the partners
                     const float a = h70_h(body[e] + __shfl_xor(body[e], 1));
@@ -492,12 +537,12 @@ __global__ __launch_bounds__(128/TT) void k_c32_t(const float* in, const float* 
                     *reinterpret_cast<float4*>(raw_out + a) = make_float4(body[0], body[1], body[2], body[3]);
                     *reinterpret_cast<float4*>(raw_out + a + 4) = make_float4(body[4], body[5], body[6], body[7]);
                 }
-                if (quant_out) store_fmt<8>(quant_out, io.out_fmt, a, quant);
+                if (quant_out) store_quant<8>(quant_out, out_fmt, a, body);
             } else {
                 for (int q = 0; q < 4; ++q) {
                     const int a = ob + o*16 + 4*q + 2*h;
                     if (raw_out) *reinterpret_cast<float2*>(raw_out + a) = make_float2(body[2*q], body[2*q+1]);
-                    if (quant_out) store_fmt<2>(quant_out, io.out_fmt, a, quant + 2*q);
+                    if (quant_out) store_quant<2>(quant_out, out_fmt, a, body + 2*q);
                 }
             }
         }
