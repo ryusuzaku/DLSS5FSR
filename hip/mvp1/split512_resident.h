@@ -170,6 +170,10 @@ public:
     // consume_source: the fast path may use the source as its second buffer
     // (one buffer less; set when nothing reads the source afterwards).
     bool consume_source = false;
+    // keep_raw: every block writes raw_output (raw_view, save). Off, only the
+    // fast path's last block does, for the head (15 MB less a block at
+    // 5120x1440; the raw values feed nothing else).
+    bool keep_raw = true;
     bool run_from_device(DeviceTensor source, bool verify = false) {
         result = nullptr;
         if (!source.data || source.count != n) return false;
@@ -251,8 +255,9 @@ public:
                                                b8 && c512_resident::attention_t ? nullptr : crop.data.get(), wt, 512, &io,
                                                b8 ? bytes(crop8) : nullptr, &crop_bytes,
                                                qkv_half ? reinterpret_cast<const _Float16*>(qkv.data.get()) : nullptr);
+                const bool raw = keep_raw || (head_weights && &entry == &weights.back());
                 tiled::gemm<tiled::Split,tiled::FP8,true>(c512_resident::stream, crop_bytes ? nullptr : crop.data.get(), 512, w.final.data, 512, feature.data, 512,
-                    w.final_skip.data, output, raw_output.data, 512, tokens, 512, 1, 0, 0, 0, 1,
+                    w.final_skip.data, output, raw ? raw_output.data.get() : nullptr, 512, tokens, 512, 1, 0, 0, 0, 1,
                     crop_bytes ? bytes(crop8) : nullptr, output8);
                 HIP_CHECK(hipGetLastError());
                 advance();
