@@ -6,6 +6,7 @@
 #include "split512_bridge.hip"
 #include "resident_stream.h"
 #include "tiled_gemm.hip"
+#include "split512_ffn_t.hip"
 #include "split512_attention_wmma.hip"
 #include "swin_block_wmma.hip"
 #include <map>
@@ -205,6 +206,13 @@ public:
             if (small) {
                 C512_LAUNCH(k_split512_expand, size_t(tokens)*2048, mixed.data, w.expand.data, hidden.data, tokens);
                 C512_LAUNCH(k_split512_contract, n, hidden.data, w.contract.data, branch.data, tokens);
+            } else if (b8 && split512_ffn::enabled && wmma_gemm::enabled && wmma_gemm::gemm_t && tokens >= 2048) {
+                // Expand, gate and contract in one launch, the hidden in
+                // registers (split512_ffn_t.hip; the GEMMs' arithmetic).
+                split512_ffn::run(c512_resident::stream, bytes(mixed8),
+                                  wmma_gemm::fp8_weights(c512_resident::stream, w.expand.data, size_t(8)*256*64),
+                                  wmma_gemm::fp8_weights(c512_resident::stream, w.contract.data, size_t(8)*64*256),
+                                  bytes(branch8), tokens, wmma_t::single_round);
             } else {
                 tiled::gemm<tiled::Split,tiled::GATE,false>(c512_resident::stream, b8 ? nullptr : mixed.data.get(), 512, w.expand.data, 64, nullptr, 0, nullptr,
                     nullptr, b8 ? nullptr : hidden.data.get(), 2048, tokens, 256, 8, 64, 256*64, 256, 1,
