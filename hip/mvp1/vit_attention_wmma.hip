@@ -216,12 +216,37 @@ __global__ void k_vit_kv8(const float* __restrict__ projected, unsigned char* k8
     for (int c = 0; c < 32; ++c) v8[(size_t(head)*32 + c)*tokens + token] = wmma_t::byte8(split512_half(vv[c]));
 }
 
+// vit_denominator of one chunk's 64 exponents as a column reduction (S339):
+// key kt*16 + h*8 + e is x[kt][e] of lane half h. In vit order j (key =
+// vit_key_inverse_order(j)) the partial (odd, l) sums keys o, o+1 of each
+// key tile kt in order, o = 2*odd + 4*(l&1), all in half l/2: this half
+// computes its two partials a parity, the other half's come across. Sums of
+// two halves round once in f16 as in float.
+__device__ inline _Float16 vit_den_cols(const _Float16 (*x)[8]) {
+    const int h = (threadIdx.x % 32) / 16;
+    _Float16 mine[2][2];
+    for (int odd = 0; odd < 2; ++odd)
+        for (int lb = 0; lb < 2; ++lb) {
+            const int o = 2*odd + 4*lb;
+            _Float16 v = x[0][o] + x[0][o+1];
+            for (int kt = 1; kt < 4; ++kt) v = v + (x[kt][o] + x[kt][o+1]);
+            mine[odd][lb] = v;
+        }
+    _Float16 parity[2];
+    for (int odd = 0; odd < 2; ++odd) {
+        const _Float16 o0 = (_Float16)__shfl_xor(float(mine[odd][0]), 16), o1 = (_Float16)__shfl_xor(float(mine[odd][1]), 16);
+        const _Float16 p0 = h ? o0 : mine[odd][0], p1 = h ? o1 : mine[odd][1];
+        const _Float16 p2 = h ? mine[odd][0] : o0, p3 = h ? mine[odd][1] : o1;
+        parity[odd] = ((p0 + p1) + p2) + p3;
+    }
+    return parity[0] + parity[1];
+}
+
 __global__ __launch_bounds__(128) void k_vit_attention_t(const float* __restrict__ projected,
         const unsigned char* __restrict__ k8, const unsigned char* __restrict__ v8,
         const float* __restrict__ scales, float* output, unsigned char* out8, int tokens, int valid) {
     using namespace wmma_t;
-    __shared__ float row[4][16][33];  // per wave: Q values, then a chunk's exponents (as floats)
-    __shared__ float erow[4][16][65];
+    __shared__ float row[4][16][33];  // per wave: Q values
     const int head = blockIdx.y, q0 = blockIdx.x*64;
     const int tid = threadIdx.x, wave = tid/32, lane = tid%32, n = lane%16, h = lane/16;
     const int query = q0 + wave*16 + n;
@@ -253,31 +278,36 @@ __global__ __launch_bounds__(128) void k_vit_attention_t(const float* __restrict
     const unsigned char* V = v8 + size_t(head)*32*tokens;
     float d = 0.0f, acc[2][8] = {};
     for (int k0 = 0; k0 < tokens; k0 += 64) {
-        float ex[4][8];
+        // The exponents in f16: the affine step h(score*k + k') is one f16
+        // fma (build/vit_affine_test.exe: equal for every half score), the
+        // clamp and the bit transform act on halves. They lie in (0, 1.64]:
+        // no clamp before E4M3.
+        _Float16 ex[4][8];
+        op8 pb[4];
         for (int kt = 0; kt < 4; ++kt) {
             const unsigned char* kr = K + size_t(k0 + kt*16)*32;
             acc8 c = {};
             c = mma(arow(kr, 32, 16), qb[1], mma(arow(kr, 32, 0), qb[0], c));
-            for (int e = 0; e < 8; ++e) {
-                float score = hf(c[e]);
-                float affine = fminf(1.9775390625f, fmaxf(1.439453125f, hf(score*.08953857421875f+1.708984375f)));
-                _Float16 hc = split512_to_half(affine);
-                unsigned short bits; __builtin_memcpy(&bits, &hc, 2);
-                bits = (unsigned short)((unsigned(bits)<<4)+0x4000u);
-                __builtin_memcpy(&hc, &bits, 2);
-                const int key = k0 + kt*16 + h*8 + e;
-                ex[kt][e] = key >= valid ? 0.0f : float(hc);
-                erow[wave][n][kt*16 + h*8 + e] = ex[kt][e];
+            // Two at a time in packed f16 / 16-bit integer instructions.
+            typedef _Float16 h2 __attribute__((ext_vector_type(2)));
+            typedef unsigned short u2 __attribute__((ext_vector_type(2)));
+            float v[8];
+            for (int q = 0; q < 4; ++q) {
+                const h2 score = {(_Float16)c[2*q], (_Float16)c[2*q+1]};
+                const h2 affine = __builtin_elementwise_min(__builtin_elementwise_max(
+                    __builtin_elementwise_fma(score, (h2)(_Float16).08953857421875f, (h2)(_Float16)1.708984375f),
+                    (h2)(_Float16)1.439453125f), (h2)(_Float16)1.9775390625f);
+                const u2 bits = (__builtin_bit_cast(u2, affine) << 4) + (u2)(unsigned short)0x4000u;
+                const h2 hc = __builtin_bit_cast(h2, bits);
+                ex[kt][2*q] = hc[0]; ex[kt][2*q+1] = hc[1];
             }
+            if (k0 + 64 > valid)  // the last chunk: padding keys get a zero exponent
+                for (int e = 0; e < 8; ++e) if (k0 + kt*16 + h*8 + e >= valid) ex[kt][e] = (_Float16)0.0f;
+            for (int e = 0; e < 8; ++e) v[e] = float(ex[kt][e]);
+            pb[kt] = pack_in(v);  // fp8(exponent): exact halves
         }
-        __syncthreads();  // (wave-local rows; a block barrier keeps it simple)
-        float part = 0.0f;
-        if (h == 0) part = vit_denominator(&erow[wave][n][0]);
-        part = __shfl(part, n);
+        const float part = float(vit_den_cols(ex));
         d = k0 ? hf(d + part) : part;
-        __syncthreads();  // erow is rewritten by the next chunk
-        op8 pb[4];
-        for (int kt = 0; kt < 4; ++kt) pb[kt] = pack(ex[kt]);  // fp8(exponent): exact halves
         for (int dt = 0; dt < 2; ++dt)
             for (int s0 = 0; s0 < 2; ++s0) {
                 const unsigned char* vr = V + size_t(dt*16)*tokens + k0 + s0*32;

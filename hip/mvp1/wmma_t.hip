@@ -20,6 +20,15 @@ __device__ inline op8 pack(const float* v) {
     hi = __builtin_amdgcn_cvt_pk_fp8_f32(clamp448(v[6]), clamp448(v[7]), hi, true);
     return op8{lo, hi};
 }
+// pack of values already inside +-448 (the clamp would not change them).
+__device__ inline op8 pack_in(const float* v) {
+    int lo = 0, hi = 0;
+    lo = __builtin_amdgcn_cvt_pk_fp8_f32(v[0], v[1], lo, false);
+    lo = __builtin_amdgcn_cvt_pk_fp8_f32(v[2], v[3], lo, true);
+    hi = __builtin_amdgcn_cvt_pk_fp8_f32(v[4], v[5], hi, false);
+    hi = __builtin_amdgcn_cvt_pk_fp8_f32(v[6], v[7], hi, true);
+    return op8{lo, hi};
+}
 // One half -> its E4M3 byte.
 __device__ inline unsigned char byte8(float h) {
     return (unsigned char)(__builtin_amdgcn_cvt_pk_fp8_f32(clamp448(h), 0.0f, 0, false) & 0xFF);

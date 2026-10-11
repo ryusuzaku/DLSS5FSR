@@ -29,15 +29,7 @@ __device__ inline op8 pack(const float* v) {
     hi = __builtin_amdgcn_cvt_pk_fp8_f32(clamp448(v[6]), clamp448(v[7]), hi, true);
     return op8{lo, hi};
 }
-// pack of values already inside +-448 (the clamp would not change them).
-__device__ inline op8 pack_in(const float* v) {
-    int lo = 0, hi = 0;
-    lo = __builtin_amdgcn_cvt_pk_fp8_f32(v[0], v[1], lo, false);
-    lo = __builtin_amdgcn_cvt_pk_fp8_f32(v[2], v[3], lo, true);
-    hi = __builtin_amdgcn_cvt_pk_fp8_f32(v[4], v[5], hi, false);
-    hi = __builtin_amdgcn_cvt_pk_fp8_f32(v[6], v[7], hi, true);
-    return op8{lo, hi};
-}
+using wmma_t::pack_in;  // values already inside +-448
 __device__ inline acc8 mma(op8 a, op8 b, acc8 c) { return __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(a, b, c); }
 // A operand: row l%16 of a [rows][ld] byte matrix, K step k.
 // The lane offset is unsigned and the uniform part (m + k) separate, so the
