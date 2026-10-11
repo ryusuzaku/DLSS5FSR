@@ -137,6 +137,32 @@ __device__ inline h8 hmul8(h8 v, _Float16 k) {
     }
     return r;
 }
+// The C32 projection's body values h(c + h(r*g)) (r halves, g the gains).
+// h(r*g) as one v_fma_mix of r's half with g and -0: the exact product
+// rounded once, which is c32f_h(float(r)*g) because the product of two
+// halves (the gains are halves) is exact in float. Then the sum as mix_sum
+// with that half straight from its register.
+__device__ inline void proj_body(const acc8& c, h8 r, const float* g, float* body) {
+    typedef unsigned u4 __attribute__((ext_vector_type(4)));
+    const u4 rr = __builtin_bit_cast(u4, r);
+    for (int q = 0; q < 4; ++q) {
+        unsigned t = 0, s = 0;
+        asm("v_fma_mixlo_f16 %0, %1, %2, neg(0) op_sel_hi:[1,0,0]" : "+v"(t) : "v"(rr[q]), "v"(g[2*q]));
+        asm("v_fma_mixhi_f16 %0, %1, %2, neg(0) op_sel:[1,0,0] op_sel_hi:[1,0,0]" : "+v"(t) : "v"(rr[q]), "v"(g[2*q+1]));
+        asm("v_fma_mixlo_f16 %0, %1, 1.0, %2 op_sel_hi:[0,0,1]" : "+v"(s) : "v"(c[2*q]), "v"(t));
+        asm("v_fma_mixhi_f16 %0, %1, 1.0, %2 op_sel:[0,0,1] op_sel_hi:[0,0,1]" : "+v"(s) : "v"(c[2*q+1]), "v"(t));
+        const h2 v = __builtin_bit_cast(h2, s);
+        body[2*q] = float(v[0]); body[2*q+1] = float(v[1]);
+    }
+}
+// h(ex * d) of eight halves (held as floats) by one half, two at a time.
+__device__ inline void hmul8f(const float* ex, _Float16 d, float* v) {
+    for (int q = 0; q < 4; ++q) {
+        const h2 x = {(_Float16)ex[2*q], (_Float16)ex[2*q+1]};
+        const h2 y = x*(h2)d;
+        v[2*q] = float(y[0]); v[2*q+1] = float(y[1]);
+    }
+}
 // The f32-add-then-half form of acc_add (RESIDENT_SR=0).
 __device__ inline void acc_add2(h8& acc, const acc8& part) {
     for (int e = 0; e < 8; ++e) acc[e] = (_Float16)(float(acc[e]) + part[e]);

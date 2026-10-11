@@ -443,7 +443,7 @@ __global__ __launch_bounds__(128/TT) void k_c32_t(const float* in, const float* 
         op8 pb[4];
         for (int k = 0; k < 4; ++k) {
             float v[8];
-            for (int e = 0; e < 8; ++e) v[e] = wmma_t::hmul(ex[k][e], den);
+            wmma_t::hmul8f(ex[k], (_Float16)den, v);
             pb[k] = pack_in(v);  // probabilities: in [0, 1]
         }
         // Context^T in two 32-key slices, then the projection.
@@ -464,7 +464,7 @@ __global__ __launch_bounds__(128/TT) void k_c32_t(const float* in, const float* 
             for (int o = 0; o < 2; ++o) {
                 acc8 c = {};
                 c = mma(arow(Wp + o*16*32, 32, 16), cb[1], mma(arow(Wp + o*16*32, 32, 0), cb[0], c));
-                for (int e = 0; e < 8; ++e) body[o][e] = wmma_t::mix_sum(c[e], c32f_h(float(ffn[u][o][e])*g2[o*16 + h*8 + e]));
+                wmma_t::proj_body(c, ffn[u][o], g2 + o*16 + h*8, body[o]);
             }
             if constexpr (MODE == 1) {
                 // skip0 (k_front_native32, clamped) and the pool (k_front_pool).
@@ -537,7 +537,7 @@ __global__ __launch_bounds__(128/TT) void k_c32_t(const float* in, const float* 
             acc8 c = {};
             c = mma(arow(Wp + o*16*32, 32, 16), cb[1], mma(arow(Wp + o*16*32, 32, 0), cb[0], c));
             float body[8];
-            for (int e = 0; e < 8; ++e) body[e] = wmma_t::mix_sum(c[e], c32f_h(float(ffn[u][o][e])*g2[o*16 + h*8 + e]));
+            wmma_t::proj_body(c, ffn[u][o], g2 + o*16 + h*8, body);  // h(c + h(ffn*g2))
             if (TT == 1 && fz.pool) {
                 for (int e = 0; e < 8; ++e) {  // all lanes: the shuffles need the partners
                     const float a = h70_h(body[e] + __shfl_xor(body[e], 1));
