@@ -45,7 +45,7 @@ class Prefix {
     Buffer weights, scale, low, merged;
     bool ready = false;
     std::unique_ptr<Buffer> merged8;  // byte_out: the merge as E4M3 bytes
-    bool wrote8 = false;
+    bool wrote8 = false, low_half = false;
 public:
     size_t comparisons = 0;
     // byte_out: the fast path reads byte inputs/skips and writes the merge as bytes.
@@ -60,16 +60,28 @@ public:
             !check(dir,"skip",skip.data,out_n,verify,comparisons)) return false;
         wrote8 = byte_out && !verify && !c512_resident::exact_math;
         if ((input.fmt || skip.fmt) && (verify || c512_resident::exact_math)) return false;
+        // The fast merge (k_upsample_merge8) reads low as halves when the
+        // projection could write them.
+        const bool fast = wrote8 && skip.fmt == 1;
+        low_half = false;
         tiled::gemm<tiled::Split,tiled::RAW,false>(c512_resident::stream,input.fmt?nullptr:input.data,256,weights.data,256,nullptr,0,nullptr,
-            low.data,nullptr,128,width*height,128,1,0,0,0,1,input.fmt==1?reinterpret_cast<const unsigned char*>(input.data):nullptr);  // k_upsample56_project
+            low.data,nullptr,128,width*height,128,1,0,0,0,1,input.fmt==1?reinterpret_cast<const unsigned char*>(input.data):nullptr,nullptr,
+            fast ? reinterpret_cast<_Float16*>(low.data.get()) : nullptr, &low_half);  // k_upsample56_project
         if (wrote8 && !merged8) merged8.reset(new Buffer((out_n+3)/4));
+        if (low_half) {
+            const size_t threads = out_n/8;
+            hipLaunchKernelGGL(k_upsample_merge8<128>, dim3((threads+255)/256), dim3(256), 0, c512_resident::stream,
+                               reinterpret_cast<const _Float16*>(low.data.get()), reinterpret_cast<const unsigned char*>(skip.data),
+                               scale.data, reinterpret_cast<unsigned char*>(merged8->data.get()), width, height);
+            HIP_CHECK(hipGetLastError());
+        } else
         C128_LAUNCH(k_upsample56_merge, out_n, low.data,skip.data,scale.data,wrote8 ? merged8->data.get() : merged.data.get(),width,height,skip.fmt,int(wrote8));
         if (!check(dir,"low",low.data,n/2,verify,comparisons) ||
             !check(dir,"merged",merged.data,out_n,verify,comparisons)) return false;
         ready = true;
         return true;
     }
-    DeviceTensor low_view() const { return ready ? DeviceTensor{low.data,n/2} : DeviceTensor{}; }
+    DeviceTensor low_view() const { return ready ? DeviceTensor{low.data,n/2,low_half ? 2 : 0} : DeviceTensor{}; }
     DeviceTensor final_view() const {
         return !ready ? DeviceTensor{} : wrote8 ? DeviceTensor{merged8->data.get(),out_n,1} : DeviceTensor{merged.data.get(),out_n};
     }

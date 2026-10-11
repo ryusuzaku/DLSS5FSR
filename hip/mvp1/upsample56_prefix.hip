@@ -1,6 +1,7 @@
 // Standalone block56 C256->C128 projection and nearest upsample/skip merge.
 // The C128 Swin body and original encoder14 skip are outside this fixture.
 #include "split512_block.hip"
+#include "upsample_merge8.hip"
 
 __global__ void k_upsample56_project(const float* input,const float* weights,
                                      float* low,int tokens) {
