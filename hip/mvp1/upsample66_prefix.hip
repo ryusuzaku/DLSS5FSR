@@ -39,3 +39,30 @@ __global__ void k_upsample66_merge(const float* low,const float* skip,
     if(out_half) reinterpret_cast<_Float16*>(merged)[i]=split512_to_half(total);
     else merged[i]=split512_half(total);
 }
+
+// k_upsample66_merge's fast form (S340): low as halves (the RAW projection
+// writes them, wmma_gemm out16), the skip as E4M3 bytes, merged as halves;
+// one thread per eight channels of an output pixel (vector loads and
+// stores), the same per-element arithmetic.
+__global__ void k_upsample66_merge8(const _Float16* low,const unsigned char* skip,
+                                    const float* scale,_Float16* merged,
+                                    int width,int height,int skip_peer) {
+    typedef _Float16 h8 __attribute__((ext_vector_type(8)));
+    const int i=blockIdx.x*blockDim.x+threadIdx.x;  // (pixel, channel octet)
+    const int outwidth=2*width,outheight=2*height;
+    if(i>=outwidth*outheight*4)return;
+    const int c0=(i%4)*8,p=i/4,x=p%outwidth,y=p/outwidth;
+    const h8 main=*reinterpret_cast<const h8*>(low+((y/2)*width+x/2)*32+c0);
+    const uint4 group=*reinterpret_cast<const uint4*>(skip+size_t(p)*32+(c0&~15));  // the channel's 16-byte group
+    const unsigned char* g=reinterpret_cast<const unsigned char*>(&group);
+    h8 out;
+    for(int e=0;e<8;++e) {
+        const int c=c0+e;
+        const int sc=skip_peer?((c&~15)|(c&1)|((c&2)<<2)|((c&4)>>1)|((c&8)>>1)):c;
+        const float sv=__builtin_amdgcn_cvt_f32_fp8(int(g[sc&15]),0);
+        const float product=sv*scale[c];
+        const float total=float(main[e])+product;
+        out[e]=split512_to_half(total);
+    }
+    *reinterpret_cast<h8*>(merged+size_t(p)*32+c0)=out;
+}

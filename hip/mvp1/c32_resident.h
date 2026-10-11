@@ -211,7 +211,7 @@ class Prefix {
     size_t n, out_n;
     std::string dir;
     Buffer weights, scale, low, merged, merged_h;
-    bool ready = false, wrote_half = false;
+    bool ready = false, wrote_half = false, low_half = false;
 public:
     size_t comparisons = 0;
     // half_out: the fast path stores the (half-valued) merge as halves.
@@ -225,11 +225,23 @@ public:
         if (!check(dir,"input",input.data,n,verify,comparisons) ||
             !check(dir,"skip",skip.data,out_n,verify,comparisons)) return false;
         if (input.fmt && (verify || c512_resident::exact_math)) return false;
+        wrote_half = half_out && !verify && !c512_resident::exact_math;
+        // The fast merge (k_upsample66_merge8) reads low as halves when the
+        // projection could write them.
+        const bool fast = wrote_half && skip.fmt == 1;
+        low_half = false;
         tiled::gemm<tiled::Split,tiled::RAW,false>(c512_resident::stream,input.fmt?nullptr:input.data,64,weights.data,64,nullptr,0,nullptr,
             low.data,nullptr,32,width*height,32,1,0,0,0,1,
-            input.fmt==1?reinterpret_cast<const unsigned char*>(input.data):nullptr);  // k_upsample66_project
-        wrote_half = half_out && !verify && !c512_resident::exact_math;
+            input.fmt==1?reinterpret_cast<const unsigned char*>(input.data):nullptr,nullptr,
+            fast ? reinterpret_cast<_Float16*>(low.data.get()) : nullptr, &low_half);  // k_upsample66_project
         if (skip.fmt && (verify || c512_resident::exact_math)) return false;
+        if (low_half) {
+            const size_t threads = out_n/8;
+            hipLaunchKernelGGL(k_upsample66_merge8, dim3((threads+255)/256), dim3(256), 0, c512_resident::stream,
+                               reinterpret_cast<const _Float16*>(low.data.get()), reinterpret_cast<const unsigned char*>(skip.data),
+                               scale.data, reinterpret_cast<_Float16*>(merged_h.data.get()), width, height, int(skip_peer));
+            HIP_CHECK(hipGetLastError());
+        } else
         C32_LAUNCH(k_upsample66_merge, out_n, low.data,skip.data,scale.data,wrote_half ? merged_h.data.get() : merged.data.get(),
                    width,height,int(skip_peer),skip.fmt,int(wrote_half));
         if (!check(dir,"low",low.data,n/2,verify,comparisons) ||
@@ -237,7 +249,7 @@ public:
         ready = true;
         return true;
     }
-    DeviceTensor low_view() const { return ready ? DeviceTensor{low.data,n/2} : DeviceTensor{}; }
+    DeviceTensor low_view() const { return ready ? DeviceTensor{low.data,n/2,low_half ? 2 : 0} : DeviceTensor{}; }
     DeviceTensor final_view() const {
         return !ready ? DeviceTensor{} : wrote_half ? DeviceTensor{merged_h.data.get(),out_n,2} : DeviceTensor{merged.data.get(),out_n};
     }
