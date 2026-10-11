@@ -228,8 +228,12 @@ public:
                 // qkv on the HWC tokens; the fused attention gathers its
                 // windows (zero rows for padding) and writes the context to
                 // HWC: no gather or scatter pass.
+                // qkv as halves in the same buffer when the attention reads
+                // them (half the traffic both ways; the values are halves).
+                bool qkv_half = false;
                 tiled::gemm<tiled::Split,tiled::RAW,false>(c512_resident::stream, feature.data, 512, w.qkv.data, 512, nullptr, 0, nullptr,
-                    qkv.data, nullptr, 1536, tokens, 1536, 1, 0, 0, 0, 1, b8 ? bytes(feature8) : nullptr);
+                    qkv.data, nullptr, 1536, tokens, 1536, 1, 0, 0, 0, 1, b8 ? bytes(feature8) : nullptr, nullptr,
+                    c512_resident::attention_half_qkv() ? reinterpret_cast<_Float16*>(qkv.data.get()) : nullptr, &qkv_half);
                 WindowIo io;
                 io.hwc = 1; io.width = width; io.height = height; io.px = px; io.py = py;
                 io.pw = ((width+px+7)/8)*8;
@@ -237,7 +241,8 @@ public:
                 // The context's floats only when no bytes replace them.
                 c512_resident::fused_attention(qkv.data, w.scales.data, w.bias.data,
                                                b8 && c512_resident::attention_t ? nullptr : crop.data.get(), wt, 512, &io,
-                                               b8 ? bytes(crop8) : nullptr, &crop_bytes);
+                                               b8 ? bytes(crop8) : nullptr, &crop_bytes,
+                                               qkv_half ? reinterpret_cast<const _Float16*>(qkv.data.get()) : nullptr);
                 tiled::gemm<tiled::Split,tiled::FP8,true>(c512_resident::stream, crop_bytes ? nullptr : crop.data.get(), 512, w.final.data, 512, feature.data, 512,
                     w.final_skip.data, output, raw_output.data, 512, tokens, 512, 1, 0, 0, 0, 1,
                     crop_bytes ? bytes(crop8) : nullptr, output8);

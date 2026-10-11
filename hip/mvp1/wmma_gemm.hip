@@ -305,7 +305,7 @@ __global__ __launch_bounds__(32*WAVES) void k_wmma_gemm8t(
         const float* __restrict__ R, int ldr, const float* __restrict__ S,
         float* out, float* out2, int ldo, int T, int O,
         long long gx, long long gw, long long go, int parts, float* partial,
-        const unsigned char* __restrict__ X8 = nullptr, unsigned char* out8 = nullptr) {
+        const unsigned char* __restrict__ X8 = nullptr, unsigned char* out8 = nullptr, _Float16* out16 = nullptr) {
     constexpr int LX = TK + 16, THREADS = 32*WAVES;
     __shared__ __attribute__((aligned(16))) unsigned char xs[64*LX];
     const int tid = threadIdx.x, wave = tid/32, lane = tid%32, n = lane%16, h = lane/16;
@@ -426,7 +426,11 @@ __global__ __launch_bounds__(32*WAVES) void k_wmma_gemm8t(
         const size_t at = size_t(t)*ldo + o0+h*8;
         float v[8];
         if constexpr (EPI == RAW) {
-            if (out) put(out + at, a);  // out may be null when only the bytes (out8) are wanted
+            if (out16) {  // RAW values are halves: 16 bytes instead of 32
+                wmma_t::h8 hv;
+                for (int e = 0; e < 8; ++e) hv[e] = (_Float16)a[e];
+                *reinterpret_cast<wmma_t::h8*>(out16 + at) = hv;
+            } else if (out) put(out + at, a);  // out may be null when only the bytes (out8) are wanted
         } else if constexpr (EPI == FP8) {
             for (int e = 0; e < 8; ++e) v[e] = P::fp8(a[e]);
             if (out) put(out + at, v);
@@ -561,8 +565,12 @@ template<class P, int EPI, bool RESIDUAL>
 inline bool gemm(hipStream_t stream, const float* X, int ldx, c512_resident::WeightRef W, int K,
                  const float* R, int ldr, const float* S, float* out, float* out2, int ldo,
                  int T, int O, int groups, long long gx, long long gw, long long go, int parts,
-                 const unsigned char* X8 = nullptr, unsigned char* out8 = nullptr, bool* wrote8 = nullptr) {
+                 const unsigned char* X8 = nullptr, unsigned char* out8 = nullptr, bool* wrote8 = nullptr,
+                 _Float16* out16 = nullptr, bool* wrote16 = nullptr) {
+    // out16 (optional, RAW): the outputs as halves (exact: RAW values are
+    // half-rounded) instead of floats; *wrote16 says whether this call did.
     if (wrote8) *wrote8 = false;
+    if (wrote16) *wrote16 = false;
     // 16-byte weight rows/slices; K whole slices in every partition.
     if (K % 32 || (K/parts) % 32 || gw % 8) return false;
     const size_t wcount = size_t(groups-1)*gw + size_t(O)*K;
@@ -590,14 +598,16 @@ inline bool gemm(hipStream_t stream, const float* X, int ldx, c512_resident::Wei
         if (X8 && (ldx % 16 || gx % 16)) X8 = nullptr;
         unsigned char* o8 = !partial && ldo % 8 == 0 && go % 8 == 0 ? out8 : nullptr;
         if (wrote8) *wrote8 = o8 != nullptr || (partial && EPI == FP8 && out8);
+        _Float16* o16 = EPI == RAW && !partial && ldo % 8 == 0 && go % 8 == 0 ? out16 : nullptr;
+        if (wrote16) *wrote16 = o16 != nullptr;
         // Byte input: 256-deep chunks (a quarter of the barriers) when K allows.
         const bool wide = X8 && chunk256 && (K/parts) % 256 == 0;
         const bool sr = std::is_same<P, tiled::Split>::value && wmma_t::single_round;
 #define GEMMT_LAUNCH(W, TKV) do { \
             if (sr) hipLaunchKernelGGL((k_wmma_gemm8t<P,EPI,RESIDUAL,W,TKV,true>), dim3(O/(16*W), (T+63)/64, zdim), \
-                                       dim3(32*W), 0, stream, X, ldx, w8, K, R, ldr, S, out, out2, ldo, T, O, gx, gw, go, parts, partial, X8, o8); \
+                                       dim3(32*W), 0, stream, X, ldx, w8, K, R, ldr, S, out, out2, ldo, T, O, gx, gw, go, parts, partial, X8, o8, o16); \
             else hipLaunchKernelGGL((k_wmma_gemm8t<P,EPI,RESIDUAL,W,TKV>), dim3(O/(16*W), (T+63)/64, zdim), \
-                                    dim3(32*W), 0, stream, X, ldx, w8, K, R, ldr, S, out, out2, ldo, T, O, gx, gw, go, parts, partial, X8, o8); \
+                                    dim3(32*W), 0, stream, X, ldx, w8, K, R, ldr, S, out, out2, ldo, T, O, gx, gw, go, parts, partial, X8, o8, o16); \
         } while (0)
         if (O % 128 == 0 && size_t(O/128)*((T+63)/64)*zdim >= 256) { if (wide) GEMMT_LAUNCH(8, 256); else GEMMT_LAUNCH(8, TKC); }
         else if (O % 64 == 0) { if (wide) GEMMT_LAUNCH(4, 256); else GEMMT_LAUNCH(4, TKC); }

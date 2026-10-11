@@ -147,7 +147,7 @@ __global__ __launch_bounds__(256) void k_split512_attention_wmma(
 // context's E4M3 bytes for the next GEMM.
 __global__ __launch_bounds__(128) void k_split512_attention_t(
         const float* __restrict__ qkv, const float* __restrict__ scales, const float* __restrict__ bias,
-        float* context, unsigned char* context8, int channels, WindowIo io) {
+        float* context, unsigned char* context8, int channels, WindowIo io, const _Float16* __restrict__ qkvh = nullptr) {
     using namespace wmma_t;
     __shared__ __attribute__((aligned(16))) unsigned char Ks[64*32];  // [key][d]
     __shared__ __attribute__((aligned(16))) unsigned char Vt[32*64];  // [d][key]
@@ -155,14 +155,21 @@ __global__ __launch_bounds__(128) void k_split512_attention_t(
     const int tid = threadIdx.x, wave = tid/32, lane = tid%32, n = lane%16, h = lane/16;
     const int token = wave*16 + n;
     const long long r = io.row(win, token);
-    const float* row = qkv + (r < 0 ? 0 : r)*3*channels + head*32;
-    // Raw qkv is half-valued (RAW GEMM epilogue); padding tokens read zero.
+    const size_t row = size_t(r < 0 ? 0 : r)*3*channels + head*32;
+    // Raw qkv is half-valued (RAW GEMM epilogue), as floats or (qkvh) as
+    // the halves themselves; padding tokens read zero.
     float x[3][2][8];
     for (int m = 0; m < 3; ++m)
         for (int t = 0; t < 2; ++t) {
-            const float4* p = reinterpret_cast<const float4*>(row + m*channels + t*16 + h*8);
-            const float4 lo = p[0], hi = p[1];
-            const float v[8] = {lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
+            float v[8];
+            if (qkvh) {
+                const h8 hv = *reinterpret_cast<const h8*>(qkvh + row + m*channels + t*16 + h*8);
+                for (int e = 0; e < 8; ++e) v[e] = float(hv[e]);
+            } else {
+                const float4* p = reinterpret_cast<const float4*>(qkv + row + m*channels + t*16 + h*8);
+                const float4 lo = p[0], hi = p[1];
+                v[0] = lo.x; v[1] = lo.y; v[2] = lo.z; v[3] = lo.w; v[4] = hi.x; v[5] = hi.y; v[6] = hi.z; v[7] = hi.w;
+            }
             for (int e = 0; e < 8; ++e) x[m][t][e] = r < 0 ? 0.0f : hf(v[e]);
         }
     op8 qb[2];
@@ -229,15 +236,23 @@ namespace c512_resident {
 // k_split512_attention_t. context8 (optional, transposed only): the
 // context's E4M3 bytes; *wrote8 says whether they were written.
 inline bool attention_t = [] { const char* v = getenv("RESIDENT_ATTN_T"); return !(v && *v == '0'); }();
+// Whether fused_attention can take qkv as halves (the transposed kernel).
+#if defined(H70_NO_FP8)
+inline bool attention_half_qkv() { return false; }
+#else
+inline bool attention_half_qkv() { return attention_t; }
+#endif
 inline bool fused_attention(const float* qkv, const float* scales, const float* bias,
                             float* context, int tokens, int channels, const WindowIo* io = nullptr,
-                            unsigned char* context8 = nullptr, bool* wrote8 = nullptr) {
+                            unsigned char* context8 = nullptr, bool* wrote8 = nullptr,
+                            const _Float16* qkvh = nullptr) {
+    // qkvh (optional): qkv as halves instead (the transposed kernel only).
     if (wrote8) *wrote8 = false;
     if (exact_math || tokens % 64 || channels % 32) return false;
 #if !defined(H70_NO_FP8)
     if (attention_t) {
         hipLaunchKernelGGL(k_split512_attention_t, dim3(tokens/64, channels/32), dim3(128), 0, stream,
-                           qkv, scales, bias, context, context8, channels, io ? *io : WindowIo());
+                           qkv, scales, bias, context, context8, channels, io ? *io : WindowIo(), qkvh);
         HIP_CHECK(hipGetLastError());
         if (wrote8) *wrote8 = context8 != nullptr;
         if (launch_hook) launch_hook("k_split512_attention_t");

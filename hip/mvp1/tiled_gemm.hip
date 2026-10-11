@@ -116,13 +116,17 @@ template<class P, int EPI, bool RESIDUAL>
 inline void gemm(hipStream_t stream, const float* X, int ldx, c512_resident::WeightRef W, int K,
                  const float* R, int ldr, const float* S, float* out, float* out2, int ldo,
                  int T, int O, int groups = 1, long long gx = 0, long long gw = 0, long long go = 0,
-                 int parts = 1, const unsigned char* X8 = nullptr, unsigned char* out8 = nullptr) {
+                 int parts = 1, const unsigned char* X8 = nullptr, unsigned char* out8 = nullptr,
+                 _Float16* out16 = nullptr, bool* wrote16 = nullptr) {
+    // out16 (optional, RAW, may alias out): halves instead of floats when the
+    // WMMA path can; *wrote16 says which of the two holds the result.
+    if (wrote16) *wrote16 = false;
     // X8 / out8: E4M3 byte copies of X / the FP8 output (wmma_gemm::gemm).
     // out8 is always written: by the GEMM when it can, else from the floats.
     bool wrote8 = false;
     const bool wmma = wmma_gemm::enabled && !c512_resident::exact_math &&
         wmma_gemm::gemm<P,EPI,RESIDUAL>(stream, X, ldx, W, K, R, ldr, S, out, out2, ldo, T, O, groups, gx, gw, go, parts,
-                                        X8, out8, &wrote8);
+                                        X8, out8, &wrote8, out16, wrote16);
     // Narrow outputs use taller tiles so no thread idles; the arithmetic per
     // output is identical for every tile shape.
     if (wmma) {
