@@ -2,6 +2,7 @@
 // Candidate inverse bridge and block39; no arithmetic changes to the kernels.
 #include "resident_index_map.h"
 #include "decoder39_entry.hip"
+#include "tiled_gemm.hip"
 #include <stdexcept>
 
 namespace decoder39_resident {
@@ -59,8 +60,17 @@ public:
         hipLaunchKernelGGL(k_decoder39_inverse, dim3((n+255)/256), dim3(256), 0, c512_resident::stream,
                            vit.data, inverse.data, main.data, int(n));
         HIP_CHECK(hipGetLastError());
-        hipLaunchKernelGGL(k_decoder39_project, dim3((projected.count+255)/256), dim3(256), 0, c512_resident::stream,
-                           main.data, weights.data, projected.data, tokens);
+        if (!verify && !c512_resident::exact_math) {
+            // The same product as k_decoder39_project (32-deep slices onto a
+            // half accumulator, four 256-deep partitions combined in order:
+            // the split policy, RAW epilogue) on the FP8 WMMA GEMM; the
+            // weights and the ViT output are E4M3 values.
+            tiled::gemm<tiled::Split,tiled::RAW,false>(c512_resident::stream, main.data, 1024, weights.data, 1024, nullptr, 0, nullptr,
+                projected.data, nullptr, 512, tokens, 512, 1, 0, 0, 0, 4);
+        } else {
+            hipLaunchKernelGGL(k_decoder39_project, dim3((projected.count+255)/256), dim3(256), 0, c512_resident::stream,
+                               main.data, weights.data, projected.data, tokens);
+        }
         HIP_CHECK(hipGetLastError());
         hipLaunchKernelGGL(k_decoder39_upsample_skip, dim3((skip_n+255)/256), dim3(256), 0, c512_resident::stream,
                            projected.data, skip.data, scale.data, output.data, width, height);
