@@ -114,6 +114,29 @@ __device__ inline op8 gate_pack(h8 a) {
     hi = __builtin_amdgcn_cvt_pk_fp8_f32(v[6], v[7], hi, true);
     return op8{lo, hi};
 }
+// norm_inverse of a token's 32 halves (a: v[h*8+e], b: v[16+h*8+e]) with
+// the squares in packed f16: the same operations elementwise.
+__device__ inline float norm_inverse_h(h8 a, h8 b) {
+    _Float16 p[4];
+    for (int q = 0; q < 4; ++q) {
+        const h2 x = {a[2*q], a[2*q+1]}, y = {b[2*q], b[2*q+1]};
+        const h2 s = __builtin_elementwise_fma(x, x, y*y);
+        p[q] = s[0] + s[1];
+    }
+    for (int q = 0; q < 4; ++q) p[q] = p[q] + (_Float16)__shfl_xor(float(p[q]), 16);
+    const float total = float((p[0] + p[2]) + (p[1] + p[3]));
+    return hf(1.f/sqrtf(fmaxf(total, .00006198883056640625f)));
+}
+// h(v * k) of eight halves by one half, two at a time.
+__device__ inline h8 hmul8(h8 v, _Float16 k) {
+    h8 r;
+    for (int q = 0; q < 4; ++q) {
+        const h2 x = {v[2*q], v[2*q+1]};
+        const h2 y = x*(h2)k;
+        r[2*q] = y[0]; r[2*q+1] = y[1];
+    }
+    return r;
+}
 // The f32-add-then-half form of acc_add (RESIDENT_SR=0).
 __device__ inline void acc_add2(h8& acc, const acc8& part) {
     for (int e = 0; e < 8; ++e) acc[e] = (_Float16)(float(acc[e]) + part[e]);

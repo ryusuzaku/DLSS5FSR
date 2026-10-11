@@ -289,6 +289,26 @@ __global__ __launch_bounds__(128/TT) void k_c32_t(const float* in, const float* 
         }
         for (int s = 0; s < 2; ++s) {
             float v[8], x[8];
+            if constexpr (MODE == 0 && BYTES) {
+                // E4M3 input: the bytes are the B operand already (an E4M3
+                // value is a half, and packing it again gives its own byte);
+                // only the residual needs the values. Permuted: the four
+                // native pairs s*16 + 4q + 2h.
+                const unsigned short* p = reinterpret_cast<const unsigned short*>(
+                    reinterpret_cast<const unsigned char*>(in) + (b < 0 ? 0 : b) + s*16);
+                unsigned lo, hi;
+                if (!io.permute) {
+                    const uint2 w = *reinterpret_cast<const uint2*>(p + 4*h);
+                    lo = w.x; hi = w.y;
+                } else {
+                    lo = unsigned(p[h]) | unsigned(p[2+h]) << 16;
+                    hi = unsigned(p[4+h]) | unsigned(p[6+h]) << 16;
+                }
+                if (b < 0) lo = hi = 0;
+                xb[u][s] = op8{int(lo), int(hi)};
+                for (int e = 0; e < 8; ++e) ffn[u][s][e] = (_Float16)(fp8_at(e < 4 ? lo : hi, e % 4)*g1[s*16 + h*8 + e]);
+                continue;
+            }
             if constexpr (MODE == 1) {
                 for (int e = 0; e < 8; ++e) {
                     const int c = s*16 + h*8 + e;
@@ -386,14 +406,13 @@ __global__ __launch_bounds__(128/TT) void k_c32_t(const float* in, const float* 
                 }
                 continue;
             }
-            float v0[8], v1[8], p[4], s[8];
-            for (int e = 0; e < 8; ++e) { v0[e] = c32f_h(c0[e]); v1[e] = c32f_h(c1[e]); }
-            const float inverse = wmma_t::norm_inverse(v0, v1);
-            for (int e = 0; e < 8; ++e) {
-                float q0 = wmma_t::hmul(v0[e], inverse), q1 = wmma_t::hmul(v1[e], inverse);
-                if (m == 0) { q0 = wmma_t::hmul(q0, head_scale); q1 = wmma_t::hmul(q1, head_scale); }
-                v0[e] = q0; v1[e] = q1;
-            }
+            // Packed f16 (wmma_t::norm_inverse_h, hmul8): the same operations.
+            wmma_t::h8 h0 = __builtin_convertvector(c0, wmma_t::h8), h1 = __builtin_convertvector(c1, wmma_t::h8);
+            const _Float16 inverse = (_Float16)wmma_t::norm_inverse_h(h0, h1);
+            h0 = wmma_t::hmul8(h0, inverse); h1 = wmma_t::hmul8(h1, inverse);
+            if (m == 0) { h0 = wmma_t::hmul8(h0, (_Float16)head_scale); h1 = wmma_t::hmul8(h1, (_Float16)head_scale); }
+            float v0[8], v1[8];
+            for (int e = 0; e < 8; ++e) { v0[e] = float(h0[e]); v1[e] = float(h1[e]); }
             if (m == 0) {
                 qb[u][0] = pack(v0); qb[u][1] = pack(v1);
             } else {
