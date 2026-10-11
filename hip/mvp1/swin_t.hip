@@ -30,6 +30,8 @@ using wmma_t::single_round;  // RESIDENT_SR (wmma_t.hip)
 inline bool tiles2 = [] { const char* v = getenv("RESIDENT_SWIN_TT"); return !(v && *v == '0'); }();
 // RESIDENT_SWIN_LP=0: the projection inside the head loop (k_swin_t's LP).
 inline bool late_projection = [] { const char* v = getenv("RESIDENT_SWIN_LP"); return !(v && *v == '0'); }();
+// RESIDENT_SWIN_WS=0: the C256 FFN weights streamed by every wave (k_swin_t's WS).
+inline bool stage_weights = [] { const char* v = getenv("RESIDENT_SWIN_WS"); return !(v && *v == '0'); }();
 
 // Storage formats of a block's input, quantized output and raw output (S336):
 // 0 float, 1 E4M3 byte, 2 half (raw only); element addressing either way.
@@ -46,16 +48,29 @@ __device__ inline void load8(const float* p, float* v) {
 // this wave's slice of LDS, then every feature tile takes its residual and
 // the heads' K slices in order (the same sums): the 16-tile residual is no
 // longer live through the attention, which spilled at C256.
-template<int C, bool SR = false, bool LP = false>
+// WS: each FFN step's weights (W1 rows 32j.., the W2 column slice 32j..)
+// staged in LDS once per workgroup and shared by its four waves, instead of
+// every wave streaming them from L2 (S339: the C256 block runs ~2x faster
+// with the weights cache-resident). The staging area overlaps the attention's
+// K/V and context buffers (used only after the FFN).
+template<int C, bool SR = false, bool LP = false, bool WS = false>
 __global__ __launch_bounds__(128) void k_swin_t(const float* __restrict__ input, Geometry g,
         const u8* __restrict__ w1, const u8* __restrict__ w2, const u8* __restrict__ w3,
         const float* __restrict__ skip, const u8* __restrict__ wqkv, const float* __restrict__ scales,
         const float* __restrict__ bias, const u8* __restrict__ wp, const float* __restrict__ attention_skip,
         float* output, float* raw_out, SwinIo sio = SwinIo()) {
     constexpr int FT = C/16, KS = C/32, HEADS = C/32, HID = 4*C;
-    __shared__ __attribute__((aligned(16))) u8 Ks[2][64*32];  // [key][d], per head parity
-    __shared__ __attribute__((aligned(16))) u8 Vt[2][32*64];  // [d][key]
-    __shared__ op8 Cs[LP ? 4 : 1][LP ? HEADS : 1][2][32];      // LP: context B operands, per wave
+    // LDS: K [parity][key][d], V^T [parity][d][key], LP's context B operands
+    // [wave][head][2][lane]; WS's staged weights in the same bytes before.
+    constexpr int KV = 2*64*32 + 2*32*64, CSB = LP ? 4*HEADS*2*32*8 : 0;
+    constexpr int L1 = C + 16, L2 = 48;  // padded rows (no bank conflicts on the A fragments)
+    constexpr int WSB = WS ? 32*L1 + C*L2 : 0, SMEM = KV + CSB > WSB ? KV + CSB : WSB;
+    __shared__ __attribute__((aligned(16))) u8 smem[SMEM];
+    u8 (*Ks)[64*32] = reinterpret_cast<u8 (*)[64*32]>(smem);
+    u8 (*Vt)[32*64] = reinterpret_cast<u8 (*)[32*64]>(smem + 2*64*32);
+    op8 (*Cs)[HEADS][2][32] = reinterpret_cast<op8 (*)[HEADS][2][32]>(smem + KV);
+    u8* S1 = smem;            // WS: W1 rows 32j..32j+31, all C columns
+    u8* S2 = smem + 32*L1;    // WS: W2 rows 0..C-1, columns 32j..32j+31
     const int tid = threadIdx.x, wave = tid/32, lane = tid%32, n = lane%16, h = lane/16;
     const int token = wave*16 + n, win = blockIdx.x;
     int px, py;
@@ -76,15 +91,28 @@ __global__ __launch_bounds__(128) void k_swin_t(const float* __restrict__ input,
     for (int f = 0; f < FT; ++f) mid[f] = h8{};
 #pragma unroll 1
     for (int j = 0; j < HID/32; ++j) {
+        if constexpr (WS) {
+            __syncthreads();  // the previous step's weights are consumed
+            for (int i = tid; i < 32*C/16; i += 128) {
+                const int row = i / (C/16), col = (i % (C/16))*16;
+                *reinterpret_cast<uint4*>(S1 + row*L1 + col) = *reinterpret_cast<const uint4*>(w1 + size_t(32*j + row)*C + col);
+            }
+            for (int i = tid; i < 2*C; i += 128) {
+                const int row = i / 2, col = (i % 2)*16;
+                *reinterpret_cast<uint4*>(S2 + row*L2 + col) = *reinterpret_cast<const uint4*>(w2 + size_t(row)*HID + 32*j + col);
+            }
+            __syncthreads();
+        }
         op8 hb[2];
         for (int u = 0; u < 2; ++u) {
-            const u8* wr = w1 + size_t((2*j+u)*16)*C;
+            const u8* wr = WS ? S1 + u*16*L1 : w1 + size_t((2*j+u)*16)*C;
+            constexpr int lw = WS ? L1 : C;
             float v[8];
             if constexpr (SR) {
                 h8 ha = {};
                 for (int k = 0; k < KS; ++k) {
                     acc8 part = {};
-                    part = mma(arow(wr, C, 32*k+16), xb[2*k+1], mma(arow(wr, C, 32*k), xb[2*k], part));
+                    part = mma(arow(wr, lw, 32*k+16), xb[2*k+1], mma(arow(wr, lw, 32*k), xb[2*k], part));
                     wmma_t::acc_add(ha, part);
                 }
                 for (int e = 0; e < 8; ++e) v[e] = c32t::gate(float(ha[e]));
@@ -92,7 +120,7 @@ __global__ __launch_bounds__(128) void k_swin_t(const float* __restrict__ input,
                 float acc[8] = {};
                 for (int k = 0; k < KS; ++k) {
                     acc8 part = {};
-                    part = mma(arow(wr, C, 32*k+16), xb[2*k+1], mma(arow(wr, C, 32*k), xb[2*k], part));
+                    part = mma(arow(wr, lw, 32*k+16), xb[2*k+1], mma(arow(wr, lw, 32*k), xb[2*k], part));
                     for (int e = 0; e < 8; ++e) acc[e] = c32f_h(acc[e]+part[e]);
                 }
                 for (int e = 0; e < 8; ++e) v[e] = c32t::gate(acc[e]);
@@ -100,9 +128,12 @@ __global__ __launch_bounds__(128) void k_swin_t(const float* __restrict__ input,
             hb[u] = pack(v);
         }
         for (int f = 0; f < FT; ++f) {
-            const u8* wr = w2 + size_t(f*16)*HID;
             acc8 part = {};
-            part = mma(arow(wr, HID, 32*j+16), hb[1], mma(arow(wr, HID, 32*j), hb[0], part));
+            if constexpr (WS) part = mma(arow(S2 + f*16*L2, L2, 16), hb[1], mma(arow(S2 + f*16*L2, L2, 0), hb[0], part));
+            else {
+                const u8* wr = w2 + size_t(f*16)*HID;
+                part = mma(arow(wr, HID, 32*j+16), hb[1], mma(arow(wr, HID, 32*j), hb[0], part));
+            }
             if constexpr (SR) {
                 wmma_t::acc_add(mid[f], part);
             } else {
@@ -110,6 +141,7 @@ __global__ __launch_bounds__(128) void k_swin_t(const float* __restrict__ input,
             }
         }
     }
+    if constexpr (WS) __syncthreads();  // the staging bytes become K / V / context
     op8 mb[FT];
     for (int f = 0; f < FT; ++f) {
         float v[8];
@@ -485,7 +517,7 @@ inline bool run(const float* input, float* output, float* raw_out, int width, in
         // 250; a 320x92 block, E4M3 in and out, 0.63 -> 0.60 ms). C64 has no
         // spills to remove and measured no faster; at C128, TT=2, slower.
         auto kernel = sr ? k_swin_t<C, true, false> : k_swin_t<C, false, false>;
-        if constexpr (C == 256) if (late_projection) kernel = k_swin_t<C, false, true>;
+        if constexpr (C == 256) if (late_projection) kernel = stage_weights ? k_swin_t<C, false, true, true> : k_swin_t<C, false, true, false>;
         hipLaunchKernelGGL(kernel, dim3(windows), dim3(128), 0, s, input, g,
                            f8w(w.w1, size_t(4*C)*C), f8w(w.w2, size_t(C)*4*C), f8w(w.w3, size_t(C)*C), w.skip,
                            f8w(w.qkv, size_t(3*C)*C), w.scales, w.bias, f8w(w.projection, size_t(C)*C),
