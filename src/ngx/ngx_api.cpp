@@ -266,9 +266,43 @@ NVSDK_NGX_Result DoEvaluateD3D12(ID3D12GraphicsCommandList* cl,
         }
         if (depth) {
             const D3D12_RESOURCE_DESC dd = depth->GetDesc();
-            motion.depth = depth;
-            guideExtent(dd, motion.depthW, motion.depthH);
-            if (n == 0 || (n % 3000) == 0)
+            const char* extent = guideExtent(dd, motion.depthW, motion.depthH);
+            // A depth texture that cannot be this frame's. OptiScaler's NR
+            // pass hands a typed clone of the game's depth that it makes once
+            // and never re-creates: after a resolution change in game the
+            // clone keeps its old size and content (a 3413x960 picture of the
+            // previous view beside 1280x800 vectors), and the depth test and
+            // the disocclusion fill then ran on it. The caller states the
+            // extent its guides cover (the game's render size); a depth of
+            // another size is this frame's only when it shares the motion
+            // texture's allocation. Without that statement, a depth read over
+            // its whole extent has to have the shape of the vectors' region.
+            unsigned int callerW = 0, callerH = 0;
+            params->TryGetUI("DLSSNR.GuideWidth", callerW);
+            params->TryGetUI("DLSSNR.GuideHeight", callerH);
+            const bool asMotion = dd.Width == md.Width && dd.Height == md.Height;
+            bool usable = true;
+            if (asMotion) {
+                motion.depthW = motion.guideW;
+                motion.depthH = motion.guideH;
+            } else if (callerW && callerH) {
+                usable = dd.Width == callerW && dd.Height == callerH;
+            } else if (extent[0] == 'o') {
+                const float a = (float)dd.Width * (float)motion.guideH, b = (float)motion.guideW * (float)dd.Height;
+                usable = a > b * 0.98f && a < b * 1.02f;
+            }
+            static unsigned long long refused = 0;
+            const unsigned long long key = ((unsigned long long)dd.Width << 32) | dd.Height;
+            if (usable) {
+                motion.depth = depth;
+                refused = 0;
+            } else if (refused != key) {
+                refused = key;
+                LOGW("evaluate #%llu depth: %llux%u is not this frame's (guides %ux%u, motion %llux%u): depth "
+                     "left out until the caller hands a matching one", n, (unsigned long long)dd.Width, dd.Height,
+                     callerW, callerH, (unsigned long long)md.Width, md.Height);
+            }
+            if (usable && (n == 0 || (n % 3000) == 0))
                 LOGI("evaluate #%llu depth: %llux%u format %u guide %ux%u", n, (unsigned long long)dd.Width,
                      dd.Height, (unsigned)dd.Format, motion.depthW, motion.depthH);
         }
@@ -765,7 +799,10 @@ int dlssnr_call_evaluate(ID3D12GraphicsCommandList* cmd, void* feature,
     p->Set(NVSDK_NGX_Parameter_MotionVectors, motion);
     p->Set(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width, width);
     p->Set(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height, height);
-    (void)guideWidth; (void)guideHeight; (void)depthInverted; (void)reset;
+    // The extent the caller's guides cover (the game's render size).
+    p->Set("DLSSNR.GuideWidth", guideWidth);
+    p->Set("DLSSNR.GuideHeight", guideHeight);
+    (void)depthInverted; (void)reset;
     (void)mvScaleX; (void)mvScaleY;
     {
         NrControls& c = NrControlValues();

@@ -1100,8 +1100,15 @@ bool GpuNeuralChain(ID3D12GraphicsCommandList* cl, ID3D12Resource* output,
                 }
             }
         }
+        // Every 600 resolves, and when what the resolve has to work with
+        // changes (a depth that came or went is worth a line of its own).
         static unsigned long long mapLog = 0;
-        if ((mapLog++ % 600) == 0)
+        static int mapState = -1, mapChanges = 0;
+        const int state = (c.GuideWidth ? 1 : 0) | (motionSrv ? 2 : 0) | (depthHistorySrv ? 4 : 0);
+        const bool changed = state != mapState && mapChanges < 64;
+        if (changed) ++mapChanges;
+        mapState = state;
+        if ((mapLog++ % 600) == 0 || changed)
             LOGI("nr: map resolve: lag %llu frame(s), %s, scale %g,%g, motion %s, depth test %s",
                  (unsigned long long)lag, c.GuideWidth ? "walked through the motion history" : "linear carry",
                  c.MvScaleX, c.MvScaleY, motionSrv ? "bound" : "missing", depthHistorySrv ? "on" : "off");

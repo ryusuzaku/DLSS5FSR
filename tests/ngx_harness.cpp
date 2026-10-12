@@ -682,7 +682,7 @@ static PassResult RunPass(Ngx& ngx, D3D& d, const std::string& iniDir,
                           const IniValues& v, ID3D12Resource* color,
                           ID3D12Resource* output, UINT SRC_W, UINT SRC_H,
                           UINT DST_W, UINT DST_H, int frames,
-                          ID3D12Resource* motion = nullptr) {
+                          ID3D12Resource* motion = nullptr, ID3D12Resource* depth = nullptr) {
     PassResult pr;
     if (!WriteIni(iniDir, v)) return pr;
 
@@ -720,6 +720,7 @@ static PassResult RunPass(Ngx& ngx, D3D& d, const std::string& iniDir,
     evalParams->Set(NVSDK_NGX_Parameter_Color, color);
     evalParams->Set(NVSDK_NGX_Parameter_Output, output);
     if (motion) evalParams->Set(NVSDK_NGX_Parameter_MotionVectors, motion);
+    if (depth) evalParams->Set(NVSDK_NGX_Parameter_Depth, depth);
     evalParams->Set(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width,
                     SRC_W);
     evalParams->Set(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height,
@@ -1638,6 +1639,27 @@ int main(int argc, char** argv) {
             PassResult ip = RunPass(ngx, d, iniDir, identity, engineColor, engineOutput,
                                     SRC_W, SRC_H, DST_W, DST_H, 20, mv.Get());
             Check(MaxChannelDiff(ip.rb, ep.rb) > 2, "the ratio map changes the resolved f16 frame");
+            // Depth beside the vectors. One of their size is this frame's and
+            // switches the resolve's depth test on; one of another shape (a
+            // caller's clone left over from an earlier resolution) cannot
+            // cover the view and is left out. The stale pass runs last: the
+            // log check looks for no depth test after its refusal.
+            ComPtr<ID3D12Resource> depthSame = MakeTexture(d.device.Get(), SRC_W, SRC_H, DXGI_FORMAT_R32_FLOAT,
+                                                           D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                                                           D3D12_RESOURCE_STATE_RENDER_TARGET);
+            ComPtr<ID3D12Resource> depthStale = MakeTexture(d.device.Get(), SRC_W * 2, SRC_H / 2, DXGI_FORMAT_R32_FLOAT,
+                                                            D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                                                            D3D12_RESOURCE_STATE_RENDER_TARGET);
+            Check(depthSame && depthStale, "map pass: depth textures created");
+            if (depthSame && depthStale) {
+                PassResult dp = RunPass(ngx, d, iniDir, engine, engineColor, engineOutput,
+                                        SRC_W, SRC_H, DST_W, DST_H, 60, mv.Get(), depthSame.Get());
+                Check(dp.evalFailures == 0, "frames with a matching depth evaluate");
+                PassResult sp = RunPass(ngx, d, iniDir, engine, engineColor, engineOutput,
+                                        SRC_W, SRC_H, DST_W, DST_H, 60, mv.Get(), depthStale.Get());
+                Check(sp.evalFailures == 0, "frames with a stale depth evaluate");
+                Check(MaxChannelDiff(ip.rb, sp.rb) > 2, "the map still changes the frame without the stale depth");
+            }
         } else if (resolve) {
             Check(MaxChannelDiff(p1.rb, ep.rb) > 2,
                   "resident engine changes the resolved frame");
@@ -1698,6 +1720,12 @@ int main(int argc, char** argv) {
                     Check(text.find("nr: map resolve: lag ") != std::string::npos &&
                               text.find("motion bound") != std::string::npos,
                           "map resolve carries along this frame's motion");
+                    Check(text.find("depth test on") != std::string::npos,
+                          "a depth the size of the vectors switches the depth test on");
+                    const size_t refused = text.find("is not this frame's");
+                    Check(refused != std::string::npos, "a depth of another shape is refused");
+                    Check(refused != std::string::npos && text.find("depth test on", refused) == std::string::npos,
+                          "no depth test runs on the refused depth");
                     if (EnvInt("DLSS5_SYNC", 0)) {
                         Check(text.find("synchronous path on") != std::string::npos,
                               "sync: the hook saw our lists submitted and the path switched on");
@@ -2387,7 +2415,7 @@ int main(int argc, char** argv) {
             Check(inits == 1 + 8 + 2 + 1 + ((previewEnv && *previewEnv) ? 1 : 0) +
                       ((getenv("DLSS5_CANDIDATE_PREVIEW_SWAP") &&
                         *getenv("DLSS5_CANDIDATE_PREVIEW_SWAP")) ? 1 : 0) +
-                      ((captureEnv && *captureEnv) ? 1 : 0) + (engineRun ? 1 : 0) + (engineMap ? 1 : 0),
+                      ((captureEnv && *captureEnv) ? 1 : 0) + (engineRun ? 1 : 0) + (engineMap ? 3 : 0),  // map: identity + the two depth passes
                   "every pass initialised the shim");
             Check(hipReady >= 1, "the HIP model ran at least once");
             Check(hipDegraded == 0, "no degradation to the identity model");
