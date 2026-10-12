@@ -226,6 +226,12 @@ struct OutputOptions {
     // weapon's edit trail over a dark street (tools/seq_replay.py, recorded
     // sequence). Only with a one-frame-old history and staged depth.
     int smooth_depth = 0;
+    // passes=N (transfer=nvidia, 1..3): the network runs N times on the frame,
+    // pass k+1 on pass k's composed output with the same motion and depth and
+    // a history of its own, its tone control zero (what the hosts that call
+    // the original several times in a row do). The map is the last pass's
+    // output against the frame the first pass saw. Cost is linear in N.
+    int passes = 1;
     // input_temporal=A (S332): a TAA pass on the network's input only -- the
     // frame blended with the previous network input carried along the motion
     // by A, the history clamped to the frame's 3x3 range and dropped where the
@@ -845,17 +851,36 @@ __global__ void k_seq_post(const float* rgb_native, const float* tiles, const fl
 // sat(src + sat(Intensity) * (nr - src)) (peer fswin_t.comp, read from the
 // DLL's PTX) as a delta map on the encoded input, (out - src, Y_in) per frame
 // pixel; Y_in is the linear luminance of src, for the consumer's lag gate.
-__global__ void k_nv_map(const float* image, const float* color, float4* map, int fw, int fh, int W, float intensity) {
+// base (passes > 1): the frame the first pass saw; the change and Y_in are
+// taken against it, color being the last pass's own input.
+__global__ void k_nv_map(const float* image, const float* color, float4* map, int fw, int fh, int W, float intensity,
+                         const float* base = nullptr) {
+    const int p = blockIdx.x*blockDim.x + threadIdx.x;
+    if (p >= fw*fh) return;
+    const int x = p % fw, y = p / fw;
+    const float* s = color + (size_t(y)*W + x)*3;
+    const float* b = base ? base + (size_t(y)*W + x)*3 : s;
+    const float* n = image + size_t(p)*3;
+    const float k = fminf(fmaxf(intensity, 0.0f), 1.0f);
+    float d[3];
+    for (int c = 0; c < 3; ++c) d[c] = fminf(fmaxf(s[c] + k*(n[c] - s[c]), 0.0f), 1.0f) - b[c];
+    const float yin = .2126f*srgb_decode_device(b[0]) + .7152f*srgb_decode_device(b[1]) + .0722f*srgb_decode_device(b[2]);
+    map[p] = make_float4(d[0], d[1], d[2], yin);
+}
+
+// passes > 1: one pass's composed output as the RGBA16F frame a host hands
+// the next pass (the same compose, rounded to half as the host's texture is).
+__global__ void k_nv_pass_frame(const float* image, const float* color, unsigned char* frame, int pitch,
+                                int fw, int fh, int W, float intensity) {
     const int p = blockIdx.x*blockDim.x + threadIdx.x;
     if (p >= fw*fh) return;
     const int x = p % fw, y = p / fw;
     const float* s = color + (size_t(y)*W + x)*3;
     const float* n = image + size_t(p)*3;
     const float k = fminf(fmaxf(intensity, 0.0f), 1.0f);
-    float d[3];
-    for (int c = 0; c < 3; ++c) d[c] = fminf(fmaxf(s[c] + k*(n[c] - s[c]), 0.0f), 1.0f) - s[c];
-    const float yin = .2126f*srgb_decode_device(s[0]) + .7152f*srgb_decode_device(s[1]) + .0722f*srgb_decode_device(s[2]);
-    map[p] = make_float4(d[0], d[1], d[2], yin);
+    _Float16* out = reinterpret_cast<_Float16*>(frame + size_t(y)*pitch) + x*4;
+    for (int c = 0; c < 3; ++c) out[c] = (_Float16)fminf(fmaxf(s[c] + k*(n[c] - s[c]), 0.0f), 1.0f);
+    out[3] = (_Float16)1.0f;
 }
 // The delta map as RGBA16F for the shim's resolve (map mode 4).
 __global__ void k_map4_out(const float4* map, unsigned char* out, size_t out_pitch, int w, int h) {
@@ -1202,6 +1227,10 @@ struct Engine {
     // ping-pong; the history), its frame, the stem's history features and
     // the run counter that seeds the noise (0 on a reset).
     std::unique_ptr<Buffer> nv_image[2], nv_feat;
+    // passes > 1: each later pass's own history pair, the frame the first
+    // pass saw (W stride) and the composed frame handed to the next pass.
+    std::unique_ptr<Buffer> nv_more[2][2], nv_base, nv_pass;
+    int nv_more_cur[2] = {0, 0};
     int nv_cur = 0, nv_w = 0, nv_h = 0;
     long long nv_frame = -1;
     unsigned nv_seed = 0;
@@ -1251,6 +1280,7 @@ struct Engine {
             else if (key == "rel_sigma") options.rel_sigma = std::stof(value);
             else if (key == "rel_gate") options.rel_gate = std::stof(value);
             else if (key == "smooth_depth") options.smooth_depth = std::stoi(value);
+            else if (key == "passes") options.passes = std::min(std::max(std::stoi(value), 1), 3);
             else if (key == "input_temporal") options.input_temporal = std::stof(value);
             else if (key == "extent" && (value == "compact" || value == "legacy")) options.compact = value == "compact";
             else if (key == "tone") options.tone = std::stof(value);
@@ -1645,6 +1675,9 @@ struct Engine {
             for (auto& im : nv_image)
                 if (!im || im->count < fpx*3) { im.reset(new Buffer(fpx*3)); nv_frame = -1; }
             if (!nv_feat || nv_feat->count < size_t(W)*H*3) nv_feat.reset(new Buffer(size_t(W)*H*3));
+            for (int p = 1; p < options.passes; ++p)
+                for (auto& im : nv_more[p-1])
+                    if (!im || im->count < fpx*3) { im.reset(new Buffer(fpx*3)); nv_frame = -1; }
             nv_history = nv_frame >= 0 && nv_frame == job_frame - 1 && nv_w == frame_w && nv_h == frame_h;
             if (nv_history) {
                 hipLaunchKernelGGL(k_seq_pre, dim3((W*H+255)/256), dim3(256), 0, stream,
@@ -1717,6 +1750,38 @@ struct Engine {
             HIP_CHECK(hipGetLastError());
             nv_cur = next; nv_frame = job_frame; nv_w = frame_w; nv_h = frame_h;
         }
+        const float* nv_final = nvidia ? nv_image[nv_cur]->data.get() : nullptr;
+        const float* nv_first = nullptr;  // the first pass's input, when later passes ran
+        if (nvidia && options.passes > 1) {
+            const size_t fpx = size_t(frame_w)*frame_h, wpx = size_t(W)*H*3;
+            const int pass_pitch = frame_w*8;
+            if (!nv_base || nv_base->count < wpx) nv_base.reset(new Buffer(wpx));
+            if (!nv_pass || nv_pass->count < fpx*2) nv_pass.reset(new Buffer(fpx*2));
+            HIP_CHECK(hipMemcpyAsync(nv_base->data, net->color->data, wpx*sizeof(float), hipMemcpyDeviceToDevice, stream));
+            nv_first = nv_base->data;
+            auto* pass_frame = reinterpret_cast<unsigned char*>(nv_pass->data.get());
+            for (int p = 1; p < options.passes; ++p) {
+                hipLaunchKernelGGL(k_nv_pass_frame, dim3((fpx+255)/256), dim3(256), 0, stream,
+                                   nv_final, net->color->data, pass_frame, pass_pitch, frame_w, frame_h, W, job_strength);
+                auto& im = nv_more[p-1];
+                int& cur = nv_more_cur[p-1];
+                if (nv_history)
+                    hipLaunchKernelGGL(k_seq_pre, dim3((W*H+255)/256), dim3(256), 0, stream,
+                                       im[cur]->data, nv_mv, job_depth_valid ? job_depth->data : nullptr,
+                                       nv_feat->data, frame_w, frame_h, W, H, nv_ms);
+                HIP_CHECK(hipGetLastError());
+                net->front->controls.v[1] = 0.0f;  // the tone is the first pass's alone
+                net->run(pass_frame, frame_w, frame_h, pass_pitch, 8, false, stream, sw, sh, nullptr,
+                         options.encoded, nullptr, nullptr, options.reject);
+                hipLaunchKernelGGL(k_seq_post, dim3((frame_w*frame_h+255)/256), dim3(256), 0, stream,
+                                   net->rgb_native->data, nv_history ? net->head70->native_view().data : nullptr,
+                                   hist_row->data, im[cur]->data, nv_mv, im[cur ^ 1]->data,
+                                   frame_w, frame_h, W, 0.7397f, int(nv_history), nv_ms);
+                HIP_CHECK(hipGetLastError());
+                cur ^= 1;
+                nv_final = im[cur]->data;
+            }
+        }
         if (temporal) {
             if (use_history) {
                 hipLaunchKernelGGL(k_head_temporal, dim3((W*H+255)/256), dim3(256), 0, stream,
@@ -1765,9 +1830,9 @@ struct Engine {
                     if (!m || m->count < size_t(frame_w)*frame_h*per) m.reset(new Buffer(size_t(frame_w)*frame_h*per));
                 if (nvidia) {
                     hipLaunchKernelGGL(k_nv_map, dim3((frame_w*frame_h+255)/256), dim3(256), 0, stream,
-                                       nv_image[nv_cur]->data, net->color->data,
+                                       nv_final, net->color->data,
                                        reinterpret_cast<float4*>(maps[next]->data.get()), frame_w, frame_h, W,
-                                       job_strength);
+                                       job_strength, nv_first);
                     HIP_CHECK(hipGetLastError());
                 } else {
                     // smooth_depth: the history is the previous frame's map, both
