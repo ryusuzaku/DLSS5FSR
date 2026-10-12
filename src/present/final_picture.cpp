@@ -97,7 +97,11 @@ struct State {
     std::thread watchdog;
 };
 
-State& S() { static State s; return s; }
+// Never destroyed: a game ends without Shutdown, and by the time statics are
+// torn down the watchdog thread and the device are gone.
+State& S() { static State* s = new State; return *s; }
+
+void (*g_log)(const char*) = nullptr;
 
 void Log(const char* fmt, ...) {
     char line[512];
@@ -105,8 +109,8 @@ void Log(const char* fmt, ...) {
     va_start(ap, fmt);
     vsnprintf(line, sizeof(line), fmt, ap);
     va_end(ap);
-    fprintf(stderr, "final_picture: %s\n", line);
-    OutputDebugStringA(line);
+    if (g_log) g_log(line);
+    else fprintf(stderr, "final_picture: %s\n", line);
 }
 
 bool Fail(const char* what) {
@@ -409,7 +413,8 @@ bool Init(ID3D12Device* device, ID3D12CommandQueue* queue, const Config& config)
     s.cfg = config;
     s.device = device;
     s.queue = queue;
-    s.engine = LoadLibraryW(config.engineDll.c_str());
+    // Its directory first for what it depends on (the ROCm runtime beside it).
+    s.engine = LoadLibraryExW(config.engineDll.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
     if (!s.engine) return Fail("cannot load the engine DLL");
     s.hip = GetModuleHandleW(L"amdhip64_7.dll");
     if (!s.hip) s.hip = LoadLibraryW(L"amdhip64_7.dll");
@@ -558,6 +563,17 @@ void Flush() {
     std::lock_guard<std::mutex> lock(s.mutex);
     if (s.ready) WaitDone(s.frame);
 }
+
+void ForgetBackBuffers() {
+    State& s = S();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    if (!s.ready) return;
+    WaitDone(s.frame);
+    memset(s.backRtv, 0, sizeof(s.backRtv));
+    s.backRtvNext = 0;
+}
+
+void SetLog(void (*log)(const char*)) { g_log = log; }
 
 void Shutdown() {
     State& s = S();

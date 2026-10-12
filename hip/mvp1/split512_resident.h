@@ -67,6 +67,7 @@ struct Buffer {
         data.host = read(dir, name, n);
     }
     ~Buffer() {  // destructors never throw or exit
+        if (process_exiting) return;
         for (auto hook : free_hooks()) { hook(&data); if (data.p) hook(data.p); }
         if (data.p) (void)hipFree(data.p);
     }

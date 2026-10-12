@@ -87,6 +87,15 @@ if [ -d "$ROCM/include" ]; then
     echo "== compiling the final-picture front end and its harness"
     msvc_build /c /Fo:"$OUT/final_picture.obj" -D__HIP_PLATFORM_AMD__ -I"$ROCM/include"         src/present/final_picture.cpp || exit 1
     msvc_build /Fe:"$OUT/present_harness.exe" /Fo:"$OUT/present_harness.obj"         tests/present_harness.cpp "$OUT/final_picture.obj" $LIBS || exit 1
+    # The present hook (loaded by a game as version.dll) and a windowed test
+    # program for it, in a directory of their own: a version.dll in $OUT
+    # would be loaded by every program there.
+    echo "== compiling the present hook (version.dll) and present_window"
+    mkdir -p "$OUT/present_hook"
+    msvc_build /c /Fo:"$OUT/present_hook.obj" src/present/hook.cpp || exit 1
+    MSYS_NO_PATHCONV=1 "$LINK" /nologo /DLL /DEF:src/present/version.def         /OUT:"$OUT/present_hook/version.dll" "$OUT/present_hook.obj" "$OUT/final_picture.obj"         $LIBS user32.lib || exit 1
+    msvc_build /Fe:"$OUT/present_hook/present_window.exe" /Fo:"$OUT/present_window.obj"         tests/present_window.cpp $LIBS user32.lib version.lib || exit 1
+    cp -n src/present/dlss5_present.ini "$OUT/present_hook/" 2>/dev/null || true
 fi
 
 # ----------------------------------------------------------------- config --

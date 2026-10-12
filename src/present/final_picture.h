@@ -50,6 +50,11 @@ bool Process(ID3D12Resource* backBuffer);
 void SetControls(const float controls[6]);
 // Blocks until everything queued so far has run (resize, shutdown, tests).
 void Flush();
+// Before a swap chain resizes or recreates its buffers: waits as Flush does
+// and drops the views of the old back buffers.
+void ForgetBackBuffers();
+// Where the module's log lines go (default: stderr).
+void SetLog(void (*log)(const char* line));
 void Shutdown();
 const Stats& GetStats();
 

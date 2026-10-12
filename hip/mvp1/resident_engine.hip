@@ -2188,6 +2188,24 @@ struct Engine {
 
 std::mutex g_mutex;
 std::unique_ptr<Engine> g_engine;
+}
+
+// A process that ends with the engine alive (a game closing: nothing calls
+// re_destroy) detaches this module after the system has killed every other
+// thread, the engine's worker and the HIP runtime's among them. Tearing the
+// engine down then called into a runtime that could no longer answer and the
+// process died with an error status; the engine and its buffers are left to
+// the system instead. (DLL_PROCESS_DETACH is 0; reserved is non-null only
+// when the process is terminating.)
+extern "C" int __stdcall DllMain(void*, unsigned long reason, void* reserved) {
+    if (reason == 0 && reserved) {
+        c512_resident::process_exiting = true;
+        (void)g_engine.release();
+    }
+    return 1;
+}
+
+namespace {
 std::string g_error;
 } // namespace
 

@@ -475,7 +475,7 @@ struct State {
     std::map<const void*, std::pair<unsigned char*, size_t>> weights8;  // E4M3 copies
     float* partial = nullptr;  // split-K partition totals
     size_t partial_count = 0;
-    ~State() { clear(); }
+    ~State() { if (!c512_resident::process_exiting) clear(); }
     void clear() {
         for (auto& w : weights) (void)hipFree(w.second.first);
         weights.clear();

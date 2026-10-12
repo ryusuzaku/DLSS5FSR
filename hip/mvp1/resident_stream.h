@@ -14,6 +14,10 @@ inline void (*launch_hook)(const char* kernel) = nullptr;
 // Fast paths (WMMA etc.) may reorder fp32 sums inside a 32-product slice;
 // RESIDENT_EXACT=1 keeps every stage byte-identical to the reference kernels.
 inline bool exact_math = [] { const char* v = getenv("RESIDENT_EXACT"); return v && *v == '1'; }();
+// Set when the process is ending and this module is being torn down without
+// re_destroy (a game closing): the runtime's threads are gone by then, so
+// destructors must not call into HIP any more.
+inline bool process_exiting = false;
 // Called with a buffer's cache keys (its Lazy object, its device pointer)
 // when it is freed: the weight caches evict their copies (S336).
 inline std::vector<void(*)(const void*)>& free_hooks() { static std::vector<void(*)(const void*)> h; return h; }
