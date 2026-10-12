@@ -1961,14 +1961,28 @@ struct Engine {
     int set_controls(const float* v) {
         if (!options.external) return 0;
         std::lock_guard<std::mutex> lock(mutex);
-        const float style = fminf(fmaxf(v[1], 0.0f), 2.0f);
+        const float style = fminf(fmaxf(v[1], 0.0f), 2.0f);  // 0 default, 1 natural, 2 cinematic
+        const float structure = fminf(fmaxf(v[2], 0.0f), 2.0f);
         options.controls[0] = style / 128.0f;
         options.controls[1] = fminf(fmaxf(v[3], 0.0f), 2.0f);
-        options.controls[2] = fminf(fmaxf(v[2], 0.0f), 2.0f);
-        // transfer=nvidia: the features the validated sequence feeds for
-        // Skin -1 with the automatic mask.
-        options.controls[3] = options.nvidia ? 1.0f : -1.0f;
-        options.controls[4] = options.nvidia ? 1.0f : -1.0f;
+        options.controls[2] = structure;
+        options.controls[3] = -1.0f;
+        options.controls[4] = -1.0f;
+        if (options.nvidia) {
+            // The original's mapping (peer DLSSNR-AMD nr_graph.cpp, as
+            // network_parity.hip): with the automatic mask and no mask
+            // texture the skin and other strengths go to features 3 and 4
+            // (Skin < 0 follows the structure) and feature 2 is 1.
+            const bool automask = v[5] != 0.0f;
+            const float skin = fminf(v[4], 2.0f);
+            const float mask_skin = automask ? (skin < 0.0f ? structure : skin) : -1.0f;
+            const float mask_other = automask ? structure : -1.0f;
+            if (fmaxf(mask_skin, mask_other) >= 0.0f) {
+                options.controls[2] = 1.0f;
+                options.controls[3] = mask_skin < 0.0f ? structure : mask_skin;
+                options.controls[4] = mask_other < 0.0f ? structure : mask_other;
+            }
+        }
         options.strength = fminf(fmaxf(v[0], 0.0f), 2.0f);
         return 1;
     }
