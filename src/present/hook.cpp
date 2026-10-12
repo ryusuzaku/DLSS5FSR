@@ -108,10 +108,16 @@ typedef HRESULT (STDMETHODCALLTYPE* PresentFn)(IDXGISwapChain*, UINT, UINT);
 typedef HRESULT (STDMETHODCALLTYPE* Present1Fn)(IDXGISwapChain1*, UINT, UINT, const DXGI_PRESENT_PARAMETERS*);
 typedef HRESULT (STDMETHODCALLTYPE* ResizeFn)(IDXGISwapChain*, UINT, UINT, UINT, DXGI_FORMAT, UINT);
 typedef HRESULT (STDMETHODCALLTYPE* Resize1Fn)(IDXGISwapChain3*, UINT, UINT, UINT, DXGI_FORMAT, UINT, const UINT*, IUnknown* const*);
+typedef HRESULT (STDMETHODCALLTYPE* ColorSpaceFn)(IDXGISwapChain3*, DXGI_COLOR_SPACE_TYPE);
 PresentFn g_present = nullptr;
 Present1Fn g_present1 = nullptr;
 ResizeFn g_resize = nullptr;
 Resize1Fn g_resize1 = nullptr;
+ColorSpaceFn g_colorSpace = nullptr;
+// The colour space the game last set: anything but sRGB (HDR10's PQ shares
+// the 10-bit format) is left alone -- the model is shown sRGB pictures.
+DXGI_COLOR_SPACE_TYPE g_space = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+bool g_spaceLogged = false;
 
 Settings g_settings;
 std::mutex g_frameMutex;
@@ -153,6 +159,10 @@ unsigned long long g_presents = 0;
 void OnPresent(IDXGISwapChain* sc) {
     std::lock_guard<std::mutex> lock(g_frameMutex);
     if (g_failed || !g_settings.enabled) return;
+    if (g_space != DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709) {
+        if (!g_spaceLogged) { g_spaceLogged = true; Log("colour space %d (HDR) is not handled yet: frames left alone", int(g_space)); }
+        return;
+    }
     ID3D12CommandQueue* queue = QueueOf(sc);
     if (!queue) return;  // not a D3D12 swap chain
     if (g_started && queue != g_queue) {
@@ -228,6 +238,15 @@ HRESULT STDMETHODCALLTYPE HookResize1(IDXGISwapChain3* sc, UINT count, UINT w, U
     return g_resize1(sc, count, w, h, f, flags, masks, queues);
 }
 
+HRESULT STDMETHODCALLTYPE HookColorSpace(IDXGISwapChain3* sc, DXGI_COLOR_SPACE_TYPE space) {
+    const HRESULT hr = g_colorSpace(sc, space);
+    if (SUCCEEDED(hr)) {
+        std::lock_guard<std::mutex> lock(g_frameMutex);
+        if (space != g_space) { g_space = space; g_spaceLogged = false; Log("swap chain colour space %d", int(space)); }
+    }
+    return hr;
+}
+
 template<class F> bool Patch(void** vtable, int slot, void* hook, F& original) {
     DWORD old = 0;
     if (!VirtualProtect(&vtable[slot], sizeof(void*), PAGE_EXECUTE_READWRITE, &old)) return false;
@@ -278,9 +297,10 @@ DWORD WINAPI HookThread(void*) {
             void** vtable = *reinterpret_cast<void***>(probe.Get());
             g_queueVtable = *reinterpret_cast<void**>(queue.Get());
             // IDXGISwapChain: Present 8, ResizeBuffers 13; IDXGISwapChain1: Present1 22;
-            // IDXGISwapChain3: ResizeBuffers1 39.
+            // IDXGISwapChain3: SetColorSpace1 38, ResizeBuffers1 39.
             ok = Patch(vtable, 8, (void*)&HookPresent, g_present) && Patch(vtable, 22, (void*)&HookPresent1, g_present1) &&
-                 Patch(vtable, 13, (void*)&HookResize, g_resize) && Patch(vtable, 39, (void*)&HookResize1, g_resize1);
+                 Patch(vtable, 13, (void*)&HookResize, g_resize) && Patch(vtable, 39, (void*)&HookResize1, g_resize1) &&
+                 Patch(vtable, 38, (void*)&HookColorSpace, g_colorSpace);
         }
     }
     if (hwnd) DestroyWindow(hwnd);
