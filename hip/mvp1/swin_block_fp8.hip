@@ -12,6 +12,8 @@
 // rows (l/16)*8 + e. RESIDENT_SWIN_F16=1 runs swin_block_wmma.hip instead.
 // Needs swin_block_wmma.hip included first.
 
+#include "resident_stream.h"
+
 namespace swin_fp8 {
 using swin_fused::Geometry;
 using swin_fused::Tiles;
@@ -53,8 +55,22 @@ __global__ void k_to_fp8(const float* w, u8* out, size_t n) {
 }
 
 // Cached E4M3 copy of `count` weights at W (converted once on `stream`).
-inline const u8* weights(hipStream_t stream, const float* W, size_t count) {
+// A freed buffer's copy leaves the cache: a later buffer may reuse its
+// address with other weights (a network rebuilt for a new frame size read
+// stale copies here until S341; wmma_gemm's caches evict the same way).
+inline std::map<const float*, std::pair<u8*, size_t>>& weight_cache() {
     static std::map<const float*, std::pair<u8*, size_t>> cache;
+    return cache;
+}
+inline void evict(const void* key) {
+    auto& cache = weight_cache();
+    auto found = cache.find(static_cast<const float*>(key));
+    if (found != cache.end()) { (void)hipFree(found->second.first); cache.erase(found); }
+}
+inline void register_evict() { static const bool once = (c512_resident::free_hooks().push_back(&evict), true); (void)once; }
+inline const u8* weights(hipStream_t stream, const float* W, size_t count) {
+    register_evict();
+    auto& cache = weight_cache();
     auto found = cache.find(W);
     if (found == cache.end() || found->second.second != count) {
         u8* packed = nullptr;
