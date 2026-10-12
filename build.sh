@@ -77,6 +77,18 @@ echo "== compiling harness"
 msvc_build /Fe:"$OUT/ngx_harness.exe" /Fo:"$OUT/ngx_harness.obj" $INC \
     tests/ngx_harness.cpp $LIBS || exit 1
 
+# ------------------------------------------------- final-picture front end --
+# src/present: the engine applied to a finished frame at present time (any
+# D3D12 swap chain), and its headless harness. Needs ROCm's headers for the
+# interop types, as hip_backend does.
+if [ -d "$ROCM/include" ]; then
+    echo "== final_picture.hlsl -> final_picture_{vs,down,up}.h"
+    (cd src/present/shaders &&      MSYS_NO_PATHCONV=1 "$FXC" /nologo /T vs_5_0 /E VsMain /Vn g_fpVs /Fh final_picture_vs.h final_picture.hlsl &&      MSYS_NO_PATHCONV=1 "$FXC" /nologo /T ps_5_0 /E PsDown /Vn g_fpDown /Fh final_picture_down.h final_picture.hlsl &&      MSYS_NO_PATHCONV=1 "$FXC" /nologo /T ps_5_0 /E PsUp /Vn g_fpUp /Fh final_picture_up.h final_picture.hlsl)
+    echo "== compiling the final-picture front end and its harness"
+    msvc_build /c /Fo:"$OUT/final_picture.obj" -D__HIP_PLATFORM_AMD__ -I"$ROCM/include"         src/present/final_picture.cpp || exit 1
+    msvc_build /Fe:"$OUT/present_harness.exe" /Fo:"$OUT/present_harness.obj"         tests/present_harness.cpp "$OUT/final_picture.obj" $LIBS || exit 1
+fi
+
 # ----------------------------------------------------------------- config --
 # -n so a hand-edited build/dlssnr_shim.ini (dump settings, log level) is not
 # reset on every rebuild.

@@ -46,3 +46,4 @@
 !tools/**/*.json
 /hip/mvp1/rw_yp*golden.inc
 /src/ngx/shaders/*_cs.h
+/src/present/shaders/*.h
