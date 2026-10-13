@@ -22,6 +22,7 @@ namespace {
 std::atomic<int> g_state{0};          // 0 not started, 1 hooking, 2 hooked, 3 failed
 std::atomic<unsigned int> g_controls{0};  // the NrControls generation handed on
 swap_hook::Settings g_settings;
+ID3D12Device* g_device = nullptr;  // the game's, held until the hook is in
 
 void PresentLog(const char* line) { LOGI("present: %s", line); }
 
@@ -30,7 +31,8 @@ DWORD WINAPI InstallThread(void*) {
     GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                        reinterpret_cast<LPCWSTR>(&InstallThread), &self);
     swap_hook::SetLog(PresentLog);
-    const bool ok = swap_hook::Install(g_settings, self);
+    const bool ok = swap_hook::Install(g_settings, self, g_device);
+    if (g_device) { g_device->Release(); g_device = nullptr; }
     g_controls = 0;  // whatever the caller set meanwhile goes in again
     g_state = ok ? 2 : 3;
     return 0;
@@ -57,9 +59,16 @@ void PresentModeEvaluate(ID3D12GraphicsCommandList* cl, const Config& cfg, const
         if (NrControlValues().generation) Controls(g_settings.controls);
         LOGI("present: mode on, engine config %s, working scale %g (0: within %.0f pixels)", config,
              cfg.presentWorkingScale, cfg.presentMaxWorkingPixels);
+        // The probe swap chain is made on the game's device: a second
+        // D3D12CreateDevice here would be seen by every other hook in the
+        // process (OptiScaler takes each new device as its current one).
+        if (FAILED(cl->GetDevice(IID_PPV_ARGS(&g_device)))) g_device = nullptr;
         HANDLE t = CreateThread(nullptr, 0, InstallThread, nullptr, 0, nullptr);
         if (t) CloseHandle(t);
-        else g_state = 3;
+        else {
+            if (g_device) { g_device->Release(); g_device = nullptr; }
+            g_state = 3;
+        }
     }
     if (g_state != 2) return;
 

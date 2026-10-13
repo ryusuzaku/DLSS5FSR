@@ -222,7 +222,7 @@ void SetControls(const float controls[6]) {
 
 void SetQueueHint(ID3D12CommandQueue* queue) { g_hintQueue = queue; }
 
-bool Install(const Settings& settings, HINSTANCE module) {
+bool Install(const Settings& settings, HINSTANCE module, ID3D12Device* gameDevice) {
     {
         std::lock_guard<std::mutex> lock(g_frameMutex);
         g_settings = settings;
@@ -246,7 +246,7 @@ bool Install(const Settings& settings, HINSTANCE module) {
     bool ok = false;
     {
         ComPtr<IDXGIFactory2> factory;
-        ComPtr<ID3D12Device> device;
+        ComPtr<ID3D12Device> device = gameDevice;
         ComPtr<ID3D12CommandQueue> queue;
         ComPtr<IDXGISwapChain1> probe;
         D3D12_COMMAND_QUEUE_DESC qd{};
@@ -259,7 +259,7 @@ bool Install(const Settings& settings, HINSTANCE module) {
         sd.BufferCount = 2;
         sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
         if (hwnd && createFactory && SUCCEEDED(createFactory(IID_PPV_ARGS(&factory))) &&
-            SUCCEEDED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device))) &&
+            (device || SUCCEEDED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)))) &&
             SUCCEEDED(device->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue))) &&
             SUCCEEDED(factory->CreateSwapChainForHwnd(queue.Get(), hwnd, &sd, nullptr, nullptr, &probe))) {
             void** vtable = *reinterpret_cast<void***>(probe.Get());

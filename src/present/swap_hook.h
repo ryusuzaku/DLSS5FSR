@@ -24,7 +24,9 @@ struct Settings {
 void SetLog(void (*log)(const char* line));
 // Patches the swap chain class through a throw-away swap chain on a hidden
 // window. Blocks while it does; not to be called under the loader lock.
-bool Install(const Settings& settings, HINSTANCE module);
+// device: the game's, when the caller has it; the probe then makes no device
+// of its own (other hooks in the process take note of every new device).
+bool Install(const Settings& settings, HINSTANCE module, ID3D12Device* device = nullptr);
 // The controls the front end starts with, or takes from now on.
 void SetControls(const float controls[6]);
 // The queue to run on when the swap chain's own cannot be read out of the
