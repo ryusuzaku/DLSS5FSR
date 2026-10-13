@@ -6,7 +6,7 @@
 // After the last frame the last presented buffer is read back and compared
 // with what was drawn: any change is the hook's.
 //
-// Usage: present_window image.rgb out_prefix [frames] [show] [shim.dll] [guides] [pan]
+// Usage: present_window image.rgb out_prefix [frames] [show] [shim.dll] [guides] [pan] [seq_dir] [linear] [linger]
 //   image.rgb: two uint32 (width, height), then RGB8 rows.
 //   show: 1 shows the window (default hidden).
 //   shim.dll: the NGX shim (nvngx.dll) with a dlssnr_shim.ini beside it that
@@ -16,9 +16,17 @@
 //     colour, the motion of the pan and a depth, before it presents.
 //   guides: 0 hands the shim no motion (default 1).
 //   pan: pixels the picture moves to the left a frame (default 4; 0 a still).
+//   seq_dir: instead of the panned picture, the frames of a sequence capture
+//     (D5INP001 + D5DEP001 + D5MOV001, as the shim and the front end record
+//     them) of the image's size: frame k is drawn, and its own motion and
+//     depth are what the NR evaluate is handed. linear 1: the pictures are
+//     linear light and are sRGB-encoded first.
+//   linger: seconds to stay alive after the last frame (a sequence capture
+//     the front end recorded is written by a thread of this process).
 
 #include <windows.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -43,6 +51,24 @@ static D3D12_RESOURCE_BARRIER Transition(ID3D12Resource* r, D3D12_RESOURCE_STATE
     return b;
 }
 
+float HalfToFloat(unsigned short v) {
+    const unsigned int sign = (v & 0x8000u) << 16, exp = (v >> 10) & 0x1Fu, man = v & 0x3FFu;
+    unsigned int bits;
+    if (exp == 0) {
+        if (man == 0) bits = sign;
+        else {
+            int e = -1;
+            unsigned int m = man;
+            do { ++e; m <<= 1; } while (!(m & 0x400u));
+            bits = sign | ((unsigned int)(112 - e) << 23) | ((m & 0x3FFu) << 13);
+        }
+    } else if (exp == 31) bits = sign | 0x7F800000u | (man << 13);
+    else bits = sign | ((exp + 112) << 23) | (man << 13);
+    float f;
+    memcpy(&f, &bits, 4);
+    return f;
+}
+
 int main(int argc, char** argv) {
     if (argc < 3) { fputs("usage: present_window image.rgb out_prefix [frames] [show]\n", stderr); return 2; }
     const int frames = argc > 3 ? atoi(argv[3]) : 240;
@@ -51,6 +77,17 @@ int main(int argc, char** argv) {
     const char* shimPath = argc > 5 && argv[5][0] ? argv[5] : nullptr;
     const bool guides = !(argc > 6 && atoi(argv[6]) == 0);
     const int pan = argc > 7 ? atoi(argv[7]) : 4;
+    const char* seqDir = argc > 8 && argv[8][0] ? argv[8] : nullptr;
+    const bool seqLinear = argc > 9 && atoi(argv[9]) != 0;
+    std::vector<std::string> seqFiles;
+    if (seqDir) {
+        WIN32_FIND_DATAA fd;
+        HANDLE find = FindFirstFileA((std::string(seqDir) + "\\*.bin").c_str(), &fd);
+        if (find == INVALID_HANDLE_VALUE) { fputs("no sequence frames\n", stderr); return 1; }
+        do seqFiles.push_back(std::string(seqDir) + "\\" + fd.cFileName); while (FindNextFileA(find, &fd));
+        FindClose(find);
+        std::sort(seqFiles.begin(), seqFiles.end());
+    }
     // The import that brings version.dll (the hook) into the process.
     wchar_t self[MAX_PATH];
     GetModuleFileNameW(nullptr, self, MAX_PATH);
@@ -167,7 +204,26 @@ int main(int argc, char** argv) {
     ComPtr<ID3D12Resource> nrColor, nrOutput, nrMotion, nrDepth;
     ComPtr<ID3D12DescriptorHeap> nrRtvs;
     const UINT nrW = 256, nrH = 144;
+    // The guides: half the frame for the pan, the frame's size for a sequence.
+    const UINT guideW = seqDir ? w : w / 2, guideH = seqDir ? h : h / 2;
     int shimFailures = 0;
+    // A sequence's motion and depth go through upload buffers every frame.
+    ComPtr<ID3D12Resource> mvUpload, depthUpload;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT mvFp{}, depthFp{};
+    if (seqDir) {
+        D3D12_RESOURCE_DESC gd = td;
+        UINT64 bytes = 0;
+        gd.Format = DXGI_FORMAT_R32G32_FLOAT;
+        device->GetCopyableFootprints(&gd, 0, 1, 0, &mvFp, nullptr, nullptr, &bytes);
+        D3D12_RESOURCE_DESC ub = bd;
+        ub.Width = bytes;
+        bool ok = SUCCEEDED(device->CreateCommittedResource(&up, D3D12_HEAP_FLAG_NONE, &ub, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&mvUpload)));
+        gd.Format = DXGI_FORMAT_R32_FLOAT;
+        device->GetCopyableFootprints(&gd, 0, 1, 0, &depthFp, nullptr, nullptr, &bytes);
+        ub.Width = bytes;
+        ok = ok && SUCCEEDED(device->CreateCommittedResource(&up, D3D12_HEAP_FLAG_NONE, &ub, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&depthUpload)));
+        if (!ok) { fputs("guide upload buffers failed\n", stderr); return 1; }
+    }
     if (shimPath) {
         HMODULE shim = LoadLibraryA(shimPath);
         const CreateFn create = shim ? reinterpret_cast<CreateFn>(GetProcAddress(shim, "dlssnr_call_create")) : nullptr;
@@ -186,8 +242,8 @@ int main(int argc, char** argv) {
         hd.NumDescriptors = 3;
         if (!texture(nrW, nrH, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET, nrColor) ||
             !texture(nrW, nrH, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nrOutput) ||
-            !texture(w / 2, h / 2, DXGI_FORMAT_R16G16_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET, nrMotion) ||
-            !texture(w / 2, h / 2, DXGI_FORMAT_R32_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET, nrDepth) ||
+            !texture(guideW, guideH, seqDir ? DXGI_FORMAT_R32G32_FLOAT : DXGI_FORMAT_R16G16_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET, nrMotion) ||
+            !texture(guideW, guideH, DXGI_FORMAT_R32_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET, nrDepth) ||
             FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&nrRtvs)))) {
             fputs("NR textures failed\n", stderr); return 1;
         }
@@ -209,7 +265,8 @@ int main(int argc, char** argv) {
         GetCurrentDirectoryW(MAX_PATH, dir);
         shimFeature = create(L"", dir, device.Get(), nullptr, shimParams, nrW, nrH, 1, 1.0f, 0, 1.0f, 1.0f, -1.0f, 1, 0);
         if (!shimFeature) { fputs("the shim did not create the NR feature\n", stderr); return 1; }
-        printf("shim %s: NR feature created, %s\n", shimPath, guides ? "with the pan's motion and a depth" : "without motion");
+        printf("shim %s: NR feature created, %s\n", shimPath,
+               !guides ? "without motion" : seqDir ? "with the sequence's motion and depth" : "with the pan's motion and a depth");
     }
 
     // A real game spends seconds loading before its first frames; the hook's
@@ -221,19 +278,90 @@ int main(int argc, char** argv) {
     double slowest = 0.0, sum = 0.0;
     int counted = 0, shift = 0;
     UINT lastIndex = 0;
-    for (int k = 0; k < frames; ++k) {
+    std::vector<unsigned char> seqData;
+    bool seqDepth = false;
+    for (int k = 0; k < frames && (!seqDir || k < int(seqFiles.size())); ++k) {
+        if (seqDir) {
+            // Frame k of the sequence: its picture into the upload buffer, its
+            // motion and depth into theirs.
+            FILE* sf = fopen(seqFiles[k].c_str(), "rb");
+            if (!sf) { fputs("cannot read a sequence frame\n", stderr); return 1; }
+            _fseeki64(sf, 0, SEEK_END);
+            seqData.resize(size_t(_ftelli64(sf)));
+            _fseeki64(sf, 0, SEEK_SET);
+            const bool read = fread(seqData.data(), 1, seqData.size(), sf) == seqData.size();
+            fclose(sf);
+            unsigned hdr[4] = {};
+            if (read && seqData.size() > 36) memcpy(hdr, seqData.data() + 8, 16);
+            if (!read || memcmp(seqData.data(), "D5INP001", 8) || hdr[0] != w || hdr[1] != h || hdr[2] != 8) {
+                fputs("sequence frame is not an RGBA16F picture of the image's size\n", stderr); return 1;
+            }
+            const size_t pitch = hdr[3], plane = size_t(w) * h;
+            unsigned char* p = nullptr;
+            upload->Map(0, nullptr, reinterpret_cast<void**>(&p));
+            for (UINT y = 0; y < h; ++y)
+                for (UINT x = 0; x < w; ++x) {
+                    unsigned char* d = p + size_t(y) * fp.Footprint.RowPitch + x * 4;
+                    for (int c = 0; c < 3; ++c) {
+                        unsigned short hv;
+                        memcpy(&hv, seqData.data() + 36 + size_t(y) * pitch + x * 8 + c * 2, 2);
+                        float v = HalfToFloat(hv);
+                        v = !(v > 0.0f) ? 0.0f : v > 1.0f ? 1.0f : v;
+                        if (seqLinear) v = v <= 0.0031308f ? v * 12.92f : 1.055f * powf(v, 1.0f / 2.4f) - 0.055f;
+                        d[c] = (unsigned char)(v * 255.0f + 0.5f);
+                    }
+                    d[3] = 255;
+                }
+            upload->Unmap(0, nullptr);
+            size_t at = 36 + pitch * h;
+            const float *depthAt = nullptr, *mvAt = nullptr;
+            while (at + 16 <= seqData.size()) {
+                if (!memcmp(seqData.data() + at, "D5DEP001", 8)) { depthAt = reinterpret_cast<const float*>(seqData.data() + at + 16); at += 16 + plane * 4; }
+                else if (!memcmp(seqData.data() + at, "D5MOV001", 8)) { mvAt = reinterpret_cast<const float*>(seqData.data() + at + 16); at += 16 + plane * 8; }
+                else break;
+            }
+            if (!mvAt) { fputs("sequence frame without motion\n", stderr); return 1; }
+            mvUpload->Map(0, nullptr, reinterpret_cast<void**>(&p));
+            for (UINT y = 0; y < h; ++y) memcpy(p + size_t(y) * mvFp.Footprint.RowPitch, mvAt + size_t(y) * w * 2, size_t(w) * 8);
+            mvUpload->Unmap(0, nullptr);
+            seqDepth = depthAt != nullptr;
+            if (depthAt) {
+                depthUpload->Map(0, nullptr, reinterpret_cast<void**>(&p));
+                for (UINT y = 0; y < h; ++y) memcpy(p + size_t(y) * depthFp.Footprint.RowPitch, depthAt + size_t(y) * w, size_t(w) * 4);
+                depthUpload->Unmap(0, nullptr);
+            }
+        }
         MSG msg;
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
         const UINT index = sc->GetCurrentBackBufferIndex();
         ComPtr<ID3D12Resource> back;
         sc->GetBuffer(index, IID_PPV_ARGS(&back));
-        shift = (k * pan) % int(w);
+        shift = seqDir ? 0 : (k * pan) % int(w);
         alloc->Reset(); cl->Reset(alloc.Get(), nullptr);
         b = Transition(back.Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST);
         cl->ResourceBarrier(1, &b);
         D3D12_TEXTURE_COPY_LOCATION dst{};
         dst.pResource = back.Get(); dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        if (shift) {
+        if (seqDir) {
+            cl->CopyTextureRegion(&dst, 0, 0, 0, &bufUp, nullptr);
+            if (shimEvaluate && guides) {
+                D3D12_RESOURCE_BARRIER g[2] = {Transition(nrMotion.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST),
+                                               Transition(nrDepth.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST)};
+                cl->ResourceBarrier(2, g);
+                D3D12_TEXTURE_COPY_LOCATION gt{}, gb{};
+                gt.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                gb.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                gt.pResource = nrMotion.Get(); gb.pResource = mvUpload.Get(); gb.PlacedFootprint = mvFp;
+                cl->CopyTextureRegion(&gt, 0, 0, 0, &gb, nullptr);
+                if (seqDepth) {
+                    gt.pResource = nrDepth.Get(); gb.pResource = depthUpload.Get(); gb.PlacedFootprint = depthFp;
+                    cl->CopyTextureRegion(&gt, 0, 0, 0, &gb, nullptr);
+                }
+                g[0] = Transition(nrMotion.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET);
+                g[1] = Transition(nrDepth.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET);
+                cl->ResourceBarrier(2, g);
+            }
+        } else if (shift) {
             D3D12_BOX left{UINT(shift), 0, 0, w, h, 1}, right{0, 0, 0, UINT(shift), h, 1};
             cl->CopyTextureRegion(&dst, 0, 0, 0, &texSource, &left);
             cl->CopyTextureRegion(&dst, w - UINT(shift), 0, 0, &texSource, &right);
@@ -245,7 +373,7 @@ int main(int argc, char** argv) {
         // The upscaler's NR call, on the frame's own list.
         if (shimEvaluate &&
             shimEvaluate(cl.Get(), shimFeature, shimParams, nrColor.Get(), guides ? nrDepth.Get() : nullptr,
-                         guides ? nrMotion.Get() : nullptr, nrOutput.Get(), nrW, nrH, w / 2, h / 2, 1, 0, 1.0f, 0, 1.0f, 1.0f,
+                         guides ? nrMotion.Get() : nullptr, nrOutput.Get(), nrW, nrH, guideW, guideH, 1, 0, 1.0f, 0, 1.0f, 1.0f,
                          -1.0f, 1, float(nrW), float(nrH)) != 1)
             ++shimFailures;
         cl->Close();
@@ -301,5 +429,6 @@ int main(int argc, char** argv) {
     }
     back.Reset();
     wait();
+    if (argc > 10) Sleep(DWORD(atoi(argv[10])) * 1000);
     return diff > 0.5 ? 0 : 1;
 }
