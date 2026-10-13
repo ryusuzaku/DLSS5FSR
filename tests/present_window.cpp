@@ -14,7 +14,10 @@
 //     plays the upscaler's part as OptiScaler's DLSS-NR pass does: every
 //     frame it calls dlssnr_call_evaluate on its own list with a small
 //     colour, the motion of the pan and a depth, before it presents.
-//   guides: 0 hands the shim no motion (default 1).
+//   guides: 0 hands the shim no motion (default 1). 2: the same motion in
+//     pixels of the guides with scale 1, and a depth that is not inverted
+//     (near small), stated so: the result must be what 1 gives. 3: pixels
+//     only, the depth as it is.
 //   pan: pixels the picture moves to the left a frame (default 4; 0 a still).
 //   seq_dir: instead of the panned picture, the frames of a sequence capture
 //     (D5INP001 + D5DEP001 + D5MOV001, as the shim and the front end record
@@ -75,7 +78,8 @@ int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);  // a crash under the hook must not lose what was printed
     const bool show = argc > 4 && atoi(argv[4]) != 0;
     const char* shimPath = argc > 5 && argv[5][0] ? argv[5] : nullptr;
-    const bool guides = !(argc > 6 && atoi(argv[6]) == 0);
+    const int guideMode = argc > 6 ? atoi(argv[6]) : 1;
+    const bool guides = guideMode != 0, pixelGuides = guideMode >= 2, flipDepth = guideMode == 2;
     const int pan = argc > 7 ? atoi(argv[7]) : 4;
     const char* seqDir = argc > 8 && argv[8][0] ? argv[8] : nullptr;
     const bool seqLinear = argc > 9 && atoi(argv[9]) != 0;
@@ -206,6 +210,11 @@ int main(int argc, char** argv) {
     const UINT nrW = 256, nrH = 144;
     // The guides: half the frame for the pan, the frame's size for a sequence.
     const UINT guideW = seqDir ? w : w / 2, guideH = seqDir ? h : h / 2;
+    // The scale an upscaler host states (OptiScaler): vector units -> pixels
+    // of the guides (their extent for fractions of the frame, 1 for pixels),
+    // times the NR working size over the frame's.
+    const float mvScaleX = (pixelGuides ? 1.0f : float(guideW)) * float(nrW) / float(w);
+    const float mvScaleY = (pixelGuides ? 1.0f : float(guideH)) * float(nrH) / float(h);
     int shimFailures = 0;
     // A sequence's motion and depth go through upload buffers every frame.
     ComPtr<ID3D12Resource> mvUpload, depthUpload;
@@ -250,7 +259,9 @@ int main(int argc, char** argv) {
         const UINT step = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
         D3D12_CPU_DESCRIPTOR_HANDLE rtv = nrRtvs->GetCPUDescriptorHandleForHeapStart();
         ID3D12Resource* targets[3] = {nrColor.Get(), nrMotion.Get(), nrDepth.Get()};
-        const float clears[3][4] = {{0.3f, 0.3f, 0.3f, 1.0f}, {float(pan) / float(w), 0.0f, 0.0f, 0.0f}, {0.5f, 0.0f, 0.0f, 0.0f}};
+        const float clears[3][4] = {{0.3f, 0.3f, 0.3f, 1.0f},
+                                    {pixelGuides ? float(pan) * float(guideW) / float(w) : float(pan) / float(w), 0.0f, 0.0f, 0.0f},
+                                    {0.5f, 0.0f, 0.0f, 0.0f}};
         alloc->Reset(); cl->Reset(alloc.Get(), nullptr);
         for (int k = 0; k < 3; ++k) {
             device->CreateRenderTargetView(targets[k], nullptr, rtv);
@@ -322,12 +333,22 @@ int main(int argc, char** argv) {
             }
             if (!mvAt) { fputs("sequence frame without motion\n", stderr); return 1; }
             mvUpload->Map(0, nullptr, reinterpret_cast<void**>(&p));
-            for (UINT y = 0; y < h; ++y) memcpy(p + size_t(y) * mvFp.Footprint.RowPitch, mvAt + size_t(y) * w * 2, size_t(w) * 8);
+            for (UINT y = 0; y < h; ++y) {
+                float* row = reinterpret_cast<float*>(p + size_t(y) * mvFp.Footprint.RowPitch);
+                memcpy(row, mvAt + size_t(y) * w * 2, size_t(w) * 8);
+                if (pixelGuides)
+                    for (UINT x = 0; x < w; ++x) { row[x * 2] *= float(w); row[x * 2 + 1] *= float(h); }
+            }
             mvUpload->Unmap(0, nullptr);
             seqDepth = depthAt != nullptr;
             if (depthAt) {
                 depthUpload->Map(0, nullptr, reinterpret_cast<void**>(&p));
-                for (UINT y = 0; y < h; ++y) memcpy(p + size_t(y) * depthFp.Footprint.RowPitch, depthAt + size_t(y) * w, size_t(w) * 4);
+                for (UINT y = 0; y < h; ++y) {
+                    float* row = reinterpret_cast<float*>(p + size_t(y) * depthFp.Footprint.RowPitch);
+                    memcpy(row, depthAt + size_t(y) * w, size_t(w) * 4);
+                    if (flipDepth)
+                        for (UINT x = 0; x < w; ++x) row[x] = 1.0f - row[x];
+                }
                 depthUpload->Unmap(0, nullptr);
             }
         }
@@ -373,8 +394,8 @@ int main(int argc, char** argv) {
         // The upscaler's NR call, on the frame's own list.
         if (shimEvaluate &&
             shimEvaluate(cl.Get(), shimFeature, shimParams, nrColor.Get(), guides ? nrDepth.Get() : nullptr,
-                         guides ? nrMotion.Get() : nullptr, nrOutput.Get(), nrW, nrH, guideW, guideH, 1, 0, 1.0f, 0, 1.0f, 1.0f,
-                         -1.0f, 1, float(nrW), float(nrH)) != 1)
+                         guides ? nrMotion.Get() : nullptr, nrOutput.Get(), nrW, nrH, guideW, guideH, flipDepth ? 0 : 1, 0,
+                         1.0f, 0, 1.0f, 1.0f, -1.0f, 1, mvScaleX, mvScaleY) != 1)
             ++shimFailures;
         cl->Close();
         queue->ExecuteCommandLists(1, lists);

@@ -87,9 +87,23 @@ void PresentModeEvaluate(ID3D12GraphicsCommandList* cl, const Config& cfg, const
     final_picture::GuideTargets t;
     if (!motion || !motion->res || !motion->guideW || !motion->guideH || !final_picture::GetGuideTargets(&t)) return;
 
-    // The vectors under each working pixel (nearest), scaled by NGX's MV
-    // scale: fractions of the frame, as the engine's motion=uv expects. The
-    // pass multiplies by target / guide size (its pixel form), cancelled here.
+    // The vectors under each working pixel (nearest) as fractions of the
+    // frame, which is what the engine's motion=uv expects. A DLSS-NR caller
+    // states the scale from vector units to pixels of its working image, and
+    // (OptiScaler) gets there through "full-frame pixels" times working /
+    // frame size, whatever the vectors' own resolution: that scale over the
+    // guide extent, with the working / frame ratio taken back out, is the
+    // fraction of the frame. Without a statement, NGX's MV scale as it is.
+    // The pass multiplies by target / guide size (its pixel form), cancelled
+    // below.
+    float uvX = motion->scaleX, uvY = motion->scaleY;
+    if (motion->callerScaleX != 0.0f && motion->callerScaleY != 0.0f && motion->callerWidth && motion->callerHeight) {
+        const float workX = t.frameWidth ? (float)motion->callerWidth / (float)t.frameWidth : 1.0f;
+        const float workY = t.frameHeight ? (float)motion->callerHeight / (float)t.frameHeight : 1.0f;
+        uvX = motion->callerScaleX / (float)motion->guideW / workX;
+        uvY = motion->callerScaleY / (float)motion->guideH / workY;
+    }
+    if (motion->reset) final_picture::ResetHistory();
     bool motionOk = false, depthOk = false;
     PooledTexture* mvTex = GpuAcquireTexture(L"present motion", DXGI_FORMAT_R32G32_FLOAT, t.width, t.height);
     if (mvTex) {
@@ -102,8 +116,8 @@ void PresentModeEvaluate(ID3D12GraphicsCommandList* cl, const Config& cfg, const
         mc.Height = t.height;
         mc.GuideWidth = motion->guideW;
         mc.GuideHeight = motion->guideH;
-        mc.MvScaleX = motion->scaleX * (float)motion->guideW / (float)t.width;
-        mc.MvScaleY = motion->scaleY * (float)motion->guideH / (float)t.height;
+        mc.MvScaleX = uvX * (float)motion->guideW / (float)t.width;
+        mc.MvScaleY = uvY * (float)motion->guideH / (float)t.height;
         const bool ok = GpuNrDispatch(cl, mc, motion->res, nullptr, nullptr, nullptr, nullptr, mvTex->res.Get(), nullptr);
         GpuTransition(cl, motion->res, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, in);
         if (ok) {
@@ -130,6 +144,7 @@ void PresentModeEvaluate(ID3D12GraphicsCommandList* cl, const Config& cfg, const
         dc.Height = t.height;
         dc.GuideWidth = motion->depthW;
         dc.GuideHeight = motion->depthH;
+        dc.Pad1 = motion->depthInverted ? 0u : 8u;
         const bool ok = GpuNrDispatch(cl, dc, motion->depth, nullptr, nullptr, nullptr, nullptr, dTex->res.Get(), nullptr);
         GpuTransition(cl, motion->depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, in);
         if (ok) {
@@ -149,10 +164,11 @@ void PresentModeEvaluate(ID3D12GraphicsCommandList* cl, const Config& cfg, const
     if (depthOk) ++withDepth;
     if (calls == 1 || calls == 120 || (calls % 3000) == 0 || (motionOk && staged == 1)) {
         const final_picture::Stats& st = final_picture::GetStats();
-        LOGI("present: evaluate %llu: motion %ux%u -> %ux%u (scale %g,%g) staged %llu times, depth %llu; "
-             "%llu frames processed, %llu with the game's motion, %llu skipped",
-             calls, motion->guideW, motion->guideH, t.width, t.height, motion->scaleX, motion->scaleY, staged, withDepth,
-             st.frames, st.guideFrames, st.skipped);
+        LOGI("present: evaluate %llu: motion %ux%u -> %ux%u (caller's scale %g,%g for %ux%u; x%g,%g to fractions of the "
+             "%ux%u frame) staged %llu times, depth %llu (%s); %llu frames processed, %llu with the game's motion, %llu skipped",
+             calls, motion->guideW, motion->guideH, t.width, t.height, motion->callerScaleX, motion->callerScaleY,
+             motion->callerWidth, motion->callerHeight, uvX, uvY, t.frameWidth, t.frameHeight, staged, withDepth,
+             motion->depthInverted ? "inverted" : "not inverted", st.frames, st.guideFrames, st.skipped);
     }
 }
 

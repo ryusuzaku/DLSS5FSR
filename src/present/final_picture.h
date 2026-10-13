@@ -12,9 +12,10 @@
 //   wait     the queue waits for `result`
 //   list B   change map -> texture, frame copy + map -> back buffer
 // Nothing on the host waits for the device. The engine runs transfer=nvidia;
-// without the game's motion its history is read in place. A caller that
-// sees the game's motion vectors and depth earlier in the frame (an upscaler
-// hook) hands them over through GetGuideTargets / GuidesStaged.
+// without the game's motion it runs every frame on its own, as the original
+// does without a motion source (no history). A caller that sees the game's
+// motion vectors and depth earlier in the frame (an upscaler hook) hands
+// them over through GetGuideTargets / GuidesStaged.
 #pragma once
 
 #include <windows.h>
@@ -72,9 +73,12 @@ struct GuideTargets {
     ID3D12Resource* depth = nullptr;  // null: no depth
     unsigned int width = 0, height = 0;
     unsigned int motionPitch = 0, depthPitch = 0;
+    unsigned int frameWidth = 0, frameHeight = 0;  // the presented picture
 };
 bool GetGuideTargets(GuideTargets* out);
 void GuidesStaged(bool motion, bool depth);
+// The caller's Reset (a camera cut): the next frame runs without history.
+void ResetHistory();
 // Starts a sequence capture of `frames` frames at the next Process, as the
 // trigger file does (Config::capturePath must be set).
 void RequestCapture(int frames);

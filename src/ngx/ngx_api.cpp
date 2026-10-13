@@ -239,6 +239,14 @@ NVSDK_NGX_Result DoEvaluateD3D12(ID3D12GraphicsCommandList* cl,
         motion.res = mv;
         params->TryGetF(NVSDK_NGX_Parameter_MV_Scale_X, motion.scaleX);
         params->TryGetF(NVSDK_NGX_Parameter_MV_Scale_Y, motion.scaleY);
+        // A DLSS-NR caller's own statements (dlssnr_call_evaluate).
+        if (params->TryGetF("DLSSNR.MVecScaleX", motion.callerScaleX) &&
+            params->TryGetF("DLSSNR.MVecScaleY", motion.callerScaleY)) {
+            motion.callerWidth = colorRect.w; motion.callerHeight = colorRect.h;
+        }
+        unsigned int flag = 0;
+        if (params->TryGetUI("DLSSNR.DepthInverted", flag)) motion.depthInverted = flag != 0;
+        if (params->TryGetUI("DLSSNR.Reset", flag)) motion.reset = flag != 0;
         const D3D12_RESOURCE_DESC md = mv->GetDesc();
         const D3D12_RESOURCE_DESC cd = color->GetDesc();
         const D3D12_RESOURCE_DESC od = output->GetDesc();
@@ -809,8 +817,11 @@ int dlssnr_call_evaluate(ID3D12GraphicsCommandList* cmd, void* feature,
     // The extent the caller's guides cover (the game's render size).
     p->Set("DLSSNR.GuideWidth", guideWidth);
     p->Set("DLSSNR.GuideHeight", guideHeight);
-    (void)depthInverted; (void)reset;
-    (void)mvScaleX; (void)mvScaleY;
+    // What the caller states about its guides, as NVIDIA's own keys.
+    p->Set("DLSSNR.DepthInverted", (unsigned int)(depthInverted != 0));
+    p->Set("DLSSNR.Reset", (unsigned int)(reset != 0));
+    p->Set("DLSSNR.MVecScaleX", mvScaleX);
+    p->Set("DLSSNR.MVecScaleY", mvScaleY);
     {
         NrControls& c = NrControlValues();
         const float v[6] = {intensity, (float)style, localStructure, localTone, skinStructure, (float)useAutoMask};

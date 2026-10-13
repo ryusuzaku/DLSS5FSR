@@ -56,6 +56,8 @@ struct State {
     int (*reSyncSubmit)(const ReSyncJob*) = nullptr;
     const char* (*reLastError)() = nullptr;
     void (*reDestroy)() = nullptr;
+    int (*reReset)() = nullptr;  // optional: an older engine has none
+    std::atomic<bool> resetHistory{false};
     hipError_t (*importMemory)(hipExternalMemory_t*, const hipExternalMemoryHandleDesc*) = nullptr;
     hipError_t (*mappedBuffer)(void**, hipExternalMemory_t, const hipExternalMemoryBufferDesc*) = nullptr;
     hipError_t (*destroyMemory)(hipExternalMemory_t) = nullptr;
@@ -595,6 +597,7 @@ bool Init(ID3D12Device* device, ID3D12CommandQueue* queue, const Config& config)
         !Resolve(s.hip, "hipDestroyExternalSemaphore", s.destroySemaphore) ||
         !Resolve(s.hip, "hipDeviceSynchronize", s.deviceSynchronize))
         return Fail("engine or HIP export missing");
+    s.reReset = reinterpret_cast<int (*)()>(GetProcAddress(s.engine, "re_reset"));
     if (s.reCreate(config.engineConfig.c_str()) != 1) {
         Log("re_create: %s", s.reLastError());
         return Fail("the engine did not start");
@@ -687,6 +690,7 @@ bool Process(ID3D12Resource* bb) {
     j.wait_sem = s.semStaged; j.wait_value = n;
     j.out = s.ptrOut; j.out_pitch = s.pitch;
     j.signal_sem = s.semResult; j.signal_value = n;
+    if (s.resetHistory.exchange(false) && s.reReset) s.reReset();
     int accepted = 0;
     const long long t0 = NowMs();
     for (;;) {
@@ -753,8 +757,11 @@ bool GetGuideTargets(GuideTargets* out) {
     out->depth = s.ptrDepth ? s.bufDepth.Get() : nullptr;
     out->width = s.workW; out->height = s.workH;
     out->motionPitch = s.motionPitch; out->depthPitch = s.depthPitch;
+    out->frameWidth = s.width; out->frameHeight = s.height;
     return true;
 }
+
+void ResetHistory() { S().resetHistory = true; }
 
 void GuidesStaged(bool motion, bool depth) {
     S().guides = (motion ? 1 : 0) | (motion && depth ? 2 : 0);

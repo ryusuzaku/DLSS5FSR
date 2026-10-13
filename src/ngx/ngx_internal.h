@@ -397,6 +397,13 @@ struct MotionInput {
     // The RR diffuse albedo (optional) and the region of it covering the frame.
     ID3D12Resource* albedo = nullptr;
     unsigned int albedoW = 0, albedoH = 0;
+    // What a DLSS-NR caller states with the call (dlssnr_call_evaluate).
+    // callerScale: vector units -> pixels of the caller's working image
+    // (callerWidth x callerHeight); 0: not stated. Used by present mode.
+    float callerScaleX = 0.0f, callerScaleY = 0.0f;
+    unsigned int callerWidth = 0, callerHeight = 0;
+    bool depthInverted = true;  // near is large (the engine's reading)
+    bool reset = false;         // the caller's Reset: no history this frame
 };
 
 // The CPU mirror of cbuffer Params in shaders/dlssnr.hlsl.

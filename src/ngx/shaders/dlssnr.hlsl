@@ -49,6 +49,7 @@ cbuffer Params : register(b0)
     uint  gProxyMode;        // proxy curve: 0 soft knee, 1 hybrid, 2 scale+encode
     uint  gMapMode;          // resolve: the model texture is a ratio map (ratio, Y_in), not a picture;
                              // | 2 depth test, | 4 a delta map (encoded rgb change, Y_in): transfer=nvidia
+                             // depth pass: | 8 the depth is not inverted (near is small)
     float gMapInvGate;       // resolve, map mode: 1 / the luminance gate
 };
 
@@ -179,6 +180,9 @@ void main(uint3 id : SV_DispatchThreadID)
         texel = min(texel, int2(gGuideWidth, gGuideHeight) - 1);
         float d = gSource.Load(int3(texel, 0)).x;
         if (isnan(d) || isinf(d)) d = 0.0;
+        // The engine reads larger as nearer (reversed Z). A depth the caller
+        // calls not inverted is turned round here.
+        if ((gMapMode & 8u) != 0u) d = 1.0 - d;
         gTarget[id.xy] = float4(d, 0.0, 0.0, 0.0);
         return;
     }

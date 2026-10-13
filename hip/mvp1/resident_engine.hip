@@ -27,6 +27,7 @@
 #include "front_resident.h"
 #include "candidate_input_256.hip"
 #include <algorithm>
+#include <atomic>
 #include <condition_variable>
 #include <cstring>
 #include <fstream>
@@ -1235,6 +1236,7 @@ struct Engine {
     long long nv_frame = -1;
     unsigned nv_seed = 0;
     bool nv_history = false;
+    std::atomic<bool> nv_reset{false};  // re_reset: the next run starts over
     // re_depth: the newest submitted frame's depth (frame pixels) and the
     // job's copy, taken when the job starts.
     std::unique_ptr<Buffer> depth_next, job_depth;
@@ -1670,7 +1672,9 @@ struct Engine {
         if (nvidia) {
             // The previous run's image is the history when it is the previous
             // frame's, at this size; otherwise a reset (seed 0, no history).
-            // Without motion the history is read in place.
+            // The original's gate also needs a motion source: a frame without
+            // vectors runs without the temporal branch (its history features
+            // are the frame itself, no blend), while the seed counts on.
             const size_t fpx = size_t(frame_w)*frame_h;
             for (auto& im : nv_image)
                 if (!im || im->count < fpx*3) { im.reset(new Buffer(fpx*3)); nv_frame = -1; }
@@ -1678,14 +1682,16 @@ struct Engine {
             for (int p = 1; p < options.passes; ++p)
                 for (auto& im : nv_more[p-1])
                     if (!im || im->count < fpx*3) { im.reset(new Buffer(fpx*3)); nv_frame = -1; }
-            nv_history = nv_frame >= 0 && nv_frame == job_frame - 1 && nv_w == frame_w && nv_h == frame_h;
+            if (nv_reset.exchange(false)) nv_frame = -1;
+            const bool nv_consecutive = nv_frame >= 0 && nv_frame == job_frame - 1 && nv_w == frame_w && nv_h == frame_h;
+            nv_history = nv_consecutive && nv_mv != nullptr;
             if (nv_history) {
                 hipLaunchKernelGGL(k_seq_pre, dim3((W*H+255)/256), dim3(256), 0, stream,
                                    nv_image[nv_cur]->data, nv_mv, job_depth_valid ? job_depth->data : nullptr,
                                    nv_feat->data, frame_w, frame_h, W, H, nv_ms);
                 HIP_CHECK(hipGetLastError());
             }
-            nv_seed = nv_history ? nv_seed + 1 : 0;
+            nv_seed = nv_consecutive ? nv_seed + 1 : 0;
         }
         if (temporal) {
             size_t count = size_t(W)*H*3;
@@ -2388,6 +2394,15 @@ __declspec(dllexport) int re_sync_submit(const ReSyncJob* job) {
     std::lock_guard<std::mutex> lock(g_mutex);
     if (!g_engine || !job) return -1;
     return g_engine->sync_submit(*job);
+}
+
+// transfer=nvidia: the next frame starts over as the first one does (no
+// history, noise seed 0): the caller's Reset (a camera cut, a loading screen).
+__declspec(dllexport) int re_reset() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!g_engine) return -1;
+    g_engine->nv_reset = true;
+    return 1;
 }
 
 // Synchronous jobs finished and failed so far (failed ones still signalled).
