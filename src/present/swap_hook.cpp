@@ -152,7 +152,8 @@ void OnPresent(IDXGISwapChain* sc) {
     g_captureDown = capture;
     const bool passes = g_settings.passesKey && (GetAsyncKeyState(g_settings.passesKey) & 0x8000) != 0;
     if (passes && !g_passesDown) {
-        const int next = g_passes % 3 + 1;
+        const int most = g_settings.maxPasses < 1 ? 1 : g_settings.maxPasses > 3 ? 3 : g_settings.maxPasses;
+        const int next = g_passes % most + 1;
         if (final_picture::SetPasses(next)) { g_passes = next; Log("passes key: %d pass%s", next, next == 1 ? "" : "es"); }
         else Log("passes key: this engine cannot change its passes while running");
     }

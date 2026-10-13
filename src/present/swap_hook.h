@@ -20,7 +20,8 @@ struct Settings {
     int toggleKey = VK_F10;
     std::wstring capturePath;  // final_picture::Config::capturePath
     int captureKey = 0;        // records captureFrames consecutive frames; 0 none
-    int passesKey = 0;         // cycles the engine through 1, 2, 3 passes; 0 none
+    int passesKey = 0;         // cycles the engine through 1..maxPasses passes; 0 none
+    int maxPasses = 2;         // 1..3: three starts to invent texture and deepens what trails
     int captureFrames = 60;
 };
 

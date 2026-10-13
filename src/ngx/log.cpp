@@ -63,7 +63,13 @@ void LogV(LogLevel level, const char* fmt, ...) {
     if (!g_log.is_open()) return;
     // Narrow -> wide. Log lines are ASCII by construction.
     std::wstring w(buf, buf + n);
-    g_log << L"[" << LevelTag(level) << L"] " << w << L"\n";
+    // The time of day first: OptiScaler's log has it too, and the two are
+    // read side by side.
+    SYSTEMTIME now;
+    GetLocalTime(&now);
+    wchar_t stamp[24];
+    swprintf(stamp, 24, L"[%02u:%02u:%02u.%03u] ", now.wHour, now.wMinute, now.wSecond, now.wMilliseconds);
+    g_log << stamp << L"[" << LevelTag(level) << L"] " << w << L"\n";
     g_log.flush();
 }
 
@@ -190,6 +196,7 @@ void ConfigLoad(const std::wstring& dir) {
             else if (key == L"PresentToggleKey") c.presentToggleKey = std::stoi(val, nullptr, 0);
             else if (key == L"PresentCaptureKey") c.presentCaptureKey = std::stoi(val, nullptr, 0);
             else if (key == L"PresentPassesKey") c.presentPassesKey = std::stoi(val, nullptr, 0);
+            else if (key == L"PresentMaxPasses") c.presentMaxPasses = std::stoi(val);
             else if (key == L"PresentCaptureFrames") c.presentCaptureFrames = std::stoi(val);
             else if (key == L"ResidentEngineMap") c.residentEngineMap = (std::stoi(val) != 0);
             else if (key == L"WhitePoint")       c.whitePoint = std::stof(val);

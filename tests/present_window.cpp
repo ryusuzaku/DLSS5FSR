@@ -24,6 +24,11 @@
 //     them) of the image's size: frame k is drawn, and its own motion and
 //     depth are what the NR evaluate is handed. linear 1: the pictures are
 //     linear light and are sRGB-encoded first.
+//   Environment PW_SWITCH=N (pan only): from frame N on the upscaler has
+//     changed its quality mode, as a game does in its settings: the vectors
+//     come in a new texture of another size while the depth handed over is
+//     still the old one, and the swap chain's buffers are re-made
+//     (ResizeBuffers at the same size). The picture must carry on.
 //   linger: seconds to stay alive after the last frame (a sequence capture
 //     the front end recorded is written by a thread of this process).
 
@@ -205,7 +210,8 @@ int main(int argc, char** argv) {
     typedef int (*AllocFn)(void**);
     EvaluateFn shimEvaluate = nullptr;
     void *shimFeature = nullptr, *shimParams = nullptr;
-    ComPtr<ID3D12Resource> nrColor, nrOutput, nrMotion, nrDepth;
+    ComPtr<ID3D12Resource> nrColor, nrOutput, nrMotion, nrDepth, nrMotion2;
+    const int switchAt = getenv("PW_SWITCH") && !seqDir ? atoi(getenv("PW_SWITCH")) : -1;
     ComPtr<ID3D12DescriptorHeap> nrRtvs;
     const UINT nrW = 256, nrH = 144;
     // The guides: half the frame for the pan, the frame's size for a sequence.
@@ -215,6 +221,9 @@ int main(int argc, char** argv) {
     // times the NR working size over the frame's.
     const float mvScaleX = (pixelGuides ? 1.0f : float(guideW)) * float(nrW) / float(w);
     const float mvScaleY = (pixelGuides ? 1.0f : float(guideH)) * float(nrH) / float(h);
+    const UINT guideW2 = guideW * 7 / 8, guideH2 = guideH * 7 / 8;  // PW_SWITCH: the other quality mode
+    const float mvScaleX2 = (pixelGuides ? 1.0f : float(guideW2)) * float(nrW) / float(w);
+    const float mvScaleY2 = (pixelGuides ? 1.0f : float(guideH2)) * float(nrH) / float(h);
     int shimFailures = 0;
     // A sequence's motion and depth go through upload buffers every frame.
     ComPtr<ID3D12Resource> mvUpload, depthUpload;
@@ -248,7 +257,7 @@ int main(int argc, char** argv) {
         };
         D3D12_DESCRIPTOR_HEAP_DESC hd{};
         hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-        hd.NumDescriptors = 3;
+        hd.NumDescriptors = 4;
         if (!texture(nrW, nrH, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET, nrColor) ||
             !texture(nrW, nrH, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nrOutput) ||
             !texture(guideW, guideH, seqDir ? DXGI_FORMAT_R32G32_FLOAT : DXGI_FORMAT_R16G16_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET, nrMotion) ||
@@ -258,14 +267,21 @@ int main(int argc, char** argv) {
         }
         const UINT step = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
         D3D12_CPU_DESCRIPTOR_HANDLE rtv = nrRtvs->GetCPUDescriptorHandleForHeapStart();
-        ID3D12Resource* targets[3] = {nrColor.Get(), nrMotion.Get(), nrDepth.Get()};
+        if (switchAt >= 0 && !texture(guideW2, guideH2, DXGI_FORMAT_R16G16_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                                      D3D12_RESOURCE_STATE_RENDER_TARGET, nrMotion2)) {
+            fputs("second motion texture failed\n", stderr); return 1;
+        }
+        ID3D12Resource* targets[4] = {nrColor.Get(), nrMotion.Get(), nrDepth.Get(), nrMotion2.Get()};
         const float clears[3][4] = {{0.3f, 0.3f, 0.3f, 1.0f},
                                     {pixelGuides ? float(pan) * float(guideW) / float(w) : float(pan) / float(w), 0.0f, 0.0f, 0.0f},
                                     {0.5f, 0.0f, 0.0f, 0.0f}};
         alloc->Reset(); cl->Reset(alloc.Get(), nullptr);
-        for (int k = 0; k < 3; ++k) {
+        for (int k = 0; k < 4; ++k) {
+            if (!targets[k]) continue;
             device->CreateRenderTargetView(targets[k], nullptr, rtv);
-            cl->ClearRenderTargetView(rtv, clears[k], 0, nullptr);
+            // The second motion texture: the same vectors (pixels of its own extent, or fractions).
+            const float second[4] = {pixelGuides ? float(pan) * float(guideW2) / float(w) : float(pan) / float(w), 0.0f, 0.0f, 0.0f};
+            cl->ClearRenderTargetView(rtv, k == 3 ? second : clears[k], 0, nullptr);
             rtv.ptr += step;
         }
         cl->Close();
@@ -354,6 +370,12 @@ int main(int argc, char** argv) {
         }
         MSG msg;
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
+        const bool switched = switchAt >= 0 && k >= switchAt;
+        if (k == switchAt) {
+            wait();
+            if (FAILED(sc->ResizeBuffers(2, w, h, DXGI_FORMAT_R8G8B8A8_UNORM, 0))) { fputs("ResizeBuffers failed\n", stderr); return 1; }
+            printf("frame %d: buffers re-made, vectors now %ux%u beside the old %ux%u depth\n", k, guideW2, guideH2, guideW, guideH);
+        }
         const UINT index = sc->GetCurrentBackBufferIndex();
         ComPtr<ID3D12Resource> back;
         sc->GetBuffer(index, IID_PPV_ARGS(&back));
@@ -394,8 +416,9 @@ int main(int argc, char** argv) {
         // The upscaler's NR call, on the frame's own list.
         if (shimEvaluate &&
             shimEvaluate(cl.Get(), shimFeature, shimParams, nrColor.Get(), guides ? nrDepth.Get() : nullptr,
-                         guides ? nrMotion.Get() : nullptr, nrOutput.Get(), nrW, nrH, guideW, guideH, flipDepth ? 0 : 1, 0,
-                         1.0f, 0, 1.0f, 1.0f, -1.0f, 1, mvScaleX, mvScaleY) != 1)
+                         guides ? (switched ? nrMotion2.Get() : nrMotion.Get()) : nullptr, nrOutput.Get(), nrW, nrH,
+                         switched ? guideW2 : guideW, switched ? guideH2 : guideH, flipDepth ? 0 : 1, 0,
+                         1.0f, 0, 1.0f, 1.0f, -1.0f, 1, switched ? mvScaleX2 : mvScaleX, switched ? mvScaleY2 : mvScaleY) != 1)
             ++shimFailures;
         cl->Close();
         queue->ExecuteCommandLists(1, lists);
