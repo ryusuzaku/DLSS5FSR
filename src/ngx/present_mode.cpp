@@ -60,6 +60,7 @@ void PresentModeEvaluate(ID3D12GraphicsCommandList* cl, const Config& cfg, const
         g_settings.captureKey = cfg.presentCaptureKey;
         g_settings.passesKey = cfg.presentPassesKey;
         g_settings.maxPasses = cfg.presentMaxPasses;
+        g_settings.historyKey = cfg.presentHistoryKey;
         g_settings.captureFrames = cfg.presentCaptureFrames;
         if (NrControlValues().generation) Controls(g_settings.controls);
         LOGI("present: mode on, engine config %s, working scale %g (0: within %.0f pixels)", config,

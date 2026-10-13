@@ -22,6 +22,7 @@ struct Settings {
     int captureKey = 0;        // records captureFrames consecutive frames; 0 none
     int passesKey = 0;         // cycles the engine through 1..maxPasses passes; 0 none
     int maxPasses = 2;         // 1..3: three starts to invent texture and deepens what trails
+    int historyKey = 0;        // cycles the history amount 1, 0.5, 0.25, 0; 0 none
     int captureFrames = 60;
 };
 

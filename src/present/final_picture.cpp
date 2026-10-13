@@ -58,6 +58,7 @@ struct State {
     void (*reDestroy)() = nullptr;
     int (*reReset)() = nullptr;  // optional: an older engine has none
     int (*reSetPasses)(int) = nullptr;
+    int (*reSetHistory)(float) = nullptr;
     std::atomic<bool> resetHistory{false};
     hipError_t (*importMemory)(hipExternalMemory_t*, const hipExternalMemoryHandleDesc*) = nullptr;
     hipError_t (*mappedBuffer)(void**, hipExternalMemory_t, const hipExternalMemoryBufferDesc*) = nullptr;
@@ -600,6 +601,7 @@ bool Init(ID3D12Device* device, ID3D12CommandQueue* queue, const Config& config)
         return Fail("engine or HIP export missing");
     s.reReset = reinterpret_cast<int (*)()>(GetProcAddress(s.engine, "re_reset"));
     s.reSetPasses = reinterpret_cast<int (*)(int)>(GetProcAddress(s.engine, "re_set_passes"));
+    s.reSetHistory = reinterpret_cast<int (*)(float)>(GetProcAddress(s.engine, "re_set_history"));
     if (s.reCreate(config.engineConfig.c_str()) != 1) {
         Log("re_create: %s", s.reLastError());
         return Fail("the engine did not start");
@@ -764,6 +766,12 @@ bool GetGuideTargets(GuideTargets* out) {
 }
 
 void ResetHistory() { S().resetHistory = true; }
+
+bool SetHistory(float amount) {
+    State& s = S();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    return s.ready && s.reSetHistory && s.reSetHistory(amount) == 1;
+}
 
 bool SetPasses(int passes) {
     State& s = S();

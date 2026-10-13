@@ -101,6 +101,8 @@ ID3D12CommandQueue* QueueOf(IDXGISwapChain* sc) {
 }
 bool g_started = false, g_failed = false, g_on = true, g_keyDown = false, g_captureDown = false, g_passesDown = false;
 int g_passes = 1;
+bool g_historyDown = false;
+int g_historyStep = 0;
 unsigned long long g_presents = 0;
 
 void OnPresent(IDXGISwapChain* sc) {
@@ -158,6 +160,14 @@ void OnPresent(IDXGISwapChain* sc) {
         else Log("passes key: this engine cannot change its passes while running");
     }
     g_passesDown = passes;
+    const bool history = g_settings.historyKey && (GetAsyncKeyState(g_settings.historyKey) & 0x8000) != 0;
+    if (history && !g_historyDown) {
+        static const float amounts[4] = {1.0f, 0.5f, 0.25f, 0.0f};
+        const int next = (g_historyStep + 1) % 4;
+        if (final_picture::SetHistory(amounts[next])) { g_historyStep = next; Log("history key: amount %.2f", amounts[next]); }
+        else Log("history key: this engine cannot change its history amount while running");
+    }
+    g_historyDown = history;
     if (!g_on) return;
     ComPtr<IDXGISwapChain3> sc3;
     ComPtr<ID3D12Resource> back;

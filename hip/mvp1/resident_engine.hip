@@ -233,6 +233,18 @@ struct OutputOptions {
     // the original several times in a row do). The map is the last pass's
     // output against the frame the first pass saw. Cost is linear in N.
     int passes = 1;
+    // history=A (transfer=nvidia, 0..1, default 1; ours below 1): how much of
+    // the original's recurrence is used. 1 is the original. 0 is the original
+    // on a frame without history (its history features are the frame itself,
+    // no blend). In between, the features lean that far from the frame toward
+    // the carried history and the post block's weight is scaled by A (the
+    // "history strength" a host hands the original scales only that weight,
+    // and on its own changes little: the network builds on the features).
+    // Fed its own output, the network deepens what it did the frame before
+    // (soft shadows most of all, more with every pass), and where the light
+    // moves without motion vectors that depth follows late. Less history
+    // gives a lighter, quicker and less steady picture.
+    float history = 1.0f;
     // input_temporal=A (S332): a TAA pass on the network's input only -- the
     // frame blended with the previous network input carried along the motion
     // by A, the history clamped to the frame's 3x3 range and dropped where the
@@ -799,8 +811,11 @@ __device__ inline float3 hist_5tap(const float* h, int fw, int fh, float px, flo
 // past its edge as the colour is). mv: frame pixels after scaling by ms
 // (previous = current + mv*ms); depth (reversed-Z, optional): the vector is
 // read at whichever of the pixel and its four diagonal neighbours is nearest.
+// amount (history=A) below 1: the features lean only that far from the frame
+// this pass is shown (raw) toward the history.
 __global__ void k_seq_pre(const float* hist, const float2* mv, const float* depth, float* out,
-                          int fw, int fh, int W, int H, float2 ms = make_float2(1.0f, 1.0f)) {
+                          int fw, int fh, int W, int H, float2 ms = make_float2(1.0f, 1.0f),
+                          float amount = 1.0f, const unsigned char* raw = nullptr, int pitch = 0, int bpp = 0) {
     const int i = blockIdx.x*blockDim.x + threadIdx.x;
     if (i >= W*H) return;
     const int x = i % W, y = i / W;
@@ -818,7 +833,13 @@ __global__ void k_seq_pre(const float* hist, const float2* mv, const float* dept
     float2 v = mv ? mv[size_t(my)*fw + mx] : make_float2(0.0f, 0.0f);
     v.x *= ms.x; v.y *= ms.y;
     if (!isfinite(v.x) || !isfinite(v.y)) v = make_float2(0.0f, 0.0f);
-    const float3 h = hist_5tap(hist, fw, fh, sx + 0.5f + v.x, sy + 0.5f + v.y);
+    float3 h = hist_5tap(hist, fw, fh, sx + 0.5f + v.x, sy + 0.5f + v.y);
+    if (raw && amount < 1.0f) {
+        const unsigned char* px = raw + size_t(sy)*pitch + size_t(sx)*bpp;
+        float c[3];
+        for (int n = 0; n < 3; ++n) { const float f = frame_channel(px, bpp, n); c[n] = f > 0.0f ? fminf(f, 1.0f) : 0.0f; }
+        h = make_float3(c[0] + (h.x - c[0])*amount, c[1] + (h.y - c[1])*amount, c[2] + (h.z - c[2])*amount);
+    }
     out[size_t(i)*3] = h.x; out[size_t(i)*3+1] = h.y; out[size_t(i)*3+2] = h.z;
 }
 
@@ -1238,6 +1259,7 @@ struct Engine {
     bool nv_history = false;
     std::atomic<bool> nv_reset{false};  // re_reset: the next run starts over
     std::atomic<int> passes_request{0}; // re_set_passes: taken at the next run
+    std::atomic<int> history_request{-1}; // re_set_history: thousandths, taken at the next run
     // re_depth: the newest submitted frame's depth (frame pixels) and the
     // job's copy, taken when the job starts.
     std::unique_ptr<Buffer> depth_next, job_depth;
@@ -1284,6 +1306,7 @@ struct Engine {
             else if (key == "rel_gate") options.rel_gate = std::stof(value);
             else if (key == "smooth_depth") options.smooth_depth = std::stoi(value);
             else if (key == "passes") options.passes = std::min(std::max(std::stoi(value), 1), 3);
+            else if (key == "history") options.history = std::min(std::max(std::stof(value), 0.0f), 1.0f);
             else if (key == "input_temporal") options.input_temporal = std::stof(value);
             else if (key == "extent" && (value == "compact" || value == "legacy")) options.compact = value == "compact";
             else if (key == "tone") options.tone = std::stof(value);
@@ -1616,6 +1639,7 @@ struct Engine {
     void run(bool wait = true) {
         HIP_CHECK(hipStreamWaitEvent(stream, inputs_ready, 0));
         if (const int passes = passes_request.exchange(0)) options.passes = std::min(std::max(passes, 1), 3);
+        if (const int amount = history_request.exchange(-1); amount >= 0) options.history = std::min(amount, 1000) / 1000.0f;
         int W = 256, H = 256;
         // Luma mode may run the network on a downscale of the frame (scale).
         int sw = frame_w, sh = frame_h;
@@ -1690,7 +1714,8 @@ struct Engine {
             if (nv_history) {
                 hipLaunchKernelGGL(k_seq_pre, dim3((W*H+255)/256), dim3(256), 0, stream,
                                    nv_image[nv_cur]->data, nv_mv, job_depth_valid ? job_depth->data : nullptr,
-                                   nv_feat->data, frame_w, frame_h, W, H, nv_ms);
+                                   nv_feat->data, frame_w, frame_h, W, H, nv_ms, options.history,
+                                   reinterpret_cast<const unsigned char*>(raw_input->data.get()), frame_pitch, frame_bpp);
                 HIP_CHECK(hipGetLastError());
             }
             nv_seed = nv_consecutive ? nv_seed + 1 : 0;
@@ -1754,7 +1779,7 @@ struct Engine {
             hipLaunchKernelGGL(k_seq_post, dim3((frame_w*frame_h+255)/256), dim3(256), 0, stream,
                                net->rgb_native->data, nv_history ? net->head70->native_view().data : nullptr,
                                hist_row->data, nv_image[nv_cur]->data, nv_mv, nv_image[next]->data,
-                               frame_w, frame_h, W, 0.7397f, int(nv_history), nv_ms);
+                               frame_w, frame_h, W, 0.7397f*options.history, int(nv_history), nv_ms);
             HIP_CHECK(hipGetLastError());
             nv_cur = next; nv_frame = job_frame; nv_w = frame_w; nv_h = frame_h;
         }
@@ -1776,7 +1801,7 @@ struct Engine {
                 if (nv_history)
                     hipLaunchKernelGGL(k_seq_pre, dim3((W*H+255)/256), dim3(256), 0, stream,
                                        im[cur]->data, nv_mv, job_depth_valid ? job_depth->data : nullptr,
-                                       nv_feat->data, frame_w, frame_h, W, H, nv_ms);
+                                       nv_feat->data, frame_w, frame_h, W, H, nv_ms, options.history, pass_frame, pass_pitch, 8);
                 HIP_CHECK(hipGetLastError());
                 net->front->controls.v[1] = 0.0f;  // the tone is the first pass's alone
                 net->run(pass_frame, frame_w, frame_h, pass_pitch, 8, false, stream, sw, sh, nullptr,
@@ -1784,7 +1809,7 @@ struct Engine {
                 hipLaunchKernelGGL(k_seq_post, dim3((frame_w*frame_h+255)/256), dim3(256), 0, stream,
                                    net->rgb_native->data, nv_history ? net->head70->native_view().data : nullptr,
                                    hist_row->data, im[cur]->data, nv_mv, im[cur ^ 1]->data,
-                                   frame_w, frame_h, W, 0.7397f, int(nv_history), nv_ms);
+                                   frame_w, frame_h, W, 0.7397f*options.history, int(nv_history), nv_ms);
                 HIP_CHECK(hipGetLastError());
                 cur ^= 1;
                 nv_final = im[cur]->data;
@@ -2413,6 +2438,15 @@ __declspec(dllexport) int re_set_passes(int passes) {
     std::lock_guard<std::mutex> lock(g_mutex);
     if (!g_engine) return -1;
     g_engine->passes_request = std::min(std::max(passes, 1), 3);
+    return 1;
+}
+
+// transfer=nvidia: the history amount (the config's history=A, 0..1) from
+// the next frame on.
+__declspec(dllexport) int re_set_history(float amount) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!g_engine) return -1;
+    g_engine->history_request = int(std::min(std::max(amount, 0.0f), 1.0f)*1000.0f + 0.5f);
     return 1;
 }
 
