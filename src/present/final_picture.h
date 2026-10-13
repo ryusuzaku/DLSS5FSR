@@ -77,6 +77,9 @@ struct GuideTargets {
 };
 bool GetGuideTargets(GuideTargets* out);
 void GuidesStaged(bool motion, bool depth);
+// How many times the engine runs the network on a frame (1..3), from the
+// next frame on. False: this engine cannot change it while it runs.
+bool SetPasses(int passes);
 // The caller's Reset (a camera cut): the next frame runs without history.
 void ResetHistory();
 // Starts a sequence capture of `frames` frames at the next Process, as the

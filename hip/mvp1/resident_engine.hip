@@ -1237,6 +1237,7 @@ struct Engine {
     unsigned nv_seed = 0;
     bool nv_history = false;
     std::atomic<bool> nv_reset{false};  // re_reset: the next run starts over
+    std::atomic<int> passes_request{0}; // re_set_passes: taken at the next run
     // re_depth: the newest submitted frame's depth (frame pixels) and the
     // job's copy, taken when the job starts.
     std::unique_ptr<Buffer> depth_next, job_depth;
@@ -1614,6 +1615,7 @@ struct Engine {
     // the host waits for the device; net_done marks the end of the ratio map.
     void run(bool wait = true) {
         HIP_CHECK(hipStreamWaitEvent(stream, inputs_ready, 0));
+        if (const int passes = passes_request.exchange(0)) options.passes = std::min(std::max(passes, 1), 3);
         int W = 256, H = 256;
         // Luma mode may run the network on a downscale of the frame (scale).
         int sw = frame_w, sh = frame_h;
@@ -2402,6 +2404,15 @@ __declspec(dllexport) int re_reset() {
     std::lock_guard<std::mutex> lock(g_mutex);
     if (!g_engine) return -1;
     g_engine->nv_reset = true;
+    return 1;
+}
+
+// transfer=nvidia: the number of passes (1..3, the config's passes=N) from
+// the next frame on.
+__declspec(dllexport) int re_set_passes(int passes) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!g_engine) return -1;
+    g_engine->passes_request = std::min(std::max(passes, 1), 3);
     return 1;
 }
 

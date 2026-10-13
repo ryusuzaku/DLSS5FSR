@@ -99,7 +99,8 @@ ID3D12CommandQueue* QueueOf(IDXGISwapChain* sc) {
     }
     return g_seenQueue;
 }
-bool g_started = false, g_failed = false, g_on = true, g_keyDown = false, g_captureDown = false;
+bool g_started = false, g_failed = false, g_on = true, g_keyDown = false, g_captureDown = false, g_passesDown = false;
+int g_passes = 1;
 unsigned long long g_presents = 0;
 
 void OnPresent(IDXGISwapChain* sc) {
@@ -149,6 +150,13 @@ void OnPresent(IDXGISwapChain* sc) {
         final_picture::RequestCapture(g_settings.captureFrames);
     }
     g_captureDown = capture;
+    const bool passes = g_settings.passesKey && (GetAsyncKeyState(g_settings.passesKey) & 0x8000) != 0;
+    if (passes && !g_passesDown) {
+        const int next = g_passes % 3 + 1;
+        if (final_picture::SetPasses(next)) { g_passes = next; Log("passes key: %d pass%s", next, next == 1 ? "" : "es"); }
+        else Log("passes key: this engine cannot change its passes while running");
+    }
+    g_passesDown = passes;
     if (!g_on) return;
     ComPtr<IDXGISwapChain3> sc3;
     ComPtr<ID3D12Resource> back;

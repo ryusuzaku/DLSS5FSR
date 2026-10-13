@@ -57,6 +57,7 @@ struct State {
     const char* (*reLastError)() = nullptr;
     void (*reDestroy)() = nullptr;
     int (*reReset)() = nullptr;  // optional: an older engine has none
+    int (*reSetPasses)(int) = nullptr;
     std::atomic<bool> resetHistory{false};
     hipError_t (*importMemory)(hipExternalMemory_t*, const hipExternalMemoryHandleDesc*) = nullptr;
     hipError_t (*mappedBuffer)(void**, hipExternalMemory_t, const hipExternalMemoryBufferDesc*) = nullptr;
@@ -598,6 +599,7 @@ bool Init(ID3D12Device* device, ID3D12CommandQueue* queue, const Config& config)
         !Resolve(s.hip, "hipDeviceSynchronize", s.deviceSynchronize))
         return Fail("engine or HIP export missing");
     s.reReset = reinterpret_cast<int (*)()>(GetProcAddress(s.engine, "re_reset"));
+    s.reSetPasses = reinterpret_cast<int (*)(int)>(GetProcAddress(s.engine, "re_set_passes"));
     if (s.reCreate(config.engineConfig.c_str()) != 1) {
         Log("re_create: %s", s.reLastError());
         return Fail("the engine did not start");
@@ -762,6 +764,12 @@ bool GetGuideTargets(GuideTargets* out) {
 }
 
 void ResetHistory() { S().resetHistory = true; }
+
+bool SetPasses(int passes) {
+    State& s = S();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    return s.ready && s.reSetPasses && s.reSetPasses(passes) == 1;
+}
 
 void GuidesStaged(bool motion, bool depth) {
     S().guides = (motion ? 1 : 0) | (motion && depth ? 2 : 0);

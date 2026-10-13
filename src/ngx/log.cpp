@@ -189,6 +189,7 @@ void ConfigLoad(const std::wstring& dir) {
             else if (key == L"PresentMaxWorkingPixels") c.presentMaxWorkingPixels = std::stof(val);
             else if (key == L"PresentToggleKey") c.presentToggleKey = std::stoi(val, nullptr, 0);
             else if (key == L"PresentCaptureKey") c.presentCaptureKey = std::stoi(val, nullptr, 0);
+            else if (key == L"PresentPassesKey") c.presentPassesKey = std::stoi(val, nullptr, 0);
             else if (key == L"PresentCaptureFrames") c.presentCaptureFrames = std::stoi(val);
             else if (key == L"ResidentEngineMap") c.residentEngineMap = (std::stoi(val) != 0);
             else if (key == L"WhitePoint")       c.whitePoint = std::stof(val);
