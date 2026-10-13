@@ -11,8 +11,10 @@
 //            signals `result`
 //   wait     the queue waits for `result`
 //   list B   change map -> texture, frame copy + map -> back buffer
-// Nothing on the host waits for the device. The engine runs transfer=nvidia
-// without motion (its history is read in place).
+// Nothing on the host waits for the device. The engine runs transfer=nvidia;
+// without the game's motion its history is read in place. A caller that
+// sees the game's motion vectors and depth earlier in the frame (an upscaler
+// hook) hands them over through GetGuideTargets / GuidesStaged.
 #pragma once
 
 #include <windows.h>
@@ -37,6 +39,7 @@ struct Config {
 struct Stats {
     unsigned long long frames = 0;    // Process calls that queued a job
     unsigned long long skipped = 0;   // frames presented untouched
+    unsigned long long guideFrames = 0;  // jobs that carried the game's motion
     unsigned int workWidth = 0, workHeight = 0;
     bool active = false;
     const char* error = "";
@@ -48,6 +51,21 @@ bool Init(ID3D12Device* device, ID3D12CommandQueue* queue, const Config& config)
 // state. False: the frame was left untouched.
 bool Process(ID3D12Resource* backBuffer);
 void SetControls(const float controls[6]);
+// The game's motion and depth for the frame about to be presented. The
+// caller records, on the list the game will submit before it presents, a
+// copy of each into these buffers as rows of the working size: motion as
+// two floats per pixel (previous = current + v, in the units the engine's
+// config names: motion=uv means fractions of the frame), depth as one float
+// (reversed-Z), at the given row pitches. Then GuidesStaged; the next
+// Process hands them to the engine. False until a frame has been sized.
+struct GuideTargets {
+    ID3D12Resource* motion = nullptr;
+    ID3D12Resource* depth = nullptr;  // null: no depth
+    unsigned int width = 0, height = 0;
+    unsigned int motionPitch = 0, depthPitch = 0;
+};
+bool GetGuideTargets(GuideTargets* out);
+void GuidesStaged(bool motion, bool depth);
 // Blocks until everything queued so far has run (resize, shutdown, tests).
 void Flush();
 // Before a swap chain resizes or recreates its buffers: waits as Flush does

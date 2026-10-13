@@ -46,13 +46,43 @@ echo "== counter.hlsl -> counter_cs.h"
 (cd src/ngx/shaders && MSYS_NO_PATHCONV=1 "$FXC" /nologo /T cs_5_0 /E main \
      /Vn g_counter /Fh counter_cs.h counter.hlsl)
 
+# ------------------------------------------------- final-picture front end --
+# src/present: the engine applied to a finished frame at present time (any
+# D3D12 swap chain), and its headless harness. Needs ROCm's headers for the
+# interop types, as hip_backend does.
+if [ -d "$ROCM/include" ]; then
+    echo "== final_picture.hlsl -> final_picture_{vs,down,up}.h"
+    (cd src/present/shaders &&      MSYS_NO_PATHCONV=1 "$FXC" /nologo /T vs_5_0 /E VsMain /Vn g_fpVs /Fh final_picture_vs.h final_picture.hlsl &&      MSYS_NO_PATHCONV=1 "$FXC" /nologo /T ps_5_0 /E PsDown /Vn g_fpDown /Fh final_picture_down.h final_picture.hlsl &&      MSYS_NO_PATHCONV=1 "$FXC" /nologo /T ps_5_0 /E PsUp /Vn g_fpUp /Fh final_picture_up.h final_picture.hlsl)
+    echo "== compiling the final-picture front end and its harness"
+    msvc_build /c /Fo:"$OUT/final_picture.obj" -D__HIP_PLATFORM_AMD__ -I"$ROCM/include"         src/present/final_picture.cpp || exit 1
+    msvc_build /c /Fo:"$OUT/swap_hook.obj" src/present/swap_hook.cpp || exit 1
+    msvc_build /Fe:"$OUT/present_harness.exe" /Fo:"$OUT/present_harness.obj"         tests/present_harness.cpp "$OUT/final_picture.obj" $LIBS || exit 1
+    # The present hook (loaded by a game as version.dll) and a windowed test
+    # program for it, in a directory of their own: a version.dll in $OUT
+    # would be loaded by every program there.
+    echo "== compiling the present hook (version.dll) and present_window"
+    mkdir -p "$OUT/present_hook"
+    msvc_build /c /Fo:"$OUT/present_hook.obj" src/present/hook.cpp || exit 1
+    MSYS_NO_PATHCONV=1 "$LINK" /nologo /DLL /DEF:src/present/version.def         /OUT:"$OUT/present_hook/version.dll" "$OUT/present_hook.obj" "$OUT/swap_hook.obj" "$OUT/final_picture.obj"         $LIBS user32.lib || exit 1
+    msvc_build /Fe:"$OUT/present_hook/present_window.exe" /Fo:"$OUT/present_window.obj"         tests/present_window.cpp $LIBS user32.lib version.lib || exit 1
+    cp -n src/present/dlss5_present.ini "$OUT/present_hook/" 2>/dev/null || true
+fi
+
 # ------------------------------------------------------------------- dll ---
 echo "== compiling shim"
 OBJS=()
+# Present mode (src/ngx/present_mode.cpp) links the final-picture front end
+# (built above) into the shim; it needs ROCm's headers as the HIP backend does.
+PRESENT=""
+if [ -d "$ROCM/include" ]; then PRESENT="-DDLSS5_HAS_PRESENT"; fi
 for f in log parameter feature gpu ngx_api dllmain; do
-    msvc_build /c /Fo:"$OUT/$f.obj" $INC src/ngx/$f.cpp || exit 1
+    msvc_build /c /Fo:"$OUT/$f.obj" $INC $PRESENT src/ngx/$f.cpp || exit 1
     OBJS+=("$OUT/$f.obj")
 done
+if [ -n "$PRESENT" ]; then
+    msvc_build /c /Fo:"$OUT/present_mode.obj" $INC src/ngx/present_mode.cpp || exit 1
+    OBJS+=("$OUT/present_mode.obj" "$OUT/swap_hook.obj" "$OUT/final_picture.obj")
+fi
 
 # The HIP backend needs ROCm's headers for the interop TYPES (it loads the
 # functions themselves dynamically; nothing links against amdhip64).
@@ -68,7 +98,7 @@ fi
 
 echo "== linking nvngx.dll"
 MSYS_NO_PATHCONV=1 "$LINK" /nologo /DLL /DEF:src/ngx/exports.def \
-    /OUT:"$OUT/nvngx.dll" "${OBJS[@]}" $LIBS || exit 1
+    /OUT:"$OUT/nvngx.dll" "${OBJS[@]}" $LIBS user32.lib || exit 1
 
 # --------------------------------------------------------------- harness ---
 echo "== compiling harness"
@@ -76,27 +106,6 @@ echo "== compiling harness"
 # repo root, while every other object goes to $OUT. Found by a hygiene pass.
 msvc_build /Fe:"$OUT/ngx_harness.exe" /Fo:"$OUT/ngx_harness.obj" $INC \
     tests/ngx_harness.cpp $LIBS || exit 1
-
-# ------------------------------------------------- final-picture front end --
-# src/present: the engine applied to a finished frame at present time (any
-# D3D12 swap chain), and its headless harness. Needs ROCm's headers for the
-# interop types, as hip_backend does.
-if [ -d "$ROCM/include" ]; then
-    echo "== final_picture.hlsl -> final_picture_{vs,down,up}.h"
-    (cd src/present/shaders &&      MSYS_NO_PATHCONV=1 "$FXC" /nologo /T vs_5_0 /E VsMain /Vn g_fpVs /Fh final_picture_vs.h final_picture.hlsl &&      MSYS_NO_PATHCONV=1 "$FXC" /nologo /T ps_5_0 /E PsDown /Vn g_fpDown /Fh final_picture_down.h final_picture.hlsl &&      MSYS_NO_PATHCONV=1 "$FXC" /nologo /T ps_5_0 /E PsUp /Vn g_fpUp /Fh final_picture_up.h final_picture.hlsl)
-    echo "== compiling the final-picture front end and its harness"
-    msvc_build /c /Fo:"$OUT/final_picture.obj" -D__HIP_PLATFORM_AMD__ -I"$ROCM/include"         src/present/final_picture.cpp || exit 1
-    msvc_build /Fe:"$OUT/present_harness.exe" /Fo:"$OUT/present_harness.obj"         tests/present_harness.cpp "$OUT/final_picture.obj" $LIBS || exit 1
-    # The present hook (loaded by a game as version.dll) and a windowed test
-    # program for it, in a directory of their own: a version.dll in $OUT
-    # would be loaded by every program there.
-    echo "== compiling the present hook (version.dll) and present_window"
-    mkdir -p "$OUT/present_hook"
-    msvc_build /c /Fo:"$OUT/present_hook.obj" src/present/hook.cpp || exit 1
-    MSYS_NO_PATHCONV=1 "$LINK" /nologo /DLL /DEF:src/present/version.def         /OUT:"$OUT/present_hook/version.dll" "$OUT/present_hook.obj" "$OUT/final_picture.obj"         $LIBS user32.lib || exit 1
-    msvc_build /Fe:"$OUT/present_hook/present_window.exe" /Fo:"$OUT/present_window.obj"         tests/present_window.cpp $LIBS user32.lib version.lib || exit 1
-    cp -n src/present/dlss5_present.ini "$OUT/present_hook/" 2>/dev/null || true
-fi
 
 # ----------------------------------------------------------------- config --
 # -n so a hand-edited build/dlssnr_shim.ini (dump settings, log level) is not

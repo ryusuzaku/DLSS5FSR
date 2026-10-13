@@ -6,9 +6,16 @@
 // After the last frame the last presented buffer is read back and compared
 // with what was drawn: any change is the hook's.
 //
-// Usage: present_window image.rgb out_prefix [frames] [show]
+// Usage: present_window image.rgb out_prefix [frames] [show] [shim.dll] [guides] [pan]
 //   image.rgb: two uint32 (width, height), then RGB8 rows.
 //   show: 1 shows the window (default hidden).
+//   shim.dll: the NGX shim (nvngx.dll) with a dlssnr_shim.ini beside it that
+//     sets PresentMode=1, instead of the version.dll hook. The program then
+//     plays the upscaler's part as OptiScaler's DLSS-NR pass does: every
+//     frame it calls dlssnr_call_evaluate on its own list with a small
+//     colour, the motion of the pan and a depth, before it presents.
+//   guides: 0 hands the shim no motion (default 1).
+//   pan: pixels the picture moves to the left a frame (default 4; 0 a still).
 
 #include <windows.h>
 
@@ -41,6 +48,9 @@ int main(int argc, char** argv) {
     const int frames = argc > 3 ? atoi(argv[3]) : 240;
     setvbuf(stdout, nullptr, _IONBF, 0);  // a crash under the hook must not lose what was printed
     const bool show = argc > 4 && atoi(argv[4]) != 0;
+    const char* shimPath = argc > 5 && argv[5][0] ? argv[5] : nullptr;
+    const bool guides = !(argc > 6 && atoi(argv[6]) == 0);
+    const int pan = argc > 7 ? atoi(argv[7]) : 4;
     // The import that brings version.dll (the hook) into the process.
     wchar_t self[MAX_PATH];
     GetModuleFileNameW(nullptr, self, MAX_PATH);
@@ -142,6 +152,66 @@ int main(int argc, char** argv) {
     queue->ExecuteCommandLists(1, lists);
     wait();
 
+    // The shim in present mode: a feature, and the textures an NR evaluate is
+    // handed. The pan moves the picture `pan` pixels to the left a frame, so a
+    // pixel was that far to the right the frame before: previous = current + (pan/w, 0)
+    // in fractions of the frame.
+    typedef void* (*CreateFn)(const wchar_t*, const wchar_t*, ID3D12Device*, ID3D12GraphicsCommandList*, void*, unsigned, unsigned,
+                              int, float, int, float, float, float, int, int);
+    typedef int (*EvaluateFn)(ID3D12GraphicsCommandList*, void*, void*, ID3D12Resource*, ID3D12Resource*, ID3D12Resource*,
+                              ID3D12Resource*, unsigned, unsigned, unsigned, unsigned, int, int, float, int, float, float, float,
+                              int, float, float);
+    typedef int (*AllocFn)(void**);
+    EvaluateFn shimEvaluate = nullptr;
+    void *shimFeature = nullptr, *shimParams = nullptr;
+    ComPtr<ID3D12Resource> nrColor, nrOutput, nrMotion, nrDepth;
+    ComPtr<ID3D12DescriptorHeap> nrRtvs;
+    const UINT nrW = 256, nrH = 144;
+    int shimFailures = 0;
+    if (shimPath) {
+        HMODULE shim = LoadLibraryA(shimPath);
+        const CreateFn create = shim ? reinterpret_cast<CreateFn>(GetProcAddress(shim, "dlssnr_call_create")) : nullptr;
+        const AllocFn allocParams = shim ? reinterpret_cast<AllocFn>(GetProcAddress(shim, "NVSDK_NGX_D3D12_AllocateParameters")) : nullptr;
+        shimEvaluate = shim ? reinterpret_cast<EvaluateFn>(GetProcAddress(shim, "dlssnr_call_evaluate")) : nullptr;
+        if (!create || !allocParams || !shimEvaluate) { fputs("the shim or its exports are missing\n", stderr); return 1; }
+        auto texture = [&](UINT tw, UINT th, DXGI_FORMAT f, D3D12_RESOURCE_FLAGS flags, D3D12_RESOURCE_STATES state, ComPtr<ID3D12Resource>& out) {
+            D3D12_RESOURCE_DESC d{};
+            d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            d.Width = tw; d.Height = th; d.DepthOrArraySize = 1; d.MipLevels = 1;
+            d.Format = f; d.SampleDesc = {1, 0}; d.Flags = flags;
+            return SUCCEEDED(device->CreateCommittedResource(&def, D3D12_HEAP_FLAG_NONE, &d, state, nullptr, IID_PPV_ARGS(&out)));
+        };
+        D3D12_DESCRIPTOR_HEAP_DESC hd{};
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+        hd.NumDescriptors = 3;
+        if (!texture(nrW, nrH, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET, nrColor) ||
+            !texture(nrW, nrH, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nrOutput) ||
+            !texture(w / 2, h / 2, DXGI_FORMAT_R16G16_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET, nrMotion) ||
+            !texture(w / 2, h / 2, DXGI_FORMAT_R32_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET, nrDepth) ||
+            FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&nrRtvs)))) {
+            fputs("NR textures failed\n", stderr); return 1;
+        }
+        const UINT step = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv = nrRtvs->GetCPUDescriptorHandleForHeapStart();
+        ID3D12Resource* targets[3] = {nrColor.Get(), nrMotion.Get(), nrDepth.Get()};
+        const float clears[3][4] = {{0.3f, 0.3f, 0.3f, 1.0f}, {float(pan) / float(w), 0.0f, 0.0f, 0.0f}, {0.5f, 0.0f, 0.0f, 0.0f}};
+        alloc->Reset(); cl->Reset(alloc.Get(), nullptr);
+        for (int k = 0; k < 3; ++k) {
+            device->CreateRenderTargetView(targets[k], nullptr, rtv);
+            cl->ClearRenderTargetView(rtv, clears[k], 0, nullptr);
+            rtv.ptr += step;
+        }
+        cl->Close();
+        queue->ExecuteCommandLists(1, lists);
+        wait();
+        if (allocParams(&shimParams) != 1 || !shimParams) { fputs("no parameter block\n", stderr); return 1; }
+        wchar_t dir[MAX_PATH];
+        GetCurrentDirectoryW(MAX_PATH, dir);
+        shimFeature = create(L"", dir, device.Get(), nullptr, shimParams, nrW, nrH, 1, 1.0f, 0, 1.0f, 1.0f, -1.0f, 1, 0);
+        if (!shimFeature) { fputs("the shim did not create the NR feature\n", stderr); return 1; }
+        printf("shim %s: NR feature created, %s\n", shimPath, guides ? "with the pan's motion and a depth" : "without motion");
+    }
+
     // A real game spends seconds loading before its first frames; the hook's
     // thread needs a moment to find the swap chain's vtable.
     Sleep(1500);
@@ -157,7 +227,7 @@ int main(int argc, char** argv) {
         const UINT index = sc->GetCurrentBackBufferIndex();
         ComPtr<ID3D12Resource> back;
         sc->GetBuffer(index, IID_PPV_ARGS(&back));
-        shift = (k * 4) % int(w);
+        shift = (k * pan) % int(w);
         alloc->Reset(); cl->Reset(alloc.Get(), nullptr);
         b = Transition(back.Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST);
         cl->ResourceBarrier(1, &b);
@@ -172,6 +242,12 @@ int main(int argc, char** argv) {
         }
         b = Transition(back.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT);
         cl->ResourceBarrier(1, &b);
+        // The upscaler's NR call, on the frame's own list.
+        if (shimEvaluate &&
+            shimEvaluate(cl.Get(), shimFeature, shimParams, nrColor.Get(), guides ? nrDepth.Get() : nullptr,
+                         guides ? nrMotion.Get() : nullptr, nrOutput.Get(), nrW, nrH, w / 2, h / 2, 1, 0, 1.0f, 0, 1.0f, 1.0f,
+                         -1.0f, 1, float(nrW), float(nrH)) != 1)
+            ++shimFailures;
         cl->Close();
         queue->ExecuteCommandLists(1, lists);
         back.Reset();
@@ -184,6 +260,7 @@ int main(int argc, char** argv) {
         if (k >= frames / 2) { sum += ms; ++counted; slowest = ms > slowest ? ms : slowest; }
     }
     printf("%d frames; second half: %.2f ms a frame (slowest %.2f)\n", frames, counted ? sum / counted : 0.0, slowest);
+    if (shimEvaluate) printf("NR evaluates that failed: %d\n", shimFailures);
 
     // The last presented buffer against what was drawn into it.
     ComPtr<ID3D12Resource> back;

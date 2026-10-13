@@ -13,6 +13,8 @@
 #include <cstring>
 #include <mutex>
 #include <thread>
+#include <utility>
+#include <vector>
 
 #include <hip/hip_runtime_api.h>  // interop types only; the functions are resolved at run time
 
@@ -84,6 +86,17 @@ struct State {
     ComPtr<ID3D12Resource> frameCopy, work, delta, bufIn, bufOut;
     hipExternalMemory_t extIn = nullptr, extOut = nullptr;
     void *ptrIn = nullptr, *ptrOut = nullptr;
+    // The game's motion and depth for the frame about to be presented: the
+    // caller records copies into these on the game's own list. A list that
+    // names them may still be waiting to run when the layout changes, so old
+    // ones are kept for a few frames instead of being released at once.
+    ComPtr<ID3D12Resource> bufMotion, bufDepth;
+    hipExternalMemory_t extMotion = nullptr, extDepth = nullptr;
+    void *ptrMotion = nullptr, *ptrDepth = nullptr;
+    UINT motionPitch = 0, depthPitch = 0;
+    std::atomic<int> guides{0};  // 1 motion, 2 depth: staged for the next Process
+    unsigned long long guideFrames = 0;
+    std::vector<std::pair<unsigned long long, ComPtr<ID3D12Resource>>> retired;
     ID3D12Resource* backRtv[kBackRtvs] = {};
     int backRtvNext = 0;
     // A frame layout that could not be set up is not retried every frame.
@@ -249,8 +262,13 @@ void DropSized() {
     if (s.deviceSynchronize) s.deviceSynchronize();  // nothing of the engine's still reads the shared buffers
     if (s.extIn) s.destroyMemory(s.extIn);
     if (s.extOut) s.destroyMemory(s.extOut);
-    s.extIn = s.extOut = nullptr;
-    s.ptrIn = s.ptrOut = nullptr;
+    if (s.extMotion) s.destroyMemory(s.extMotion);
+    if (s.extDepth) s.destroyMemory(s.extDepth);
+    s.extIn = s.extOut = s.extMotion = s.extDepth = nullptr;
+    s.ptrIn = s.ptrOut = s.ptrMotion = s.ptrDepth = nullptr;
+    if (s.bufMotion) s.retired.emplace_back(s.frame + 16, std::move(s.bufMotion));
+    if (s.bufDepth) s.retired.emplace_back(s.frame + 16, std::move(s.bufDepth));
+    s.guides = 0;
     s.frameCopy.Reset(); s.work.Reset(); s.delta.Reset(); s.bufIn.Reset(); s.bufOut.Reset();
     memset(s.backRtv, 0, sizeof(s.backRtv));
     s.backRtvNext = 0;
@@ -316,6 +334,14 @@ bool CreateSized(const D3D12_RESOURCE_DESC& bb) {
         return ok;
     };
     if (!shared(s.bufIn, s.extIn, s.ptrIn) || !shared(s.bufOut, s.extOut, s.ptrOut)) return Fail("shared buffers");
+    // Guides are optional: without them the engine reads its history in place.
+    s.motionPitch = UINT((UINT64(ww) * 8 + 255) & ~UINT64(255));
+    s.depthPitch = UINT((UINT64(ww) * 4 + 255) & ~UINT64(255));
+    if (!shared(s.bufMotion, s.extMotion, s.ptrMotion) || !shared(s.bufDepth, s.extDepth, s.ptrDepth)) {
+        Log("no shared buffers for motion and depth: running without them");
+        s.bufMotion.Reset(); s.bufDepth.Reset();
+        s.ptrMotion = s.ptrDepth = nullptr;
+    }
 
     if (s.psoUpFormat != view) {
         s.psoUp.Reset();
@@ -474,6 +500,7 @@ bool Process(ID3D12Resource* bb) {
     const int ring = int(n % kRing);
     WaitDone(s.ringFrame[ring]);  // this allocator set's last use has run
     s.ringFrame[ring] = n;
+    while (!s.retired.empty() && s.retired.front().first <= n) s.retired.erase(s.retired.begin());
 
     // List A: the frame -> copy -> working size -> the shared buffer.
     ID3D12GraphicsCommandList* a = s.list[0].Get();
@@ -509,6 +536,13 @@ bool Process(ID3D12Resource* bb) {
     ReSyncJob j{};
     j.staging = s.ptrIn;
     j.w = int(s.workW); j.h = int(s.workH); j.pitch = int(s.pitch); j.bpp = 8; j.gain = 0;
+    const int guides = s.guides.exchange(0);
+    if ((guides & 1) && s.ptrMotion) {
+        j.motion = s.ptrMotion; j.motion_pitch = int(s.motionPitch);
+        if ((guides & 2) && s.ptrDepth) { j.depth = s.ptrDepth; j.depth_pitch = int(s.depthPitch); }
+        ++s.guideFrames;
+    }
+    s.stats.guideFrames = s.guideFrames;
     j.wait_sem = s.semStaged; j.wait_value = n;
     j.out = s.ptrOut; j.out_pitch = s.pitch;
     j.signal_sem = s.semResult; j.signal_value = n;
@@ -556,6 +590,21 @@ bool Process(ID3D12Resource* bb) {
     s.queue->Signal(s.done.Get(), n);
     ++s.stats.frames;
     return true;
+}
+
+bool GetGuideTargets(GuideTargets* out) {
+    State& s = S();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    if (!out || !s.ready || s.stuck || !s.width || !s.bufMotion || !s.ptrMotion) return false;
+    out->motion = s.bufMotion.Get();
+    out->depth = s.ptrDepth ? s.bufDepth.Get() : nullptr;
+    out->width = s.workW; out->height = s.workH;
+    out->motionPitch = s.motionPitch; out->depthPitch = s.depthPitch;
+    return true;
+}
+
+void GuidesStaged(bool motion, bool depth) {
+    S().guides = (motion ? 1 : 0) | (motion && depth ? 2 : 0);
 }
 
 void Flush() {

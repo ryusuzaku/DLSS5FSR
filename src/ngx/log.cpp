@@ -183,6 +183,11 @@ void ConfigLoad(const std::wstring& dir) {
             else if (key == L"ResidentEngineInterval") c.residentEngineInterval = std::stoi(val);
             else if (key == L"ResidentEngineFull") c.residentEngineFull = (std::stoi(val) != 0);
             else if (key == L"SyncMode") c.syncMode = (std::stoi(val) != 0);
+            else if (key == L"PresentMode") c.presentMode = (std::stoi(val) != 0);
+            else if (key == L"PresentEngineConfig") c.presentEngineConfig = val;
+            else if (key == L"PresentWorkingScale") c.presentWorkingScale = std::stof(val);
+            else if (key == L"PresentMaxWorkingPixels") c.presentMaxWorkingPixels = std::stof(val);
+            else if (key == L"PresentToggleKey") c.presentToggleKey = std::stoi(val, nullptr, 0);
             else if (key == L"ResidentEngineMap") c.residentEngineMap = (std::stoi(val) != 0);
             else if (key == L"WhitePoint")       c.whitePoint = std::stof(val);
             else if (key == L"ProxyMode")        c.proxyMode = std::stoi(val);
@@ -228,6 +233,22 @@ void ConfigLoad(const std::wstring& dir) {
              c.candidateInputCapturePath.c_str(), (int)c.candidateInputCaptureTrigger,
              (int)c.candidateInputCaptureRepeat);
     if (c.residentEngineInterval < 1) c.residentEngineInterval = 1;
+#ifdef DLSS5_HAS_PRESENT
+    if (c.presentMode) {
+        // One engine per process: the map path's is not started.
+        if (c.presentEngineConfig.empty()) c.presentEngineConfig = c.residentEngineConfig;
+        c.residentEngineConfig.clear();
+        c.syncMode = false;
+        LOGI("config: PresentMode=1 (the engine on the finished frame at present time, same frame) with %ls",
+             c.presentEngineConfig.c_str());
+        if (c.residentEngineDll.empty() || c.presentEngineConfig.empty()) {
+            LOGW("config: PresentMode needs ResidentEngineDll and an engine config; off");
+            c.presentMode = false;
+        }
+    }
+#else
+    if (c.presentMode) { LOGW("config: PresentMode is not in this build"); c.presentMode = false; }
+#endif
     if (c.residentEngineGain != 0 && c.residentEngineGain != 1) c.residentEngineGain = 0;
     if (!c.residentEngineConfig.empty())
         LOGI("config: resident engine %ls with %ls (gain=%s interval=%d %s; DebugView=%d)",

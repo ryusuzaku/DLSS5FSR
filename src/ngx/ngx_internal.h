@@ -211,6 +211,16 @@ struct Config {
     // the frame. Needs the game's ExecuteCommandLists (vtable hook); falls
     // back to the asynchronous path when the hook never sees our lists.
     bool syncMode = false;
+    // S347: PresentMode=1 -- the engine runs on the finished frame at present
+    // time, in the same frame, with the motion and depth the NR evaluate saw
+    // (present_mode.cpp). The evaluate itself then changes nothing, and the
+    // map path's engine is not started. PresentEngineConfig is the engine's
+    // config (transfer=nvidia, motion=uv); empty takes ResidentEngineConfig.
+    bool presentMode = false;
+    std::wstring presentEngineConfig;
+    float presentWorkingScale = 0.0f;       // 0: the largest within presentMaxWorkingPixels
+    float presentMaxWorkingPixels = 2.1e6f;
+    int presentToggleKey = 0x79;            // F10; 0 none
     // Luma engines: hand the resolve the engine's ratio map (carried along this
     // frame's motion and gated on its luminance there) instead of a frame
     // composed on the older frame the engine saw. 0 restores the composed frame.
@@ -618,6 +628,11 @@ bool GpuNrDispatch(ID3D12GraphicsCommandList* cl, const DlssNrConstants& c,
 bool GpuNeuralChain(ID3D12GraphicsCommandList* cl, ID3D12Resource* output,
                     SubRect outRect, const Config& cfg,
                     const MotionInput* motion = nullptr);
+
+// Present mode: starts the swap chain hook on first use and records, on the
+// caller's list, the copies of this frame's motion and depth the front end
+// hands the engine at present time.
+void PresentModeEvaluate(ID3D12GraphicsCommandList* cl, const Config& cfg, const MotionInput* motion);
 
 // ------------------------------------------------------------- HIP backend --
 

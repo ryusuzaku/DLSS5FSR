@@ -218,7 +218,8 @@ NVSDK_NGX_Result DoEvaluateD3D12(ID3D12GraphicsCommandList* cl,
     // executed -- it never blocks on the game and degrades to the identity
     // model when the proof is missing.
     // S332 SyncMode: the previous frame's map through GPU fences instead.
-    if (c.syncMode && GpuSyncActive()) GpuSyncPrepare(c);
+    if (c.presentMode) {}  // the frame is left as it is; the engine runs at present time
+    else if (c.syncMode && GpuSyncActive()) GpuSyncPrepare(c);
     else GpuPrepareHipModel(n, c);
 
     if (!GpuBlit(cl, color, colorRect, output, outRect)) {
@@ -311,6 +312,12 @@ NVSDK_NGX_Result DoEvaluateD3D12(ID3D12GraphicsCommandList* cl,
                  (unsigned long long)md.Width, md.Height, (unsigned)md.Format, motion.scaleX, motion.scaleY,
                  motion.guideW, motion.guideH, display);
     }
+#ifdef DLSS5_HAS_PRESENT
+    if (c.presentMode) {
+        PresentModeEvaluate(cl, c, mv ? &motion : nullptr);
+        return NVSDK_NGX_Result_Success;
+    }
+#endif
     if (c.nrPasses && !GpuNeuralChain(cl, output, outRect, c, mv ? &motion : nullptr)) {
         LOGW("evaluate: colour passes did not run, leaving the resample");
     }
