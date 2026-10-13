@@ -102,7 +102,7 @@ ID3D12CommandQueue* QueueOf(IDXGISwapChain* sc) {
 bool g_started = false, g_failed = false, g_on = true, g_keyDown = false, g_captureDown = false, g_passesDown = false;
 int g_passes = 1;
 bool g_historyDown = false;
-int g_historyStep = 0;
+int g_historyStep = -1;  // the engine config's amount until the key is first pressed (then 1)
 unsigned long long g_presents = 0;
 
 void OnPresent(IDXGISwapChain* sc) {

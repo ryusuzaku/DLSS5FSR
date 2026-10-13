@@ -245,6 +245,23 @@ struct OutputOptions {
     // moves without motion vectors that depth follows late. Less history
     // gives a lighter, quicker and less steady picture.
     float history = 1.0f;
+    // uncover=N (transfer=nvidia; ours, not the original's; 0 off): ground
+    // that something moving has just uncovered is repaired for N frames. A
+    // game's temporal upscaler has no history for such pixels and leaves
+    // copies of the thing that moved on there for a few frames (a comb behind
+    // a walking foot); the network then edits those copies like any other
+    // content, which sharpens them, more with every pass. A pixel is taken as
+    // uncovered when what was at its place a frame ago moved differently (by
+    // more than 4 px and half the larger speed) AND
+    // was nearer (so a foot that stops is not), which needs this and the
+    // previous frame's vectors and depth; without them nothing is done. Such
+    // a pixel shows, fading out over the N frames, the settled result around
+    // it on the same surface (same motion, depth within 6%) instead of its
+    // own, and only while the surface itself is nearly still on screen (a
+    // fast camera turn is left alone). No channel is moved by more than 0.1.
+    // uncover_radius=R: how far around, in frame pixels.
+    int uncover = 0;
+    int uncover_radius = 10;
     // input_temporal=A (S332): a TAA pass on the network's input only -- the
     // frame blended with the previous network input carried along the motion
     // by A, the history clamped to the frame's 3x3 range and dropped where the
@@ -890,6 +907,96 @@ __global__ void k_nv_map(const float* image, const float* color, float4* map, in
     map[p] = make_float4(d[0], d[1], d[2], yin);
 }
 
+// uncover=N, step 1: frames since this pixel was uncovered, at most `limit`.
+// The pixel's own vector says where its surface was a frame ago. If what was
+// there then moved differently (by more than 4 px and half the larger of the
+// two speeds) and was nearer (reversed Z: its depth more than 1.5% larger),
+// this surface has just come into view: age 0. Otherwise the age found
+// there, one frame older. mv, mv_prev: this and the previous frame's vectors
+// (frame pixels after ms); depth, depth_prev likewise.
+__global__ void k_uncover_age(const float2* mv, const float2* mv_prev, const float* depth, const float* depth_prev,
+                              const float* age_prev, float* age, int fw, int fh, float2 ms, float limit) {
+    const int p = blockIdx.x*blockDim.x + threadIdx.x;
+    if (p >= fw*fh) return;
+    const int x = p % fw, y = p / fw;
+    float2 v = mv[p];
+    v.x *= ms.x; v.y *= ms.y;
+    if (!isfinite(v.x) || !isfinite(v.y)) v = make_float2(0.0f, 0.0f);
+    const int qx = int(floorf(x + 0.5f + v.x)), qy = int(floorf(y + 0.5f + v.y));
+    float a = limit;  // from outside the frame: nothing is known to linger there
+    if (qx >= 0 && qx < fw && qy >= 0 && qy < fh) {
+        const size_t q = size_t(qy)*fw + qx;
+        float2 u = mv_prev[q];
+        u.x *= ms.x; u.y *= ms.y;
+        if (!isfinite(u.x) || !isfinite(u.y)) u = make_float2(0.0f, 0.0f);
+        const float apart = hypotf(u.x - v.x, u.y - v.y);
+        const float speed = fmaxf(hypotf(u.x, u.y), hypotf(v.x, v.y));
+        const bool uncovered = apart > fmaxf(4.0f, 0.5f*speed) && depth_prev[q] > depth[p]*1.015f;
+        a = uncovered ? 0.0f : fminf((age_prev ? age_prev[q] : limit) + 1.0f, limit);
+    }
+    age[p] = a;
+}
+// Step 2: a recently uncovered pixel takes the result (frame + change) of
+// settled pixels around it on the same surface: 48 taps on a spiral within
+// `radius`, Gaussian in distance, weighted by age / limit, only those that
+// move as it does and lie at its depth within 6%. It takes it by how recently
+// it was uncovered and by how much there was to take; with too little settled
+// surface around (a large uncovered area) it is left as it is. base: the
+// frame the change is against (W stride). Written to `out`, a whole copy of
+// the map (the taps read the unchanged one).
+__global__ void k_uncover_fill(const float4* map, const float* age, const float2* mv, const float* depth, const float* base,
+                               float4* out, int fw, int fh, int W, float2 ms, int radius, float limit) {
+    const int p = blockIdx.x*blockDim.x + threadIdx.x;
+    if (p >= fw*fh) return;
+    float4 o = map[p];
+    float m = 1.0f - age[p] / limit;
+    if (m > 0.0f) {
+        const int x = p % fw, y = p / fw;
+        float2 v = mv[p];
+        v.x *= ms.x; v.y *= ms.y;
+        if (!isfinite(v.x) || !isfinite(v.y)) v = make_float2(0.0f, 0.0f);
+        const float vs = hypotf(v.x, v.y), dp = depth[p];
+        // Only where the surface itself is nearly still on screen (all of it
+        // under 4 px a frame, none over 12): something crossing a view at
+        // rest. In a fast turn whole regions come into view at once, the
+        // upscaler shows them raw, and smoothing them would be a blur of ours.
+        m *= fminf(fmaxf((12.0f - vs) / 8.0f, 0.0f), 1.0f);
+        float3 s = make_float3(0.0f, 0.0f, 0.0f);
+        float sw = 0.0f, full = 0.0f;
+        const int taps = 48;
+        for (int i = 0; i < taps; ++i) {
+            const float f = (i + 0.5f) / taps, r = radius*sqrtf(f), a = 2.3999632f*i;
+            const float g = expf(-2.0f*f);  // sigma = radius / 2
+            full += g;
+            const int qx = x + int(lroundf(r*cosf(a))), qy = y + int(lroundf(r*sinf(a)));
+            if (qx < 0 || qx >= fw || qy < 0 || qy >= fh) continue;
+            const size_t q = size_t(qy)*fw + qx;
+            float2 u = mv[q];
+            u.x *= ms.x; u.y *= ms.y;
+            if (!isfinite(u.x) || !isfinite(u.y)) continue;
+            if (hypotf(u.x - v.x, u.y - v.y) > fmaxf(1.0f, 0.25f*fmaxf(vs, hypotf(u.x, u.y)))) continue;
+            if (fabsf(depth[q] - dp) > 0.06f*dp) continue;
+            const float w = g * (age[q] / limit);
+            const float* c = base + (size_t(qy)*W + qx)*3;
+            s.x += w*(c[0] + map[q].x); s.y += w*(c[1] + map[q].y); s.z += w*(c[2] + map[q].z); sw += w;
+        }
+        // A quarter of the taps settled and on the surface is enough to trust.
+        const float k = m * fminf(sw / (0.25f*full), 1.0f);
+        if (k > 0.0f) {
+            // No channel moves further than 0.1 from where the network left
+            // it: enough for what an upscaler leaves behind on a surface, and
+            // it bounds the harm where the picture is not the scene the
+            // vectors and depth describe (a HUD drawn over it).
+            const float* c = base + (size_t(y)*W + x)*3;
+            const float cap = 0.1f;
+            o.x += fminf(fmaxf((s.x/sw - c[0] - o.x)*k, -cap), cap);
+            o.y += fminf(fmaxf((s.y/sw - c[1] - o.y)*k, -cap), cap);
+            o.z += fminf(fmaxf((s.z/sw - c[2] - o.z)*k, -cap), cap);
+        }
+    }
+    out[p] = o;
+}
+
 // passes > 1: one pass's composed output as the RGBA16F frame a host hands
 // the next pass (the same compose, rounded to half as the host's texture is).
 __global__ void k_nv_pass_frame(const float* image, const float* color, unsigned char* frame, int pitch,
@@ -1260,6 +1367,12 @@ struct Engine {
     std::atomic<bool> nv_reset{false};  // re_reset: the next run starts over
     std::atomic<int> passes_request{0}; // re_set_passes: taken at the next run
     std::atomic<int> history_request{-1}; // re_set_history: thousandths, taken at the next run
+    // uncover=N: frames since each pixel was uncovered (ping-pong, carried
+    // along the motion), the previous frame's depth, and the buffer the
+    // repaired map is written to.
+    std::unique_ptr<Buffer> uncover_age[2], uncover_depth, uncover_tmp;
+    int uncover_cur = 0, uncover_w = 0, uncover_h = 0;
+    long long uncover_frame = -1;
     // re_depth: the newest submitted frame's depth (frame pixels) and the
     // job's copy, taken when the job starts.
     std::unique_ptr<Buffer> depth_next, job_depth;
@@ -1307,6 +1420,8 @@ struct Engine {
             else if (key == "smooth_depth") options.smooth_depth = std::stoi(value);
             else if (key == "passes") options.passes = std::min(std::max(std::stoi(value), 1), 3);
             else if (key == "history") options.history = std::min(std::max(std::stof(value), 0.0f), 1.0f);
+            else if (key == "uncover") options.uncover = std::min(std::max(std::stoi(value), 0), 16);
+            else if (key == "uncover_radius") options.uncover_radius = std::min(std::max(std::stoi(value), 1), 48);
             else if (key == "input_temporal") options.input_temporal = std::stof(value);
             else if (key == "extent" && (value == "compact" || value == "legacy")) options.compact = value == "compact";
             else if (key == "tone") options.tone = std::stof(value);
@@ -1867,6 +1982,46 @@ struct Engine {
                                        reinterpret_cast<float4*>(maps[next]->data.get()), frame_w, frame_h, W,
                                        job_strength, nv_first);
                     HIP_CHECK(hipGetLastError());
+                    // uncover=N: this frame's and the previous frame's vectors and depth.
+                    const size_t px = size_t(frame_w)*frame_h;
+                    const int prev_slot = int((job_frame + kRing - 1) % kRing);
+                    const bool uncover_now = options.uncover > 0 && nv_mv && job_depth_valid;
+                    if (uncover_now) {
+                        if (uncover_w != frame_w || uncover_h != frame_h) uncover_frame = -1;
+                        for (auto& a : uncover_age)
+                            if (!a || a->count < px) { a.reset(new Buffer(px)); uncover_frame = -1; }
+                        if (!uncover_depth || uncover_depth->count < px) { uncover_depth.reset(new Buffer(px)); uncover_frame = -1; }
+                        if (!uncover_tmp || uncover_tmp->count < maps[next]->count) uncover_tmp.reset(new Buffer(maps[next]->count));
+                    }
+                    // The previous frame's depth is there when the guard ran on it.
+                    if (uncover_now && job_frame > 0 && uncover_frame == job_frame - 1 && ring_frame[prev_slot] == job_frame - 1) {
+                        const int to = 1 - uncover_cur;
+                        const float limit = float(options.uncover);
+                        const dim3 grid((px+255)/256), block(256);
+                        hipLaunchKernelGGL(k_uncover_age, grid, block, 0, stream, nv_mv,
+                                           reinterpret_cast<const float2*>(ring[prev_slot]->data.get()),
+                                           job_depth->data.get(), uncover_depth->data.get(),
+                                           uncover_age[uncover_cur]->data.get(), uncover_age[to]->data.get(),
+                                           frame_w, frame_h, nv_ms, limit);
+                        hipLaunchKernelGGL(k_uncover_fill, grid, block, 0, stream,
+                                           reinterpret_cast<const float4*>(maps[next]->data.get()), uncover_age[to]->data.get(),
+                                           nv_mv, job_depth->data.get(), nv_first ? nv_first : net->color->data.get(),
+                                           reinterpret_cast<float4*>(uncover_tmp->data.get()), frame_w, frame_h, W,
+                                           nv_ms, options.uncover_radius, limit);
+                        HIP_CHECK(hipGetLastError());
+                        std::swap(maps[next], uncover_tmp);  // the repaired copy is the map
+                        uncover_cur = to;
+                    } else if (uncover_now) {
+                        // First frame with everything: all settled.
+                        std::vector<float> settled(px, float(options.uncover));
+                        HIP_CHECK(hipMemcpy(uncover_age[uncover_cur]->data, settled.data(), px*sizeof(float), hipMemcpyHostToDevice));
+                    }
+                    if (uncover_now) {
+                        HIP_CHECK(hipMemcpyAsync(uncover_depth->data, job_depth->data, px*sizeof(float), hipMemcpyDeviceToDevice, stream));
+                        uncover_frame = job_frame; uncover_w = frame_w; uncover_h = frame_h;
+                    } else {
+                        uncover_frame = -1;
+                    }
                 } else {
                     // smooth_depth: the history is the previous frame's map, both
                     // frames have depth, and this frame's motion is in the ring.
