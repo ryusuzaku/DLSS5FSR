@@ -34,6 +34,15 @@ struct Config {
     // NVIDIA's controls: intensity, style (0..2), local structure, local
     // tone, skin structure (-1 follows structure), automatic mask.
     float controls[6] = {1.0f, 0.0f, 1.0f, 1.0f, -1.0f, 1.0f};
+    // Sequence capture: while "<capturePath>.seq" exists (its text: a frame
+    // count, default 60) that many consecutive frames are recorded as the
+    // engine was handed them -- the working-size picture, the staged motion
+    // and depth -- with the change it returned, into
+    // "<capturePath>.pseq.<tick>\<frame>.bin" (D5INP001, D5DEP001, D5MOV001
+    // as the shim's capture writes them, then D5OUT001: RGBA16F rows). The
+    // frames are read back on the queue and written after the last one; the
+    // trigger file is removed when they are on disk. Empty: off.
+    std::wstring capturePath;
 };
 
 struct Stats {
@@ -66,6 +75,9 @@ struct GuideTargets {
 };
 bool GetGuideTargets(GuideTargets* out);
 void GuidesStaged(bool motion, bool depth);
+// Starts a sequence capture of `frames` frames at the next Process, as the
+// trigger file does (Config::capturePath must be set).
+void RequestCapture(int frames);
 // Blocks until everything queued so far has run (resize, shutdown, tests).
 void Flush();
 // Before a swap chain resizes or recreates its buffers: waits as Flush does

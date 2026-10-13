@@ -103,6 +103,16 @@ struct State {
     UINT failedW = 0, failedH = 0;
     DXGI_FORMAT failedFormat = DXGI_FORMAT_UNKNOWN;
 
+    // Sequence capture (Config::capturePath): one readback buffer a frame.
+    struct CaptureFrame { ComPtr<ID3D12Resource> buf; unsigned long long frame = 0; int guides = 0; };
+    std::vector<CaptureFrame> capture;
+    size_t captureAt = 0;          // frames recorded so far
+    bool capturing = false;
+    std::atomic<bool> captureWriting{false};
+    long long captureChecked = 0;  // when the trigger file was last looked for
+    std::atomic<int> captureRequest{0};  // RequestCapture: frames asked for
+    std::wstring captureDir;
+
     // A job the queue is waiting for; the watchdog releases a stuck one.
     std::atomic<unsigned long long> waitingFor{0};
     std::atomic<long long> waitingSince{0};
@@ -257,8 +267,138 @@ void WaitDone(unsigned long long value) {
     if (SUCCEEDED(s.done->SetEventOnCompletion(value, s.doneEvent))) WaitForSingleObject(s.doneEvent, 10000);
 }
 
+// Sequence capture: the recorded frames go to a thread that waits for the
+// last one's lists and writes the files.
+struct CaptureJob {
+    std::vector<State::CaptureFrame> frames;
+    std::wstring dir, trigger;
+    ComPtr<ID3D12Fence> done;
+    unsigned long long last = 0;
+    UINT w = 0, h = 0, pitch = 0, motionPitch = 0, depthPitch = 0;
+};
+
+void CaptureWrite(CaptureJob* job) {
+    State& s = S();
+    HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (ev && job->done->GetCompletedValue() < job->last && SUCCEEDED(job->done->SetEventOnCompletion(job->last, ev)))
+        WaitForSingleObject(ev, 20000);
+    if (ev) CloseHandle(ev);
+    const size_t rows = size_t(job->pitch) * job->h, plane = size_t(job->w) * job->h;
+    const size_t motionBytes = size_t(job->motionPitch) * job->h;
+    unsigned int written = 0;
+    std::vector<unsigned char> file;
+    for (auto& f : job->frames) {
+        unsigned char* p = nullptr;
+        if (FAILED(f.buf->Map(0, nullptr, reinterpret_cast<void**>(&p))) || !p) continue;
+        file.resize(36 + rows + ((f.guides & 2) ? 16 + plane * 4 : 0) + ((f.guides & 1) ? 16 + plane * 8 : 0) + 16 + plane * 8);
+        unsigned char* o = file.data();
+        memcpy(o, "D5INP001", 8);
+        // passthrough 1: the picture is display-encoded as it is.
+        const unsigned int fields[6] = {job->w, job->h, 8, job->pitch, 1, 0};
+        memcpy(o + 8, fields, sizeof(fields));
+        const float white = 1.0f;
+        memcpy(o + 32, &white, sizeof(float));
+        memcpy(o + 36, p, rows);
+        size_t at = 36 + rows;
+        const unsigned int dims[2] = {job->w, job->h};
+        if (f.guides & 2) {
+            memcpy(o + at, "D5DEP001", 8); memcpy(o + at + 8, dims, 8);
+            for (UINT y = 0; y < job->h; ++y)
+                memcpy(o + at + 16 + size_t(y) * job->w * 4, p + 2 * rows + motionBytes + size_t(y) * job->depthPitch, size_t(job->w) * 4);
+            at += 16 + plane * 4;
+        }
+        if (f.guides & 1) {
+            memcpy(o + at, "D5MOV001", 8); memcpy(o + at + 8, dims, 8);
+            for (UINT y = 0; y < job->h; ++y)
+                memcpy(o + at + 16 + size_t(y) * job->w * 8, p + 2 * rows + size_t(y) * job->motionPitch, size_t(job->w) * 8);
+            at += 16 + plane * 8;
+        }
+        memcpy(o + at, "D5OUT001", 8); memcpy(o + at + 8, dims, 8);
+        for (UINT y = 0; y < job->h; ++y)
+            memcpy(o + at + 16 + size_t(y) * job->w * 8, p + rows + size_t(y) * job->pitch, size_t(job->w) * 8);
+        f.buf->Unmap(0, nullptr);
+        f.buf.Reset();
+        wchar_t name[32];
+        swprintf(name, 32, L"\\%08llu.bin", f.frame);
+        FILE* out = _wfopen((job->dir + name).c_str(), L"wb");
+        if (out && fwrite(file.data(), 1, file.size(), out) == file.size()) ++written;
+        if (out) fclose(out);
+    }
+    DeleteFileW(job->trigger.c_str());
+    Log("capture: %u of %zu frames written to %ls", written, job->frames.size(), job->dir.c_str());
+    delete job;
+    s.captureWriting = false;
+}
+
+// Ends the recording (complete, or cut short by a new frame layout).
+void CaptureFinish() {
+    State& s = S();
+    if (!s.capturing) return;
+    s.capturing = false;
+    CaptureJob* job = new CaptureJob;
+    job->frames.assign(s.capture.begin(), s.capture.begin() + ptrdiff_t(s.captureAt));
+    s.capture.clear();
+    job->dir = s.captureDir;
+    job->trigger = s.cfg.capturePath + L".seq";
+    job->done = s.done;
+    job->last = s.frame;
+    job->w = s.workW; job->h = s.workH; job->pitch = UINT(s.pitch);
+    job->motionPitch = s.motionPitch; job->depthPitch = s.depthPitch;
+    Log("capture: %zu frames recorded up to frame %llu; writing in the background", job->frames.size(), s.frame);
+    std::thread(CaptureWrite, job).detach();
+}
+
+// Looks for the trigger file (a few times a second) and sets a recording up.
+void CaptureCheck() {
+    State& s = S();
+    if (s.cfg.capturePath.empty() || s.capturing || s.captureWriting) return;
+    const std::wstring trigger = s.cfg.capturePath + L".seq";
+    int count = s.captureRequest.exchange(0);
+    if (count <= 0) {
+        const long long now = NowMs();
+        if (now - s.captureChecked < 250) return;
+        s.captureChecked = now;
+        if (GetFileAttributesW(trigger.c_str()) == INVALID_FILE_ATTRIBUTES) return;
+        count = 60;
+        if (FILE* t = _wfopen(trigger.c_str(), L"rb")) {
+            int v = 0;
+            if (fscanf(t, "%d", &v) == 1 && v > 0) count = v;
+            fclose(t);
+        }
+    }
+    count = std::min(count, 600);
+    s.captureWriting = true;  // until the files are written, or this attempt fails
+    s.captureDir = s.cfg.capturePath + L".pseq." + std::to_wstring(GetTickCount64());
+    const UINT64 bytes = s.pitch * s.workH * 2 + UINT64(s.motionPitch) * s.workH + UINT64(s.depthPitch) * s.workH;
+    // The frames wait in memory until the last is recorded: 4 GB at most.
+    count = std::max(1, std::min(count, int((4ull << 30) / bytes)));
+    D3D12_HEAP_PROPERTIES hp{};
+    hp.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC bd{};
+    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bd.Width = bytes; bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
+    bd.SampleDesc = {1, 0}; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    s.capture.assign(size_t(count), State::CaptureFrame{});
+    bool ok = CreateDirectoryW(s.captureDir.c_str(), nullptr) != 0;
+    for (auto& f : s.capture)
+        ok = ok && SUCCEEDED(s.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                               IID_PPV_ARGS(&f.buf)));
+    if (!ok) {
+        s.capture.clear();
+        DeleteFileW(trigger.c_str());
+        s.captureWriting = false;
+        Log("capture: could not set up %d frames of %llu MB in %ls", count, (unsigned long long)(bytes >> 20), s.captureDir.c_str());
+        return;
+    }
+    s.captureAt = 0;
+    s.capturing = true;
+    Log("capture: %d frames of %ux%u (%llu MB each) into %ls", count, s.workW, s.workH, (unsigned long long)(bytes >> 20),
+        s.captureDir.c_str());
+}
+
 void DropSized() {
     State& s = S();
+    CaptureFinish();  // its frames have this layout
     if (s.deviceSynchronize) s.deviceSynchronize();  // nothing of the engine's still reads the shared buffers
     if (s.extIn) s.destroyMemory(s.extIn);
     if (s.extOut) s.destroyMemory(s.extOut);
@@ -496,6 +636,7 @@ bool Process(ID3D12Resource* bb) {
         s.failedW = s.failedH = 0;
         s.stats.active = true;
     }
+    CaptureCheck();
     const unsigned long long n = ++s.frame;
     const int ring = int(n % kRing);
     WaitDone(s.ringFrame[ring]);  // this allocator set's last use has run
@@ -580,6 +721,17 @@ bool Process(ID3D12Resource* bb) {
         b->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
         t[0] = Transition(s.delta.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         b->ResourceBarrier(1, t);
+        if (s.capturing) {
+            // What the engine read and wrote for this frame, side by side.
+            State::CaptureFrame& f = s.capture[s.captureAt];
+            const UINT64 rows = s.pitch * s.workH, motionBytes = UINT64(s.motionPitch) * s.workH;
+            f.frame = n;
+            f.guides = j.motion ? (j.depth ? 3 : 1) : 0;
+            b->CopyBufferRegion(f.buf.Get(), 0, s.bufIn.Get(), 0, rows);
+            b->CopyBufferRegion(f.buf.Get(), rows, s.bufOut.Get(), 0, rows);
+            if (f.guides & 1) b->CopyBufferRegion(f.buf.Get(), 2 * rows, s.bufMotion.Get(), 0, motionBytes);
+            if (f.guides & 2) b->CopyBufferRegion(f.buf.Get(), 2 * rows + motionBytes, s.bufDepth.Get(), 0, UINT64(s.depthPitch) * s.workH);
+        }
         Draw(b, s.psoUp.Get(), BackRtv(bb), s.width, s.height, 1);
         t[0] = Transition(bb, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
         b->ResourceBarrier(1, t);
@@ -589,6 +741,7 @@ bool Process(ID3D12Resource* bb) {
     s.queue->ExecuteCommandLists(1, lb);
     s.queue->Signal(s.done.Get(), n);
     ++s.stats.frames;
+    if (s.capturing && ++s.captureAt == s.capture.size()) CaptureFinish();
     return true;
 }
 
@@ -606,6 +759,8 @@ bool GetGuideTargets(GuideTargets* out) {
 void GuidesStaged(bool motion, bool depth) {
     S().guides = (motion ? 1 : 0) | (motion && depth ? 2 : 0);
 }
+
+void RequestCapture(int frames) { S().captureRequest = frames; }
 
 void Flush() {
     State& s = S();

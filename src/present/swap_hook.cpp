@@ -99,7 +99,7 @@ ID3D12CommandQueue* QueueOf(IDXGISwapChain* sc) {
     }
     return g_seenQueue;
 }
-bool g_started = false, g_failed = false, g_on = true, g_keyDown = false;
+bool g_started = false, g_failed = false, g_on = true, g_keyDown = false, g_captureDown = false;
 unsigned long long g_presents = 0;
 
 void OnPresent(IDXGISwapChain* sc) {
@@ -125,6 +125,7 @@ void OnPresent(IDXGISwapChain* sc) {
         c.engineConfig = g_settings.engineConfig;
         c.workingScale = g_settings.workingScale;
         c.maxWorkingPixels = g_settings.maxWorkingPixels;
+        c.capturePath = g_settings.capturePath;
         memcpy(c.controls, g_settings.controls, sizeof(c.controls));
         Log("first D3D12 present: starting the engine");
         if (!final_picture::Init(device.Get(), queue, c)) {
@@ -142,6 +143,12 @@ void OnPresent(IDXGISwapChain* sc) {
         Log("toggled %s", g_on ? "on" : "off");
     }
     g_keyDown = down;
+    const bool capture = g_settings.captureKey && (GetAsyncKeyState(g_settings.captureKey) & 0x8000) != 0;
+    if (capture && !g_captureDown && !g_settings.capturePath.empty()) {
+        Log("capture key: %d frames", g_settings.captureFrames);
+        final_picture::RequestCapture(g_settings.captureFrames);
+    }
+    g_captureDown = capture;
     if (!g_on) return;
     ComPtr<IDXGISwapChain3> sc3;
     ComPtr<ID3D12Resource> back;

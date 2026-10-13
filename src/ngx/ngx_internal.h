@@ -221,6 +221,10 @@ struct Config {
     float presentWorkingScale = 0.0f;       // 0: the largest within presentMaxWorkingPixels
     float presentMaxWorkingPixels = 2.1e6f;
     int presentToggleKey = 0x79;            // F10; 0 none
+    // Records presentCaptureFrames consecutive frames as the engine was handed
+    // them (picture, motion, depth, its answer) beside CandidateInputCapturePath.
+    int presentCaptureKey = 0x7A;           // F11; 0 none
+    int presentCaptureFrames = 60;
     // Luma engines: hand the resolve the engine's ratio map (carried along this
     // frame's motion and gated on its luminance there) instead of a frame
     // composed on the older frame the engine saw. 0 restores the composed frame.

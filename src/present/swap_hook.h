@@ -18,6 +18,9 @@ struct Settings {
     float workingScale = 0.0f, maxWorkingPixels = 2.1e6f;
     float controls[6] = {1.0f, 0.0f, 1.0f, 1.0f, -1.0f, 1.0f};
     int toggleKey = VK_F10;
+    std::wstring capturePath;  // final_picture::Config::capturePath
+    int captureKey = 0;        // records captureFrames consecutive frames; 0 none
+    int captureFrames = 60;
 };
 
 // Where the hook's and the front end's log lines go.

@@ -56,6 +56,9 @@ void PresentModeEvaluate(ID3D12GraphicsCommandList* cl, const Config& cfg, const
         g_settings.workingScale = cfg.presentWorkingScale;
         g_settings.maxWorkingPixels = cfg.presentMaxWorkingPixels;
         g_settings.toggleKey = cfg.presentToggleKey;
+        g_settings.capturePath = cfg.candidateInputCapturePath;  // "<path>.seq" records consecutive frames
+        g_settings.captureKey = cfg.presentCaptureKey;
+        g_settings.captureFrames = cfg.presentCaptureFrames;
         if (NrControlValues().generation) Controls(g_settings.controls);
         LOGI("present: mode on, engine config %s, working scale %g (0: within %.0f pixels)", config,
              cfg.presentWorkingScale, cfg.presentMaxWorkingPixels);

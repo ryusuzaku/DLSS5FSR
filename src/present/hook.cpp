@@ -83,6 +83,9 @@ Settings LoadSettings() {
         else if (key == "SkinStructure") s.controls[4] = float(atof(value.c_str()));
         else if (key == "AutoMask") s.controls[5] = float(atof(value.c_str()));
         else if (key == "ToggleKey") s.toggleKey = int(strtol(value.c_str(), nullptr, 0));
+        else if (key == "CaptureKey") s.captureKey = int(strtol(value.c_str(), nullptr, 0));
+        else if (key == "CaptureFrames") s.captureFrames = atoi(value.c_str());
+        else if (key == "CapturePath") { wchar_t w[MAX_PATH]; MultiByteToWideChar(CP_UTF8, 0, value.c_str(), -1, w, MAX_PATH); s.capturePath = w; }
     }
     fclose(f);
     return s;
