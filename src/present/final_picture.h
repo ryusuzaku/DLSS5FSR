@@ -84,6 +84,8 @@ bool SetPasses(int passes);
 // history=A: 1 the original, 0 every frame on its own), from the next frame
 // on. False: this engine cannot change it while it runs.
 bool SetHistory(float amount);
+// The engine's stabilize amount (0 off .. 0.95), from the next frame on.
+bool SetStabilize(float amount);
 // The caller's Reset (a camera cut): the next frame runs without history.
 void ResetHistory();
 // Starts a sequence capture of `frames` frames at the next Process, as the

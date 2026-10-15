@@ -262,6 +262,19 @@ struct OutputOptions {
     // uncover_radius=R: how far around, in frame pixels.
     int uncover = 0;
     int uncover_radius = 10;
+    // stabilize=A (transfer=nvidia; ours, not the original's; 0 off, default
+    // off): the low-frequency part of the change (a box blur of stabilize_radius
+    // pixels) is blended with the previous result's, carried along the motion,
+    // by A (0.66 is about 80 ms at 30 fps); the high-frequency part stays the
+    // current frame's, so detail is not smeared. The history is clamped to
+    // stabilize_clamp (0..1 units) around the current value and dropped where
+    // the surface differs (depth beyond 6%, or something nearer was there).
+    // It steadies the relighting of still surfaces (reflections, soft shading)
+    // that changes a little from frame to frame, more with several passes.
+    // Needs motion and depth; without them nothing is done.
+    float stabilize = 0.0f;
+    int stabilize_radius = 6;
+    float stabilize_clamp = 0.04f;
     // input_temporal=A (S332): a TAA pass on the network's input only -- the
     // frame blended with the previous network input carried along the motion
     // by A, the history clamped to the frame's 3x3 range and dropped where the
@@ -907,6 +920,66 @@ __global__ void k_nv_map(const float* image, const float* color, float4* map, in
     map[p] = make_float4(d[0], d[1], d[2], yin);
 }
 
+// stabilize=A, step 1: the low band of the change (xyz of the float4 map), a
+// box blur of `radius` pixels, one direction a launch (averaged over the
+// pixels inside the frame).
+__global__ void k_stab_blur(const float4* in, float4* out, int fw, int fh, int radius, int vertical) {
+    const int p = blockIdx.x*blockDim.x + threadIdx.x;
+    if (p >= fw*fh) return;
+    const int x = p % fw, y = p / fw;
+    float3 s = make_float3(0.0f, 0.0f, 0.0f);
+    int n = 0;
+    for (int d = -radius; d <= radius; ++d) {
+        const int xx = vertical ? x : x + d, yy = vertical ? y + d : y;
+        if (xx < 0 || xx >= fw || yy < 0 || yy >= fh) continue;
+        const float4 v = in[size_t(yy)*fw + xx];
+        s.x += v.x; s.y += v.y; s.z += v.z; ++n;
+    }
+    const float r = 1.0f / float(n);
+    out[p] = make_float4(s.x*r, s.y*r, s.z*r, 0.0f);
+}
+// Step 2: low band blended with the carried history, plus the current high band.
+// mv: this frame's vectors (where the surface was a frame ago, as k_uncover_age
+// reads them); hist: the previous result's low band (frame pixels), depth_hist
+// the previous frame's depth. valid = 0 passes the change through and starts
+// the history over. hist_out takes the blended low band.
+__global__ void k_stab_apply(const float4* map, const float4* low, const float4* hist, float4* hist_out, float4* out,
+                             const float2* mv, const float* depth, const float* depth_hist,
+                             int fw, int fh, float2 ms, float a, float clamp_t, int valid) {
+    const int p = blockIdx.x*blockDim.x + threadIdx.x;
+    if (p >= fw*fh) return;
+    const int x = p % fw, y = p / fw;
+    const float4 c = map[p], lo = low[p];
+    const float3 hi = make_float3(c.x - lo.x, c.y - lo.y, c.z - lo.z);
+    float3 ls = make_float3(lo.x, lo.y, lo.z);
+    if (valid) {
+        float2 v = mv[p];
+        v.x *= ms.x; v.y *= ms.y;
+        if (!isfinite(v.x) || !isfinite(v.y)) v = make_float2(0.0f, 0.0f);
+        const float fx = x + v.x, fy = y + v.y;  // pixel centres: the previous position
+        const int x0 = int(floorf(fx)), y0 = int(floorf(fy));
+        const int qx = int(floorf(fx + 0.5f)), qy = int(floorf(fy + 0.5f));
+        if (x0 >= 0 && y0 >= 0 && x0 + 1 < fw && y0 + 1 < fh && qx >= 0 && qx < fw && qy >= 0 && qy < fh) {
+            const float dp = depth[p], dq = depth_hist[size_t(qy)*fw + qx];
+            if (fabsf(dq - dp) <= 0.06f*dp && dq <= dp*1.015f) {
+                const float ax = fx - x0, ay = fy - y0;
+                const float4 h00 = hist[size_t(y0)*fw + x0], h10 = hist[size_t(y0)*fw + x0 + 1];
+                const float4 h01 = hist[size_t(y0 + 1)*fw + x0], h11 = hist[size_t(y0 + 1)*fw + x0 + 1];
+                float3 h;
+                h.x = (h00.x*(1.0f - ax) + h10.x*ax)*(1.0f - ay) + (h01.x*(1.0f - ax) + h11.x*ax)*ay;
+                h.y = (h00.y*(1.0f - ax) + h10.y*ax)*(1.0f - ay) + (h01.y*(1.0f - ax) + h11.y*ax)*ay;
+                h.z = (h00.z*(1.0f - ax) + h10.z*ax)*(1.0f - ay) + (h01.z*(1.0f - ax) + h11.z*ax)*ay;
+                h.x = fminf(fmaxf(h.x, ls.x - clamp_t), ls.x + clamp_t);
+                h.y = fminf(fmaxf(h.y, ls.y - clamp_t), ls.y + clamp_t);
+                h.z = fminf(fmaxf(h.z, ls.z - clamp_t), ls.z + clamp_t);
+                ls.x += a*(h.x - ls.x); ls.y += a*(h.y - ls.y); ls.z += a*(h.z - ls.z);
+            }
+        }
+    }
+    hist_out[p] = make_float4(ls.x, ls.y, ls.z, 0.0f);
+    out[p] = make_float4(ls.x + hi.x, ls.y + hi.y, ls.z + hi.z, c.w);
+}
+
 // uncover=N, step 1: frames since this pixel was uncovered, at most `limit`.
 // The pixel's own vector says where its surface was a frame ago. If what was
 // there then moved differently (by more than 4 px and half the larger of the
@@ -1373,6 +1446,12 @@ struct Engine {
     std::unique_ptr<Buffer> uncover_age[2], uncover_depth, uncover_tmp;
     int uncover_cur = 0, uncover_w = 0, uncover_h = 0;
     long long uncover_frame = -1;
+    // stabilize=A: the low band (ping-pong history, current blur, scratch), the
+    // previous frame's depth, and the buffer the stabilised map goes to.
+    std::unique_ptr<Buffer> stab_hist[2], stab_low, stab_tmp, stab_out, stab_depth;
+    int stab_cur = 0, stab_w = 0, stab_h = 0;
+    long long stab_frame = -1;
+    std::atomic<int> stabilize_request{-1};  // re_set_stabilize: thousandths, taken at the next run
     // re_depth: the newest submitted frame's depth (frame pixels) and the
     // job's copy, taken when the job starts.
     std::unique_ptr<Buffer> depth_next, job_depth;
@@ -1422,6 +1501,9 @@ struct Engine {
             else if (key == "history") options.history = std::min(std::max(std::stof(value), 0.0f), 1.0f);
             else if (key == "uncover") options.uncover = std::min(std::max(std::stoi(value), 0), 16);
             else if (key == "uncover_radius") options.uncover_radius = std::min(std::max(std::stoi(value), 1), 48);
+            else if (key == "stabilize") options.stabilize = std::min(std::max(std::stof(value), 0.0f), 0.95f);
+            else if (key == "stabilize_radius") options.stabilize_radius = std::min(std::max(std::stoi(value), 1), 24);
+            else if (key == "stabilize_clamp") options.stabilize_clamp = std::min(std::max(std::stof(value), 0.001f), 1.0f);
             else if (key == "input_temporal") options.input_temporal = std::stof(value);
             else if (key == "extent" && (value == "compact" || value == "legacy")) options.compact = value == "compact";
             else if (key == "tone") options.tone = std::stof(value);
@@ -1755,6 +1837,7 @@ struct Engine {
         HIP_CHECK(hipStreamWaitEvent(stream, inputs_ready, 0));
         if (const int passes = passes_request.exchange(0)) options.passes = std::min(std::max(passes, 1), 3);
         if (const int amount = history_request.exchange(-1); amount >= 0) options.history = std::min(amount, 1000) / 1000.0f;
+        if (const int amount = stabilize_request.exchange(-1); amount >= 0) options.stabilize = std::min(amount, 950) / 1000.0f;
         int W = 256, H = 256;
         // Luma mode may run the network on a downscale of the frame (scale).
         int sw = frame_w, sh = frame_h;
@@ -1982,6 +2065,44 @@ struct Engine {
                                        reinterpret_cast<float4*>(maps[next]->data.get()), frame_w, frame_h, W,
                                        job_strength, nv_first);
                     HIP_CHECK(hipGetLastError());
+                    // stabilize=A: the low band against the previous result's, along the motion.
+                    {
+                        const size_t spx = size_t(frame_w)*frame_h;
+                        const bool stab_now = options.stabilize > 0.0f && nv_mv && job_depth_valid;
+                        if (stab_now) {
+                            for (auto& b : stab_hist)
+                                if (!b || b->count < spx*4) { b.reset(new Buffer(spx*4)); stab_frame = -1; }
+                            if (!stab_low || stab_low->count < spx*4) stab_low.reset(new Buffer(spx*4));
+                            if (!stab_tmp || stab_tmp->count < spx*4) stab_tmp.reset(new Buffer(spx*4));
+                            if (!stab_out || stab_out->count < maps[next]->count) stab_out.reset(new Buffer(maps[next]->count));
+                            if (!stab_depth || stab_depth->count < spx) { stab_depth.reset(new Buffer(spx)); stab_frame = -1; }
+                            if (stab_w != frame_w || stab_h != frame_h) stab_frame = -1;
+                            const dim3 sgrid((spx+255)/256), sblock(256);
+                            hipLaunchKernelGGL(k_stab_blur, sgrid, sblock, 0, stream,
+                                               reinterpret_cast<const float4*>(maps[next]->data.get()),
+                                               reinterpret_cast<float4*>(stab_tmp->data.get()), frame_w, frame_h, options.stabilize_radius, 0);
+                            hipLaunchKernelGGL(k_stab_blur, sgrid, sblock, 0, stream,
+                                               reinterpret_cast<const float4*>(stab_tmp->data.get()),
+                                               reinterpret_cast<float4*>(stab_low->data.get()), frame_w, frame_h, options.stabilize_radius, 1);
+                            const int sto = 1 - stab_cur;
+                            const int sval = job_frame > 0 && stab_frame == job_frame - 1 ? 1 : 0;
+                            hipLaunchKernelGGL(k_stab_apply, sgrid, sblock, 0, stream,
+                                               reinterpret_cast<const float4*>(maps[next]->data.get()),
+                                               reinterpret_cast<const float4*>(stab_low->data.get()),
+                                               reinterpret_cast<const float4*>(stab_hist[stab_cur]->data.get()),
+                                               reinterpret_cast<float4*>(stab_hist[sto]->data.get()),
+                                               reinterpret_cast<float4*>(stab_out->data.get()), nv_mv, job_depth->data.get(),
+                                               stab_depth->data.get(), frame_w, frame_h, nv_ms,
+                                               options.stabilize, options.stabilize_clamp, sval);
+                            HIP_CHECK(hipGetLastError());
+                            std::swap(maps[next], stab_out);
+                            stab_cur = sto;
+                            HIP_CHECK(hipMemcpyAsync(stab_depth->data, job_depth->data, spx*sizeof(float), hipMemcpyDeviceToDevice, stream));
+                            stab_frame = job_frame; stab_w = frame_w; stab_h = frame_h;
+                        } else {
+                            stab_frame = -1;
+                        }
+                    }
                     // uncover=N: this frame's and the previous frame's vectors and depth.
                     const size_t px = size_t(frame_w)*frame_h;
                     const int prev_slot = int((job_frame + kRing - 1) % kRing);
@@ -2602,6 +2723,15 @@ __declspec(dllexport) int re_set_history(float amount) {
     std::lock_guard<std::mutex> lock(g_mutex);
     if (!g_engine) return -1;
     g_engine->history_request = int(std::min(std::max(amount, 0.0f), 1.0f)*1000.0f + 0.5f);
+    return 1;
+}
+
+// transfer=nvidia: the stabilize amount (the config's stabilize=A, 0..0.95)
+// from the next frame on.
+__declspec(dllexport) int re_set_stabilize(float amount) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!g_engine) return -1;
+    g_engine->stabilize_request = int(std::min(std::max(amount, 0.0f), 0.95f)*1000.0f + 0.5f);
     return 1;
 }
 

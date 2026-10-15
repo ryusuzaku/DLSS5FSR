@@ -231,6 +231,7 @@ struct Config {
     // Cycles how much of the engine's recurrence is used: 1 (the original),
     // 0.5, 0.25, 0 (every frame on its own).
     int presentHistoryKey = 0x76;           // F7; 0 none
+    int presentStabilizeKey = 0x78;         // F9: the edit stabiliser 0.66 / 0.8 / off; 0 none
     int presentCaptureFrames = 60;
     // Luma engines: hand the resolve the engine's ratio map (carried along this
     // frame's motion and gated on its luminance there) instead of a frame

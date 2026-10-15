@@ -87,6 +87,7 @@ Settings LoadSettings() {
         else if (key == "PassesKey") s.passesKey = int(strtol(value.c_str(), nullptr, 0));
         else if (key == "MaxPasses") s.maxPasses = atoi(value.c_str());
         else if (key == "HistoryKey") s.historyKey = int(strtol(value.c_str(), nullptr, 0));
+        else if (key == "StabilizeKey") s.stabilizeKey = int(strtol(value.c_str(), nullptr, 0));
         else if (key == "CaptureFrames") s.captureFrames = atoi(value.c_str());
         else if (key == "CapturePath") { wchar_t w[MAX_PATH]; MultiByteToWideChar(CP_UTF8, 0, value.c_str(), -1, w, MAX_PATH); s.capturePath = w; }
     }

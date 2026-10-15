@@ -101,7 +101,8 @@ ID3D12CommandQueue* QueueOf(IDXGISwapChain* sc) {
 }
 bool g_started = false, g_failed = false, g_on = true, g_keyDown = false, g_captureDown = false, g_passesDown = false;
 int g_passes = 1;
-bool g_historyDown = false;
+bool g_historyDown = false, g_stabilizeDown = false;
+int g_stabilizeStep = -1;  // the engine config's amount until the key is first pressed (then 0.66)
 int g_historyStep = -1;  // the engine config's amount until the key is first pressed (then 1)
 unsigned long long g_presents = 0;
 
@@ -168,6 +169,14 @@ void OnPresent(IDXGISwapChain* sc) {
         else Log("history key: this engine cannot change its history amount while running");
     }
     g_historyDown = history;
+    const bool stab = g_settings.stabilizeKey && (GetAsyncKeyState(g_settings.stabilizeKey) & 0x8000) != 0;
+    if (stab && !g_stabilizeDown) {
+        static const float amounts[3] = {0.66f, 0.8f, 0.0f};
+        const int next = (g_stabilizeStep + 1) % 3;
+        if (final_picture::SetStabilize(amounts[next])) { g_stabilizeStep = next; Log("stabilize key: amount %.2f", amounts[next]); }
+        else Log("stabilize key: this engine cannot change its stabiliser while running");
+    }
+    g_stabilizeDown = stab;
     if (!g_on) return;
     ComPtr<IDXGISwapChain3> sc3;
     ComPtr<ID3D12Resource> back;
