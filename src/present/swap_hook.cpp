@@ -171,9 +171,10 @@ void OnPresent(IDXGISwapChain* sc) {
     g_historyDown = history;
     const bool stab = g_settings.stabilizeKey && (GetAsyncKeyState(g_settings.stabilizeKey) & 0x8000) != 0;
     if (stab && !g_stabilizeDown) {
-        static const float amounts[3] = {0.66f, 0.8f, 0.0f};
-        const int next = (g_stabilizeStep + 1) % 3;
-        if (final_picture::SetStabilize(amounts[next])) { g_stabilizeStep = next; Log("stabilize key: amount %.2f", amounts[next]); }
+        // low band only; low band + still pixels; strong; off
+        static const float amounts[4] = {0.66f, 0.66f, 0.8f, 0.0f}, still[4] = {0.0f, 0.7f, 0.9f, 0.0f};
+        const int next = (g_stabilizeStep + 1) % 4;
+        if (final_picture::SetStabilize(amounts[next], still[next])) { g_stabilizeStep = next; Log("stabilize key: amount %.2f, still pixels %.2f", amounts[next], still[next]); }
         else Log("stabilize key: this engine cannot change its stabiliser while running");
     }
     g_stabilizeDown = stab;

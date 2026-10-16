@@ -60,6 +60,7 @@ struct State {
     int (*reSetPasses)(int) = nullptr;
     int (*reSetHistory)(float) = nullptr;
     int (*reSetStabilize)(float) = nullptr;
+    int (*reSetStabilizeStill)(float) = nullptr;
     std::atomic<bool> resetHistory{false};
     hipError_t (*importMemory)(hipExternalMemory_t*, const hipExternalMemoryHandleDesc*) = nullptr;
     hipError_t (*mappedBuffer)(void**, hipExternalMemory_t, const hipExternalMemoryBufferDesc*) = nullptr;
@@ -604,6 +605,7 @@ bool Init(ID3D12Device* device, ID3D12CommandQueue* queue, const Config& config)
     s.reSetPasses = reinterpret_cast<int (*)(int)>(GetProcAddress(s.engine, "re_set_passes"));
     s.reSetHistory = reinterpret_cast<int (*)(float)>(GetProcAddress(s.engine, "re_set_history"));
     s.reSetStabilize = reinterpret_cast<int (*)(float)>(GetProcAddress(s.engine, "re_set_stabilize"));
+    s.reSetStabilizeStill = reinterpret_cast<int (*)(float)>(GetProcAddress(s.engine, "re_set_stabilize_still"));
     if (s.reCreate(config.engineConfig.c_str()) != 1) {
         Log("re_create: %s", s.reLastError());
         return Fail("the engine did not start");
@@ -775,10 +777,12 @@ bool SetHistory(float amount) {
     return s.ready && s.reSetHistory && s.reSetHistory(amount) == 1;
 }
 
-bool SetStabilize(float amount) {
+bool SetStabilize(float amount, float still) {
     State& s = S();
     std::lock_guard<std::mutex> lock(s.mutex);
-    return s.ready && s.reSetStabilize && s.reSetStabilize(amount) == 1;
+    if (!(s.ready && s.reSetStabilize && s.reSetStabilize(amount) == 1)) return false;
+    if (s.reSetStabilizeStill) s.reSetStabilizeStill(still);  // an older engine has only the low band
+    return true;
 }
 
 bool SetPasses(int passes) {

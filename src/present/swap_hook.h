@@ -23,7 +23,7 @@ struct Settings {
     int passesKey = 0;         // cycles the engine through 1..maxPasses passes; 0 none
     int maxPasses = 2;         // 1..3: three starts to invent texture and deepens what trails
     int historyKey = 0;        // cycles the history amount 1, 0.5, 0.25, 0; 0 none
-    int stabilizeKey = 0;      // cycles the edit stabiliser 0.66, 0.8, off; 0 none
+    int stabilizeKey = 0;      // cycles the edit stabiliser: low band, + still pixels, strong, off; 0 none
     int captureFrames = 60;
 };
 
