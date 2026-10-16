@@ -2111,7 +2111,7 @@ struct Engine {
                                                reinterpret_cast<const float4*>(stab_tmp->data.get()),
                                                reinterpret_cast<float4*>(stab_low->data.get()), frame_w, frame_h, options.stabilize_radius, 1);
                             const int sto = 1 - stab_cur;
-                            const int sval = job_frame > 0 && stab_frame == job_frame - 1 ? 1 : 0;
+                            const int sval = job_frame > 0 && stab_frame == job_frame - 1 && nv_history ? 1 : 0;  // a reset (nv_history off) starts it over
                             hipLaunchKernelGGL(k_stab_apply, sgrid, sblock, 0, stream,
                                                reinterpret_cast<const float4*>(maps[next]->data.get()),
                                                reinterpret_cast<const float4*>(stab_low->data.get()),
