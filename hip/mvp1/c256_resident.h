@@ -91,8 +91,8 @@ struct Weights {
 
 class Chain {
     static int checked(int w,int h,const std::vector<std::pair<std::string,int>>& blocks) {
-        if (w <= 0 || h <= 0 || w % 4 || h % 4 || blocks.size() != 8)
-            throw std::invalid_argument("resident C256 requires a positive multiple of 4 and eight blocks");
+        if (w <= 0 || h <= 0 || w % 4 || h % 4 || blocks.empty())
+            throw std::invalid_argument("resident C256 requires a positive multiple of 4 and at least one block");
         for (const auto& b: blocks) if (b.second < 0 || b.second > 3) throw std::invalid_argument("invalid shift");
         return w;
     }

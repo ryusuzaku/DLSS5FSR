@@ -176,20 +176,27 @@ private:
     bool image_was_bytes = false, c64_was_bytes = false;
     std::unique_ptr<Buffer> c64_8, down_pool8;  // c64 and block4's pool as E4M3 bytes (c64_bytes)
     bool skip_is_half = false;  // this run wrote skip0 only as halves
-    std::vector<std::unique_ptr<Weights>> weights;
+    std::vector<std::unique_ptr<Weights>> weights;  // block0, then the bodies
+    std::vector<std::pair<int,int>> bodies;         // C32 encoder bodies: (fixture block, shift)
     Body body;
     std::unique_ptr<Buffer> body_raw, body_quant;  // chunked body outputs above the cap
     bool ready = false;
 public:
     size_t comparisons = 0;
+    // NVIDIA's 310.8 model (preset 1): C32 encoder blocks 1-4, shifts none, xy, x, y
+    // (its layer table). The 310.9.16 small model has two, blocks 1 and 4's roles.
+    static std::vector<std::pair<int,int>> original_bodies() { return {{1,0},{2,3},{3,1},{4,2}}; }
     // max_rows caps the C32 body scratch; larger frames run in chunks without stage checks.
-    FrontEnd(int w, int h, const std::string& fixture, int max_rows = 0) : width(checked(w,h)), height(h), pixels(size_t(w)*h),
+    FrontEnd(int w, int h, const std::string& fixture, int max_rows = 0,
+             std::vector<std::pair<int,int>> body_list = original_bodies()) : width(checked(w,h)), height(h), pixels(size_t(w)*h),
         dir(fixture), noise(pixels*3), stem(dir,"stem_weights",15*32), matrix(dir,"matrix",64*32), matrix_native(64*32),
         tokens(size_t(w/2+8)*(h/2+8)*32 > pixels*32 ? size_t(w/2+8)*(h/2+8)*32 : pixels*32),
         raw0(pixels*32), image(pixels/4*32), image8(pixels/4*32/4), raw4(pixels/4*32), down_pool(pixels/16*32), down(pixels/16*64),
         c64(pixels/16*64), skip4(pixels/4*32), skip0(pixels*32), skip0h(pixels*16),
-        body(max_rows > 0 && size_t(max_rows) < pixels ? max_rows : int(pixels)) {
-        for (int b = 0; b < 5; ++b) weights.emplace_back(new Weights(dir+"/block"+std::to_string(b)));
+        bodies(std::move(body_list)), body(max_rows > 0 && size_t(max_rows) < pixels ? max_rows : int(pixels)) {
+        if (bodies.empty()) throw std::invalid_argument("front end needs at least one C32 body");
+        weights.emplace_back(new Weights(dir+"/block0"));
+        for (const auto& b : bodies) weights.emplace_back(new Weights(dir+"/block"+std::to_string(b.first)));
         {
             const auto m = read(dir, "matrix", 64*32);
             std::vector<float> nat(64*32);
@@ -279,31 +286,33 @@ public:
         if (!pre) FRONT_LAUNCH(k_front_pool,pixels/4*32,raw0.data,image.data,width,height,32);
         if (!check(dir+"/block0","raw",raw0.data,pixels*32,verify,comparisons) ||
             !check(dir,"pre_down",image.data,pixels/4*32,verify,comparisons)) return false;
-        const int shifts[5] = {0,0,3,1,2};  // NVIDIA layer table: blocks 1-4 = none, xy, x, y
         int w = width/2, h = height/2;
-        for (int b = 1; b <= 4; ++b) {
-            int px = (shifts[b]&1) ? 4 : 0, py = (shifts[b]&2) ? 4 : 0;
+        for (size_t k = 0; k < bodies.size(); ++k) {
+            // weights[b]: body k; the last one also pools for the C64 downsample.
+            const int b = int(k)+1, shift = bodies[k].second;
+            const bool last = k+1 == bodies.size();
+            int px = (shift&1) ? 4 : 0, py = (shift&2) ? 4 : 0;
             int rows = ((w+px+7)/8)*((h+py+7)/8)*64;
-            std::string block = dir+"/block"+std::to_string(b);
+            std::string block = dir+"/block"+std::to_string(bodies[k].first);
             if (fused) {
-                // block4: the 2x2 pool of its raw body in the epilogue (no raw4).
+                // The last body: the 2x2 pool of its raw output in the epilogue (no raw4).
                 C32Fuse pz;
-                if (b == 4 && p4) {  // with c64_bytes the pool goes to the down GEMM as bytes
+                if (last && p4) {  // with c64_bytes the pool goes to the down GEMM as bytes
                     if (c64_bytes && !down_pool8) down_pool8.reset(new Buffer((down_pool.count+3)/4));
                     pz.pool = c64_bytes ? down_pool8->data.get() : down_pool.data.get(); pz.pool_fmt = int(c64_bytes);
                 }
-                C32Io bio = io(1, w, h, shifts[b]); bio.in_fmt = bio.out_fmt = int(i8);
+                C32Io bio = io(1, w, h, shift); bio.in_fmt = bio.out_fmt = int(i8);
                 float* img = i8 ? image8.data.get() : image.data.get();
-                weights[b]->body(img, rows, b == 4 && !p4 ? raw4.data.get() : nullptr, img, bio, pz);
+                weights[b]->body(img, rows, last && !p4 ? raw4.data.get() : nullptr, img, bio, pz);
                 continue;
             }
-            FRONT_LAUNCH(k_front_gather,size_t(rows)*32,image.data,tokens.data,w,h,shifts[b]);
+            FRONT_LAUNCH(k_front_gather,size_t(rows)*32,image.data,tokens.data,w,h,shift);
             if (!check(block,"input",tokens.data,size_t(rows)*32,verify,comparisons) ||
                 !this->block(b,rows,verify,raw,quant)) return false;
-            if (b == 4) FRONT_LAUNCH(k_front_scatter,size_t(rows)*32,raw,raw4.data,w,h,shifts[b]);
-            FRONT_LAUNCH(k_front_scatter,size_t(rows)*32,quant,image.data,w,h,shifts[b]);
+            if (last) FRONT_LAUNCH(k_front_scatter,size_t(rows)*32,raw,raw4.data,w,h,shift);
+            FRONT_LAUNCH(k_front_scatter,size_t(rows)*32,quant,image.data,w,h,shift);
             if (!check(block,"image",image.data,size_t(w)*h*32,verify,comparisons) ||
-                (b == 4 && !check(block,"raw",raw4.data,size_t(w)*h*32,verify,comparisons))) return false;
+                (last && !check(block,"raw",raw4.data,size_t(w)*h*32,verify,comparisons))) return false;
         }
         if (!(fused && p4)) FRONT_LAUNCH(k_front_pool,size_t(w/2)*(h/2)*32,raw4.data,down_pool.data,w,h,32);
         if (!verify) {

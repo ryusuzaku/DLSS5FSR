@@ -27,9 +27,9 @@ int main(int argc, char** argv) {
     {
         std::ifstream f(argv[1]);
         std::string line;
-        while (std::getline(f, line) && config.size() < 24) {
+        while (std::getline(f, line)) {  // the 24 fixture lines, then options (model=)
             if (!line.empty() && line.back() == '\r') line.pop_back();
-            config.push_back(line);
+            if (config.size() < 24 || !line.empty()) config.push_back(line);
         }
     }
     if (config.size() < 24) { fputs("config needs 24 path lines\n", stderr); return 1; }
@@ -57,7 +57,7 @@ int main(int argc, char** argv) {
     HIP_CHECK(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking));
     c512_resident::stream = stream;
     int W = 256, H = 256;
-    network_extent(fw, fh, W, H, compact);
+    network_extent(fw, fh, W, H, compact, ModelSpec::from(config).small);
     printf("frame %dx%d, network extent %dx%d (%s); controls [%g %g %g %g %g], seed %u\n", fw, fh, W, H,
            compact ? "compact" : "legacy", controls[0], controls[1], controls[2], controls[3], controls[4], seed);
     Network net(config, W, H);

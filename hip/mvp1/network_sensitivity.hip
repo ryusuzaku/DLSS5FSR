@@ -76,7 +76,7 @@ int main(int argc, char** argv) {
     int sw = fw, sh = fh;
     if (sc < 1.0f) { sw = std::max(64, int(fw*sc + 0.5f)); sh = std::max(64, int(fh*sc + 0.5f)); }
     int W = 256, H = 256;
-    network_extent(sw, sh, W, H, compact);
+    network_extent(sw, sh, W, H, compact, ModelSpec::from(config).small);
     printf("frame %dx%d -> network content %dx%d, extent %dx%d; noise %g %s\n", fw, fh, sw, sh, W, H, amp,
            patch ? "in a patch" : "everywhere");
     Network net(config, W, H);

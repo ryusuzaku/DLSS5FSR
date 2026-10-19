@@ -36,9 +36,9 @@ int main(int argc, char** argv) {
     {
         std::ifstream f(argv[1]);
         std::string line;
-        while (std::getline(f, line) && config.size() < 24) {
+        while (std::getline(f, line)) {  // the 24 fixture lines, then options (model=)
             if (!line.empty() && line.back() == '\r') line.pop_back();
-            config.push_back(line);
+            if (config.size() < 24 || !line.empty()) config.push_back(line);
         }
     }
     const int count = argc > 4 ? atoi(argv[4]) : 10;
@@ -50,7 +50,6 @@ int main(int argc, char** argv) {
     }
     // NGX defaults: Style 0, LocalTone 1, LocalStructure 1, Skin -1, automatic mask (no mask texture).
     const float controls[5] = {0.0f, 1.0f, 1.0f, 1.0f, 1.0f};
-    const float blend_scale = 0.7397f;  // the model's history blend scale
     hipStream_t stream;
     HIP_CHECK(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking));
     c512_resident::stream = stream;
@@ -67,7 +66,7 @@ int main(int argc, char** argv) {
         unsigned dims[2]; memcpy(dims, data.data(), 8);
         if (!net) {
             fw = int(dims[0]); fh = int(dims[1]);
-            network_extent(fw, fh, W, H, true);
+            network_extent(fw, fh, W, H, true, ModelSpec::from(config).small);
             net.reset(new Network(config, W, H));
             for (int c = 0; c < 5; ++c) net->front->controls.v[c] = controls[c];
             net->front->noise_function = true;
@@ -101,7 +100,7 @@ int main(int argc, char** argv) {
         net->run(d_rgba, fw, fh, fw*4, 4, false, stream, fw, fh, nullptr, 1);
         hipLaunchKernelGGL(k_seq_post, dim3((fw*fh+255)/256), dim3(256), 0, stream,
                            net->rgb_native->data, net->head70->native_view().data, d_row, d_hist, d_mv, d_out,
-                           fw, fh, W, blend_scale, int(temporal));
+                           fw, fh, W, net->model.blend, int(temporal));  // the model's history blend scale
         HIP_CHECK(hipGetLastError());
         HIP_CHECK(hipMemcpyAsync(d_hist, d_out, px*12, hipMemcpyDeviceToDevice, stream));
         HIP_CHECK(hipStreamSynchronize(stream));

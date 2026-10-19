@@ -257,7 +257,7 @@ public:
 
 class Chain {
     static int checked(int w,int h,const std::vector<std::pair<std::string,int>>& blocks) {
-        if (w<=0||h<=0||w%8||h%8||blocks.size()!=4)throw std::invalid_argument("C32 requires a positive multiple of 8 and four blocks");
+        if (w<=0||h<=0||w%8||h%8||blocks.empty())throw std::invalid_argument("C32 requires a positive multiple of 8 and at least one block");
         for(auto& b:blocks)if(b.second<0||b.second>3)throw std::invalid_argument("invalid shift");
         return w;
     }

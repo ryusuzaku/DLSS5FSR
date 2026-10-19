@@ -39,12 +39,14 @@ def main():
     ap.add_argument('--config', default=os.path.join(ROOT, 'resident_engine_check', 'engine_config_game.txt'))
     ap.add_argument('--exe', default=os.path.join(ROOT, 'network_parity.exe'))
     ap.add_argument('--out', default=os.path.join(ROOT, 'parity'))
+    ap.add_argument('--ref', default=REF, help='reference folder (single-frame-inputs, single-frame-outputs); '
+                    'for model=small: peer DLSSNR-AMD ngx-verification/310.9.16 plus the 310.8.0 inputs')
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     for res in a.res:
-        inp = np.asarray(Image.open(f'{REF}/single-frame-inputs/{res}.png').convert('RGB'))
-        ref = np.asarray(Image.open(f'{REF}/single-frame-outputs/{res}_nvidia.png').convert('RGB')).astype(np.float64)
-        peer = np.asarray(Image.open(f'{REF}/single-frame-outputs/{res}_dlssnr-amd.png').convert('RGB')).astype(np.float64)
+        inp = np.asarray(Image.open(f'{a.ref}/single-frame-inputs/{res}.png').convert('RGB'))
+        ref = np.asarray(Image.open(f'{a.ref}/single-frame-outputs/{res}_nvidia.png').convert('RGB')).astype(np.float64)
+        peer = np.asarray(Image.open(f'{a.ref}/single-frame-outputs/{res}_dlssnr-amd.png').convert('RGB')).astype(np.float64)
         h, w = inp.shape[:2]
         rgb_path = os.path.join(a.out, f'{res}.rgb')
         with open(rgb_path, 'wb') as f:

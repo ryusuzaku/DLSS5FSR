@@ -199,6 +199,7 @@ struct OutputOptions {
     int luma = 0, denoise = 0, motion = 2, motion_sign = 1;  // motion 2 = auto, 3 = uv
     int nvidia = 0;   // transfer=nvidia (luma is set too: it shares the map plumbing)
     int compact = 0;  // extent=compact: smallest multiple-of-64 extent (fast path only)
+    int small = 0;    // model=small: the fixtures hold 310.9.16's 31-block network (ModelSpec)
     float tone = 0.0f;  // tone=K: luma mode network input through auto exposure (key K) + ACES
     float controls[5] = {0, 0, 0, 0, 0};  // controls=a,b,c,d,e: stem features 10..14
     int encoded = 0;      // encoded=1: feed the network display-encoded colour, as the original
@@ -674,9 +675,52 @@ std::vector<int32_t> vit_gather_map(int tokens) {
     return map;
 }
 
+// Which of NVIDIA's networks the fixtures hold. Engine option model=original
+// (default): the 310.8 network, 71 blocks (preset 1 of 310.9.16). model=small:
+// 310.9.16's default, 31 blocks with the same layer types; each level keeps its
+// first block and its last (down / outview) one, the C32 encoder blocks 1 and
+// 4's roles (tools/fixture_maps.py writes its fixture tree and lists).
+struct ModelSpec {
+    bool small = false;
+    // Blocks per list: encoder C64, C128, C256, C512; decoder C512, C256, C128, C64, C32.
+    int c64 = 4, c128 = 6, c256 = 8, c512 = 8, dec512 = 8, d256 = 8, d128 = 6, d64 = 4, d32 = 4;
+    std::vector<std::pair<int,int>> front = front_resident::FrontEnd::original_bodies();
+    // The post block's history blend scale: the record block70 / block30
+    // .layer0.blend_scale, f16 0x39EB / 0x3A23 (the original is kept at the
+    // 0.7397 the engine has always used).
+    float blend = 0.7397f;
+    static ModelSpec from(const std::vector<std::string>& config) {
+        ModelSpec m;
+        for (size_t i = 24; i < config.size(); ++i) {
+            std::string line = config[i];
+            while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+            if (line == "model=small") m.small = true;
+            else if (line.rfind("model=", 0) == 0 && line != "model=original")
+                throw std::runtime_error("unknown model: " + line);
+        }
+        if (m.small) {
+            m.c64 = m.c128 = m.c256 = m.c512 = m.dec512 = m.d256 = m.d128 = m.d64 = m.d32 = 2;
+            m.front = {{1,0},{4,3}};
+            m.blend = 0.76708984375f;
+        }
+        return m;
+    }
+};
+
 // Smallest padded extent the resident network supports for a frame. Compact
-// (fast path only): the frame rounded up to multiples of 64.
-void network_extent(int frame_w, int frame_h, int& width, int& height, bool compact = false) {
+// (fast path only): the frame rounded up to multiples of 64. The small model
+// uses NVIDIA's 310.9.16 rule (peer DLSSNR-AMD nr_native_plan.cpp, measured
+// against the DLL): an axis aligns to 128 when its first downscale,
+// up(ceil(n/2), 4), is 4 mod 8 (1920x1080 -> 1920x1152), at least 320, and
+// when both axes are multiples of 4x their alignment the width grows by one.
+void network_extent(int frame_w, int frame_h, int& width, int& height, bool compact = false, bool small = false) {
+    if (small) {
+        auto up = [](int n, int a) { return (n+a-1)/a*a; };
+        const int ax = up((frame_w+1)/2, 4) % 8 == 4 ? 128 : 64, ay = up((frame_h+1)/2, 4) % 8 == 4 ? 128 : 64;
+        width = std::max(320, up(frame_w, ax)); height = std::max(320, up(frame_h, ay));
+        if (height % (ay*4) == 0 && width % (ax*4) == 0) width += ax;
+        return;
+    }
     int w0 = (frame_w+63)/64*64, h0 = (frame_h+63)/64*64;
     if (compact && !c512_resident::exact_math) { width = w0; height = h0; return; }
     long long best = -1;
@@ -1171,6 +1215,7 @@ struct Network {
     // of 4); tokens: the C512 head's (w32/2 x h32/2); vit_valid: NVIDIA's ViT
     // sequence (up4(w32/2) x up4(h32/2)); vit_tokens: that padded to a multiple
     // of 64 for the fused attention, which masks only past vit_valid.
+    ModelSpec model;
     int W, H, width, height, w32, h32, tokens, vit_valid, vit_tokens;
     size_t n, hn;
     std::unique_ptr<front_resident::FrontEnd> front;
@@ -1217,21 +1262,21 @@ struct Network {
     // Config: the resident_frame_server arguments after the executable; the
     // width/height lines are ignored, weights come from the listed fixtures.
     Network(const std::vector<std::string>& a, int rgb_w, int rgb_h) :
-        W(rgb_w), H(rgb_h), width(rgb_w/32), height(rgb_h/32), w32(up4(width)), h32(up4(height)),
+        model(ModelSpec::from(a)), W(rgb_w), H(rgb_h), width(rgb_w/32), height(rgb_h/32), w32(up4(width)), h32(up4(height)),
         tokens((w32/2)*(h32/2)), vit_valid(up4(w32/2)*up4(h32/2)),
         vit_tokens(vit_valid == 16 || vit_valid % 64 == 0 ? vit_valid : (vit_valid+63)/64*64),
         n(size_t(w32)*h32*512), hn(size_t(tokens)*1024) {
         if (vit_tokens != vit_valid && c512_resident::exact_math)
             throw std::runtime_error("exact mode needs a ViT token count of 16 or a multiple of 64");
         const int cap = 65536;  // C32 body rows per chunk above this
-        front.reset(new front_resident::FrontEnd(W,H,a[23],cap));
-        encoder8.reset(new c64_resident::Chain(width*8,height*8,blocks(a[21],4),true));
+        front.reset(new front_resident::FrontEnd(W,H,a[23],cap,model.front));
+        encoder8.reset(new c64_resident::Chain(width*8,height*8,blocks(a[21],model.c64),true));
         down8.reset(new c64_resident::Downsample(width*8,height*8,a[22]));
-        encoder14.reset(new c128_resident::Chain(width*4,height*4,blocks(a[19],6),true));
+        encoder14.reset(new c128_resident::Chain(width*4,height*4,blocks(a[19],model.c128),true));
         down14.reset(new c128_resident::Downsample(width*4,height*4,a[20]));
-        encoder22.reset(new c256_resident::Chain(width*2,height*2,blocks(a[17],8),true));
+        encoder22.reset(new c256_resident::Chain(width*2,height*2,blocks(a[17],model.c256),true));
         down22.reset(new c256_resident::Downsample(width*2,height*2,a[18]));
-        chain.reset(new Chain(w32,h32,blocks(a[0],8),a[3]));
+        chain.reset(new Chain(w32,h32,blocks(a[0],model.c512),a[3]));
         if (w32 != width || h32 != height) {
             padded.reset(new Buffer(n));
             HIP_CHECK(hipMemset(padded->data, 0, n*sizeof(float)));  // the extra rows/columns enter as zero
@@ -1245,16 +1290,16 @@ struct Network {
         HIP_CHECK(hipMemset(bridge->data, 0, bridge->count*sizeof(float)));
         vit.reset(new vit_resident::Chain(vit_tokens,folders(a[5],8),vit_valid));
         entry.reset(new decoder39_resident::Entry(w32/2,h32/2,a[6],inverse));
-        decoder.reset(new Chain(w32,h32,blocks(a[7],8),"",chain->scratch()));  // the encoder's intermediates
+        decoder.reset(new Chain(w32,h32,blocks(a[7],model.dec512),"",chain->scratch()));  // the encoder's intermediates
         chain->keep_raw = decoder->keep_raw = false;  // nothing reads their raw outputs but the encoder head
         prefix48.reset(new c256_resident::Prefix(w32,h32,a[8],width*2,height*2));
-        c256.reset(new c256_resident::Chain(width*2,height*2,blocks(a[9],8)));
+        c256.reset(new c256_resident::Chain(width*2,height*2,blocks(a[9],model.d256)));
         prefix56.reset(new c128_resident::Prefix(width*2,height*2,a[10]));
-        c128.reset(new c128_resident::Chain(width*4,height*4,blocks(a[11],6)));
+        c128.reset(new c128_resident::Chain(width*4,height*4,blocks(a[11],model.d128)));
         prefix62.reset(new c64_resident::Prefix(width*4,height*4,a[12]));
-        c64.reset(new c64_resident::Chain(width*8,height*8,blocks(a[13],4)));
+        c64.reset(new c64_resident::Chain(width*8,height*8,blocks(a[13],model.d64)));
         prefix66.reset(new c32_resident::Prefix(width*8,height*8,a[14]));
-        c32.reset(new c32_resident::Chain(width*16,height*16,blocks(a[15],4)));
+        c32.reset(new c32_resident::Chain(width*16,height*16,blocks(a[15],model.d32)));
         head70.reset(new c32_resident::Head(W,H,a[16],cap));
         color.reset(new Buffer(size_t(W)*H*3));
         rgb_native.reset(new Buffer(size_t(W)*H*3));
@@ -1551,6 +1596,7 @@ struct Engine {
                 }
             }
             else if (key == "motion_sign" && (value == "1" || value == "-1")) options.motion_sign = std::stoi(value);
+            else if (key == "model" && (value == "original" || value == "small")) options.small = value == "small";
             else throw std::runtime_error("unknown engine option: " + line);
         }
         if (options.sigma <= 0.0f || options.gate <= 0.0f || options.smooth < 0.0f || options.smooth > 1.0f ||
@@ -1872,7 +1918,7 @@ struct Engine {
             sw = std::max(64, int(frame_w*scale + 0.5f));
             sh = std::max(64, int(frame_h*scale + 0.5f));
         }
-        if (!job_crop) network_extent(sw, sh, W, H, options.compact);
+        if (!job_crop) network_extent(sw, sh, W, H, options.compact, options.small);
         if (!net || net->W != W || net->H != H) {
             net.reset();
             net.reset(new Network(config, W, H));
@@ -2001,7 +2047,7 @@ struct Engine {
             hipLaunchKernelGGL(k_seq_post, dim3((frame_w*frame_h+255)/256), dim3(256), 0, stream,
                                net->rgb_native->data, nv_history ? net->head70->native_view().data : nullptr,
                                hist_row->data, nv_image[nv_cur]->data, nv_mv, nv_image[next]->data,
-                               frame_w, frame_h, W, 0.7397f*options.history, int(nv_history), nv_ms);
+                               frame_w, frame_h, W, net->model.blend*options.history, int(nv_history), nv_ms);
             HIP_CHECK(hipGetLastError());
             nv_cur = next; nv_frame = job_frame; nv_w = frame_w; nv_h = frame_h;
         }
@@ -2031,7 +2077,7 @@ struct Engine {
                 hipLaunchKernelGGL(k_seq_post, dim3((frame_w*frame_h+255)/256), dim3(256), 0, stream,
                                    net->rgb_native->data, nv_history ? net->head70->native_view().data : nullptr,
                                    hist_row->data, im[cur]->data, nv_mv, im[cur ^ 1]->data,
-                                   frame_w, frame_h, W, 0.7397f*options.history, int(nv_history), nv_ms);
+                                   frame_w, frame_h, W, net->model.blend*options.history, int(nv_history), nv_ms);
                 HIP_CHECK(hipGetLastError());
                 cur ^= 1;
                 nv_final = im[cur]->data;
@@ -2041,7 +2087,7 @@ struct Engine {
             if (use_history) {
                 hipLaunchKernelGGL(k_head_temporal, dim3((W*H+255)/256), dim3(256), 0, stream,
                                    net->head70->native_view().data, hist_row->data, hist_cur->data,
-                                   net->rgb_native->data, net->rgb_public->data, W, H, 0.7397f*options.temporal);
+                                   net->rgb_native->data, net->rgb_public->data, W, H, net->model.blend*options.temporal);
                 HIP_CHECK(hipGetLastError());
             }
             size_t count = size_t(W)*H*3;

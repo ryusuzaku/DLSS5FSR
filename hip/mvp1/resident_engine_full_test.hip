@@ -80,6 +80,12 @@ int main(int argc, char** argv) {
     std::vector<float> full_native(256*256*3), full_public(256*256*3), full_color(256*256*3);
     std::vector<unsigned char> rgba8(256*256*4), rgba16(256*256*8), frame(size_t(cut)*cut*bpp);
     float ms = 0;
+    // RE_TEST_SKIP_CUT=1: skip this part (model=small runs a 256 frame on a
+    // 320x320 network, NVIDIA's minimum, so crop and full cannot agree; the
+    // reads below assume a 256x256 network).
+    const bool skip_cut = getenv("RE_TEST_SKIP_CUT") && *getenv("RE_TEST_SKIP_CUT") == '1';
+    if (skip_cut) printf("256 cut crop vs full: skipped (RE_TEST_SKIP_CUT)\n");
+    else {
     if (submit(device, cut, cut, cut*bpp, bpp) != 1 ||
         wait([&] { return poll(0, rgba8.data(), rgba16.data(), &ms); }) != 1 ||
         wait([&] { return latest(0, crop_native.data(), crop_color.data()); }) != 1 ||
@@ -98,6 +104,7 @@ int main(int argc, char** argv) {
         bool same = !memcmp(item.second.first->data(), item.second.second->data(), item.second.first->size()*4);
         printf("256 cut crop vs full %s: %s\n", item.first, same ? "PASS (byte-exact)" : "FAIL");
         ok = ok && same;
+    }
     }
 
     // 2) Whole frame at its padded network extent.

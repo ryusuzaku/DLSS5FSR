@@ -506,6 +506,7 @@ def small_lists(out, config):
     for i in range(24):  # the fixture lines; the options after them stay
         if lines[i].strip() and not lines[i].strip().isdigit():
             lines[i] = mirror(out, lines[i].strip())
+    lines = [l for l in lines if not l.startswith('model=')] + ['model=small']
     dst = os.path.join(out, 'engine_config_small.txt')
     with open(dst, 'w', newline='\r\n') as fh:
         fh.write('\n'.join(lines) + '\n')

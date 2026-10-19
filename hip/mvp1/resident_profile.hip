@@ -24,7 +24,7 @@ int main(int argc, char** argv) {
         memcpy(f, bytes.data()+8, sizeof(f));
         int fw = int(f[0]), fh = int(f[1]), bpp = int(f[2]), pitch = int(f[3]);
         int W = 0, H = 0;
-        network_extent(fw, fh, W, H, argc > 4 && std::string(argv[4]) == "compact");
+        network_extent(fw, fh, W, H, argc > 4 && std::string(argv[4]) == "compact", ModelSpec::from(lines).small);
         hipStream_t stream;
         HIP_CHECK(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking));
         c512_resident::stream = stream;
