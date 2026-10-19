@@ -193,6 +193,9 @@ def main() -> int:
     ap.add_argument("--out", default="dlssnr-analysis")
     ap.add_argument("--dump-tensors", action="store_true",
                     help="write each tensor payload to tensors/ (147 MB)")
+    ap.add_argument("--resource", default=None,
+                    help="weights resource by name (310.9.16: WEIGHTS_HT = preset 1, "
+                         "WEIGHTS_CC_SMALL_FP8 = the default small model); default the largest")
     ap.add_argument("--sample", type=int, default=65536,
                     help="bytes per tensor used for dtype classification")
     args = ap.parse_args()
@@ -228,7 +231,14 @@ def main() -> int:
         tensors = []
         blob = None
     else:
-        blob = max(rdata, key=lambda r: r.size)
+        if args.resource:
+            named = [r for r in rdata if r.name == args.resource]
+            if not named:
+                raise SystemExit(f"no resource {args.resource!r}: "
+                                 + ", ".join(str(r.name) for r in rdata))
+            blob = named[0]
+        else:
+            blob = max(rdata, key=lambda r: r.size)
         print(f"    resource {blob.name!r}  {blob.size:,} bytes "
               f"@ file 0x{blob.file_offset:X}")
         tensors = parse_tensor_table(pe.data, blob.file_offset)
@@ -273,7 +283,7 @@ def main() -> int:
     with open(os.path.join(out, "model.json"), "w", encoding="utf-8") as fh:
         json.dump({
             "source": report["source"]["file"],
-            "format": "NVIDIA DLSSNR / WEIGHTS_HT v1",
+            "format": f"NVIDIA DLSSNR / {blob.name if blob else 'WEIGHTS_HT'} v1",
             "payload_layout_version": 2,
             "dtype_note": ("dtypes are inferred statistically from payload "
                            "distribution; validate against kernel params"),
