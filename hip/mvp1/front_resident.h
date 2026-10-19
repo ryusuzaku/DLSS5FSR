@@ -279,7 +279,7 @@ public:
         if (!pre) FRONT_LAUNCH(k_front_pool,pixels/4*32,raw0.data,image.data,width,height,32);
         if (!check(dir+"/block0","raw",raw0.data,pixels*32,verify,comparisons) ||
             !check(dir,"pre_down",image.data,pixels/4*32,verify,comparisons)) return false;
-        const int shifts[5] = {0,0,3,0,3};
+        const int shifts[5] = {0,0,3,1,2};  // NVIDIA layer table: blocks 1-4 = none, xy, x, y
         int w = width/2, h = height/2;
         for (int b = 1; b <= 4; ++b) {
             int px = (shifts[b]&1) ? 4 : 0, py = (shifts[b]&2) ? 4 : 0;

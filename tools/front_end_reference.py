@@ -29,7 +29,7 @@ from cached_public_branch import digest
 
 ROOT = Path(__file__).resolve().parents[1]
 TENSORS = {0: 0, 1: 1, 2: 12, 3: 44, 4: 91}
-SHIFTS = {0: 0, 1: 0, 2: 3, 3: 0, 4: 3}
+SHIFTS = {0: 0, 1: 0, 2: 3, 3: 1, 4: 2}  # NVIDIA layer table (blocks 1-4: none, xy, x, y)
 STEM_AT, DOWN_AT = 0x2010, 0x50B0
 
 

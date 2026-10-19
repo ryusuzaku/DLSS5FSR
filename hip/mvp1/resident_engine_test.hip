@@ -2,6 +2,8 @@
 // Usage: resident_engine_test engine.dll config.txt capture.bin expected_dir out_dir
 // expected_dir holds color.f32 (candidate input), rgb_native.f32, rgb_public.f32
 // and candidate_preview.bin (D5PREV01, native gain) from the validated sidecar.
+// RE_TEST_WRITE=dir: also write this engine's last frame there in that format
+// (to renew the references after an intended change of the network's output).
 #include <hip/hip_runtime.h>
 #include <windows.h>
 #include <chrono>
@@ -106,6 +108,25 @@ int main(int argc, char** argv) {
     }
     FILE* f = fopen((out+"/engine_preview_rgba8.bin").c_str(), "wb");
     if (f) { fwrite(rgba8.data(), 1, rgba8.size(), f); fclose(f); }
+    if (const char* dir = getenv("RE_TEST_WRITE")) {
+        auto put = [&](const char* name, const void* a, size_t na, const void* b = nullptr, size_t nb = 0) {
+            FILE* o = fopen((std::string(dir)+"/"+name).c_str(), "wb");
+            if (!o) { fprintf(stderr, "cannot write %s/%s\n", dir, name); ok = false; return; }
+            fwrite(a, 1, na, o);
+            if (b) fwrite(b, 1, nb, o);
+            fclose(o);
+        };
+        put("color.f32", color.data(), color.size()*4);
+        put("rgb_native.f32", native.data(), native.size()*4);
+        put("rgb_public.f32", pub.data(), pub.size()*4);
+        std::vector<unsigned char> preview(16);
+        const unsigned int size[2] = {256, 256};
+        memcpy(preview.data(), "D5PREV01", 8);
+        memcpy(preview.data()+8, size, 8);
+        preview.insert(preview.end(), rgba8.begin(), rgba8.end());
+        put("candidate_preview.bin", preview.data(), preview.size(), rgba16.data(), rgba16.size());
+        printf("references written to %s\n", dir);
+    }
     destroy();
     hipFree(staging);
     printf("{\"setup_seconds\":%.3f,\"device_ms\":[%.3f,%.3f,%.3f]}\n", setup_s, ms[0], ms[1], ms[2]);
