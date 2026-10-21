@@ -263,6 +263,12 @@ struct OutputOptions {
     // uncover_radius=R: how far around, in frame pixels.
     int uncover = 0;
     int uncover_radius = 10;
+    // uncover_pass1=1 (ours, passes > 1, needs uncover): just-uncovered ground
+    // takes the first pass's change instead of the last's, back to the last
+    // over the same `uncover` frames. One pass leaves about what the game's own
+    // picture leaves there; every further pass edits the game's trail
+    // fragments harder (S361h: 1.5x the edit, the trail with it).
+    int uncover_pass1 = 0;
     // stabilize=A (transfer=nvidia; ours, not the original's; 0 off, default
     // off): the low-frequency part of the change (a box blur of stabilize_radius
     // pixels) is blended with the previous result's, carried along the motion,
@@ -1073,6 +1079,18 @@ __global__ void k_uncover_age(const float2* mv, const float2* mv_prev, const flo
     }
     age[p] = a;
 }
+// uncover_pass1: the change map blended toward the first pass's by how
+// recently the pixel was uncovered (both against the same frame).
+__global__ void k_uncover_pass1(float4* map, const float4* first, const float* age, int fw, int fh, float limit) {
+    const int p = blockIdx.x*blockDim.x + threadIdx.x;
+    if (p >= fw*fh) return;
+    const float m = fminf(fmaxf(1.0f - age[p] / limit, 0.0f), 1.0f);
+    if (m <= 0.0f) return;
+    float4 o = map[p];
+    const float4 f = first[p];
+    o.x += m*(f.x - o.x); o.y += m*(f.y - o.y); o.z += m*(f.z - o.z);
+    map[p] = o;
+}
 // Step 2: a recently uncovered pixel takes the result (frame + change) of
 // settled pixels around it on the same surface: 48 taps on a spiral within
 // `radius`, Gaussian in distance, weighted by age / limit, only those that
@@ -1509,6 +1527,7 @@ struct Engine {
     // along the motion), the previous frame's depth, and the buffer the
     // repaired map is written to.
     std::unique_ptr<Buffer> uncover_age[2], uncover_depth, uncover_tmp;
+    std::unique_ptr<Buffer> pass1_map;  // uncover_pass1: the first pass's change map
     int uncover_cur = 0, uncover_w = 0, uncover_h = 0;
     long long uncover_frame = -1;
     // stabilize=A: the low band (ping-pong history, current blur, scratch), the
@@ -1567,6 +1586,7 @@ struct Engine {
             else if (key == "history") options.history = std::min(std::max(std::stof(value), 0.0f), 1.0f);
             else if (key == "uncover") options.uncover = std::min(std::max(std::stoi(value), 0), 16);
             else if (key == "uncover_radius") options.uncover_radius = std::min(std::max(std::stoi(value), 1), 48);
+            else if (key == "uncover_pass1") options.uncover_pass1 = std::stoi(value) != 0;
             else if (key == "stabilize") options.stabilize = std::min(std::max(std::stof(value), 0.0f), 0.95f);
             else if (key == "stabilize_radius") options.stabilize_radius = std::min(std::max(std::stoi(value), 1), 24);
             else if (key == "stabilize_clamp") options.stabilize_clamp = std::min(std::max(std::stof(value), 0.001f), 1.0f);
@@ -2053,6 +2073,7 @@ struct Engine {
         }
         const float* nv_final = nvidia ? nv_image[nv_cur]->data.get() : nullptr;
         const float* nv_first = nullptr;  // the first pass's input, when later passes ran
+        const float* nv_pass1 = nv_final;  // the first pass's output (valid until the next frame's post)
         if (nvidia && options.passes > 1) {
             const size_t fpx = size_t(frame_w)*frame_h, wpx = size_t(W)*H*3;
             const int pass_pitch = frame_w*8;
@@ -2199,6 +2220,16 @@ struct Engine {
                                            job_depth->data.get(), uncover_depth->data.get(),
                                            uncover_age[uncover_cur]->data.get(), uncover_age[to]->data.get(),
                                            frame_w, frame_h, nv_ms, limit);
+                        if (options.uncover_pass1 && nv_first && nv_pass1) {
+                            if (!pass1_map || pass1_map->count < px*4) pass1_map.reset(new Buffer(px*4));
+                            hipLaunchKernelGGL(k_nv_map, grid, block, 0, stream, nv_pass1, nv_first,
+                                               reinterpret_cast<float4*>(pass1_map->data.get()), frame_w, frame_h, W,
+                                               job_strength, nv_first);
+                            hipLaunchKernelGGL(k_uncover_pass1, grid, block, 0, stream,
+                                               reinterpret_cast<float4*>(maps[next]->data.get()),
+                                               reinterpret_cast<const float4*>(pass1_map->data.get()),
+                                               uncover_age[to]->data.get(), frame_w, frame_h, limit);
+                        }
                         hipLaunchKernelGGL(k_uncover_fill, grid, block, 0, stream,
                                            reinterpret_cast<const float4*>(maps[next]->data.get()), uncover_age[to]->data.get(),
                                            nv_mv, job_depth->data.get(), nv_first ? nv_first : net->color->data.get(),

@@ -1,5 +1,60 @@
 # Resident C512 component check
 
+## Experimental first-pass fallback (2026-10-21)
+
+The resident engine accepts `uncover_pass1=1` (default `0`) with
+`transfer=nvidia`, `passes=2` or `3`, and `uncover=N` greater than zero.
+On a pixel detected as newly uncovered, the output change is blended toward
+the first pass's change, returning to the final pass over `N` frames. The
+existing surface fill then runs. This uses the existing motion/depth age
+mask and requires consecutive frames with valid guides. The option has no
+effect with one pass or when the uncover stage cannot run. It changes output
+composition; each pass retains its own network history.
+
+For example, add these options after the fixture paths in an engine config:
+
+```ini
+transfer=nvidia
+passes=2
+uncover=5
+uncover_radius=3
+uncover_pass1=1
+```
+
+Five 60-frame captured Cyberpunk sequences were replayed through the small
+model, preserving each clip's history amount. The table reports the
+`tools/pseq_trail.py` result-picture score: change four frames after a pixel
+is uncovered minus the still-background noise floor, in 1/255 units. Lower
+is better. Only nearly still camera frames qualify; the clips provide
+2, 32, 11, 41 and 55 qualifying frame pairs, respectively.
+
+| Clip | History | One pass | Two passes | Two passes + fallback |
+|---|---:|---:|---:|---:|
+| A | 1.0 | 11.64 | 13.56 | 10.70 |
+| B | 0.5 | 10.07 | 11.71 | 10.91 |
+| C | 0.5 | 6.80 | 7.72 | 7.53 |
+| D | 0.25 | 5.36 | 5.74 | 5.81 |
+| E | 0.25 | 8.74 | 10.03 | 9.89 |
+
+Four clips improve by 1.4–21.1%; clip D worsens by 1.2%. Mean absolute edit
+strength retains at least 99.5% of the plain two-pass value on each clip.
+The effect remains experimental and off by default: these are offline
+comparisons, not an in-game quality verdict or NVIDIA-kernel validation.
+
+Compatibility checks: original engine 15/15; original full-frame output
+byte-identical to the saved baseline; all 60 small-model frames unchanged
+with the option off at either one or two passes, and unchanged with the
+option on at one pass. The deployed game engine was left unchanged.
+
+The D3D12/HIP harness passes its default (117/117), crop (123/123), and
+FP16 map/depth (135/135) checks. Its full-frame preview visibility check
+remains 124/125: the installed baseline reproduces the same one-level
+change, below that assertion's threshold. A separate public-gain config
+does not resolve it. Engine loading, frame publication, motion and D3D12
+debug-layer checks pass; this existing preview-test limitation is unresolved.
+
+## Original component replay
+
 The C512 encoder23–30 and decoder40–47 can now execute as connected GPU
 chains in a standalone diagnostic. Encoder block30's raw output also feeds
 its pool/head kernels directly on the device. The runner uses the existing
