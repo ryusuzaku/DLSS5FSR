@@ -149,6 +149,9 @@ public:
     // noise_function: the original's noise also at seed 0 (computed over the
     // whole extent, as the original) instead of the fixtures' 256x256 tile.
     bool noise_function = false, loaded_function = false;
+    // Optional externally owned noise, valid on the resident stream. Null
+    // retains the original generation/cache path exactly.
+    const float* noise_override = nullptr;
     // half_skip: the fused block0 writes skip0 as halves only (skip0_half), for
     // a head that reads them (Head::fusable); skip0_view is then empty.
     bool half_skip = false;
@@ -248,11 +251,12 @@ public:
         ready = false;
         if (!rgb.data || rgb.count != pixels*3) return false;
         if (!check(dir,"rgb",rgb.data,pixels*3,verify,comparisons)) return false;
-        if (noise_seed != loaded_seed || noise_function != loaded_function) {
+        if (!noise_override && (noise_seed != loaded_seed || noise_function != loaded_function)) {
             if (noise_seed || noise_function) FRONT_LAUNCH(k_front_noise,pixels,noise.data,width,height,noise_seed);
             else load_noise();
             loaded_seed = noise_seed; loaded_function = noise_function;
         }
+        const float* input_noise = noise_override ? noise_override : noise.data.get();
         const float *raw = nullptr, *quant = nullptr;
         const bool fused = !verify && !c512_resident::exact_math;  // bodies gather/scatter themselves
         // Stem, block0, pool and skip0 in one launch (k_c32_t MODE 1).
@@ -263,14 +267,14 @@ public:
         // block writes it, the fused blocks read and write it (image_bytes).
         const bool i8 = pre && image_bytes && fused;
         image_was_bytes = i8;  // the FP8 body (k_c32_t) pools; the f16 one does not
-        if (!pre) FRONT_LAUNCH(k_front_stem,pixels*32,rgb.data,noise.data,stem.data,tokens.data,width,height,controls,history);
+        if (!pre) FRONT_LAUNCH(k_front_stem,pixels*32,rgb.data,input_noise,stem.data,tokens.data,width,height,controls,history);
         auto io = [](int in_hwc, int w, int h, int shift) {
             C32Io v; v.in_hwc = in_hwc; v.out_hwc = 1; v.width = w; v.height = h;
             v.px = (shift&1) ? 4 : 0; v.py = (shift&2) ? 4 : 0; v.pw = ((w+v.px+7)/8)*8;
             return v;
         };
         if (pre) {
-            C32Fuse fz; fz.width = width; fz.height = height; fz.rgb = rgb.data; fz.noise = noise.data;
+            C32Fuse fz; fz.width = width; fz.height = height; fz.rgb = rgb.data; fz.noise = input_noise;
             fz.stem = stem.data; fz.history = history;
             fz.pool = i8 ? image8.data.get() : image.data.get(); fz.pool_fmt = int(i8);
             if (half_skip) fz.skip0h = reinterpret_cast<_Float16*>(skip0h.data.get()); else fz.skip0 = skip0.data;

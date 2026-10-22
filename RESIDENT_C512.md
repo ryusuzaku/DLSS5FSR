@@ -1,5 +1,128 @@
 # Resident C512 component check
 
+## Motion-correlated noise and guided stabilization (2026-10-22)
+
+Two default-off candidates follow the [research assessment](tools/temporal_stability_research.md).
+They address stochastic edits and optional output-history reuse separately;
+neither reconstructs a clean image from trails already present in the input.
+
+```ini
+transfer=nvidia
+history=0
+noise_motion=2
+stabilize_guided=1
+# Optional; with stabilize=0 the guided flag does nothing.
+stabilize=0.66
+stabilize_still=0.7
+```
+
+`noise_motion=S` accepts0/off or a1/2/4-times finer grid, with2 the tested
+live candidate. It takes precedence over `noise_static`. Each frame has one
+field shared by all model passes. A valid consecutive motion/depth pair
+transports it; missing guides, frame/extent changes and camera resets refresh
+it. The grid rounds correspondences instead of interpolating noise values.
+For each parent with d children, independent Gaussian innovations Zi give
+`child_i = parent/sqrt(d) + Zi - mean(Z)`. With independent Gaussian inputs
+and guide-based routing, child variance is1 and distinct-child covariance is0.
+Fresh samples fill rejected locations; disjoint fine-grid blocks reduce by
+sum/S. The implementation is approximate at PRNG/float/innovation-quantization
+precision. Fixed-point64-bit innovation sums make replay deterministic.
+
+This is a backward-flow conditional-split construction inspired by the
+papers, not their full forward/backward transport. It discards unselected
+samples during contraction and quantizes subpixel correspondence to the
+finer grid. Zoom/pan appearance still needs live testing. Warm1280x832
+transport plus reduction measured1.4266ms/272MiB at2x and5.5767ms/1003MiB at4x,
+before network inference. The engine's reported GPU interval includes the
+new transport. These are kernel-stage measurements, not game FPS.
+
+Primary input-tolerance2 results on the eight S367 clips (H0, two passes,
+same repair/controls, valid motion/depth, both-frame HUD exclusions):
+
+| Clip | Still edit RMS change | Moving edit RMS change | Edit strength retained |
+|---|---:|---:|---:|
+| A | -22.94% | -0.78% | 99.84% |
+| B | -24.33% | -1.54% | 100.07% |
+| C | -23.00% | -2.38% | 100.05% |
+| D | -24.29% | -3.80% | 100.00% |
+| E | -22.21% | -1.26% | 99.95% |
+| Car | -27.52% | -1.66% | 99.92% |
+| Camera1 | -23.82% | -5.89% | 99.97% |
+| Camera2 | -26.13% | -1.57% | 100.05% |
+
+Camera1 has only6995 moving pixel observations; the other moving bins contain
+0.79–8.47million. Fast-motion subgroups are mixed: C has only260 pixels in
+one pair and worsens24%, while B is nearly unchanged. These are correlated,
+quiet-input surface samples, not proof that every moving detail improves.
+The first three evaluated clips include input tolerances1/2/4; the other
+five use the primary2 check. The4x grid had no consistent advantage on the
+camera/car/A subset, so it is not the live default. Compared with fixed seed,
+the main additional benefit is modest moving-surface stability.
+
+`stabilize_guided=1` changes only the optional `stabilize` path. It stores
+the first pass's input as per-channel log-linear guides, checks carried
+appearance against the current same-depth3x3 range, and fades confidence
+over0.1–0.3stop disagreement. Each bilinear history tap needs valid depth;
+current/old guides and motion must be finite. Low/full edits are clamped
+to a current same-surface neighborhood with a small margin, then to the
+existing change cap. The cap wins if those ranges do not intersect after
+the low-band adjustment. The full-band still-pixel blend uses the same
+confidence and warped position. No whole-picture spatial blur was added.
+Without stabilization, this flag allocates nothing and does not alter output.
+
+Against the old stabilizer at0.66/0.7, with dynamic noise in both:
+
+| Clip | Eligible pairs | Four-frame settled error old / guided | Eight-frame old / guided |
+|---|---:|---:|---:|
+| A | 1 | 5.054 / 5.062 | 2.376 / 2.543 |
+| B | 18 | 3.791 / 3.387 | 2.309 / 2.178 |
+| C | 1 | 7.244 / 6.788 | 4.552 / 4.113 |
+| D | 40 | 4.229 / 3.798 | 2.631 / 2.067 |
+| E | 43 | 4.124 / 3.894 | 2.699 / 2.332 |
+| Car | 6 | 2.555 / 2.445 | 1.554 / 1.469 |
+
+The common target is the dynamic baseline's settled frames12–16, with
+input span<2levels, HUD exclusion and the existing quiet-camera/uncover masks.
+Scores are RGB8 levels and include legitimate edit return; they are not
+ground-truth ghost measurements. The four-frame own-late orthogonal edit
+transient, strength-matched to the baseline, improves versus the old
+stabilizer in all six clips by about1–19%. Guided stabilization smooths
+less: still edit RMS is roughly43–46% of the unstabilized baseline versus
+31–34% for the old stabilizer. It is a responsiveness/stability tradeoff,
+not a universal replacement or a cure for stabilization-off trails.
+Native camera/car crops at10/25/40 show no obvious broad blur; full-speed
+visual approval remains a live test.
+
+Asset-free checks are in `motion_noise_test.hip` (15 contracts),
+`stabilize_guided_test.hip` (14 contracts, including disjoint clamp ranges),
+and `resident_engine_motion_noise_test.hip` (12 checks at1/2/3passes in both
+fast/exact mode). Build them with `tools/build_stability_candidates.sh`;
+the full resident builder includes this helper. Existing reset/pass-switch,
+original15/full-frame and default native-output byte controls also cover the
+candidate. The previously documented full-preview visibility assertion
+remains a harness limitation; no assertion or shim behavior was weakened.
+
+The final disjoint-range clamp regression passes, and all479 guided native
+frames remain byte-identical to the measured prototype. Final live motion
+and default controls also match their59-frame references. Combined live
+configuration produces59 finite native frames; its full-speed appearance
+is still a live A/B test, not inferred from the separate candidate studies.
+The same clamp contract fails with the earlier range-intersection formula,
+confirming that the test exercises the corrected edge case.
+
+
+
+## Temporal-stability research (2026-10-22)
+
+The [sourced research assessment](tools/temporal_stability_research.md)
+compares fresh peer code and noise-transport papers with the S361–S367
+experiments. It ranks distribution-preserving motion-correlated noise,
+appearance-aware confidence for optional stabilization, and a matched
+pre-/post-upscale study. Cache-specific anti-ghosting results do not establish
+a fix for our history-zero, every-frame path. A CPU interpolation probe
+confirms that restoring bilinear-warped noise variance does not restore
+spatial independence. No engine or game setting changed in this research pass.
+
 ## Opt-in fixed noise after a motion check (2026-10-22)
 
 `noise_static=1` holds the network's noise input at seed0 in

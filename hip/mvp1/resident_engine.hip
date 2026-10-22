@@ -27,6 +27,8 @@
 #include "front_resident.h"
 #include "candidate_input_256.hip"
 #include "uncover_extra.hip"
+#include "motion_noise.hip"
+#include "stabilize_guided.hip"
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
@@ -250,6 +252,10 @@ struct OutputOptions {
     // noise_static=1 (transfer=nvidia, ours): hold the network's random
     // input at seed 0. Default keeps the original per-frame seed counter.
     int noise_static = 0;
+    // noise_motion=S: conditional Gaussian transport on an Sx finer grid.
+    // 0 off, supported S=1/2/4. Takes precedence over noise_static, all passes
+    // share this frame's field. Needs consecutive motion/depth to carry noise.
+    int noise_motion = 0;
     // uncover=N (transfer=nvidia; ours, not the original's; 0 off): ground
     // that something moving has just uncovered is repaired for N frames. A
     // game's temporal upscaler has no history for such pixels and leaves
@@ -290,6 +296,7 @@ struct OutputOptions {
     float stabilize = 0.0f;
     int stabilize_radius = 6;
     float stabilize_clamp = 0.04f;
+    int stabilize_guided = 0;  // opt-in input-appearance confidence and neighborhood edit clipping
     // stabilize_still=B (0..0.95, default 0; with stabilize on): on pixels whose
     // surface is still on screen (under 0.5 px a frame, same depth) the whole
     // change, high band included, is also blended with the previous result by
@@ -1529,6 +1536,9 @@ struct Engine {
     long long nv_frame = -1;
     unsigned nv_seed = 0;
     bool nv_history = false;
+    std::unique_ptr<Buffer> noise_field[2], noise_parents, noise_groups, noise_output, noise_depth;
+    int noise_cur = 0, noise_W = 0, noise_H = 0, noise_fw = 0, noise_fh = 0, noise_sw = 0, noise_sh = 0;
+    long long noise_frame = -1;
     std::atomic<bool> nv_reset{false};  // re_reset: the next run starts over
     std::atomic<int> passes_request{0}; // re_set_passes: taken at the next run
     std::atomic<int> history_request{-1}; // re_set_history: thousandths, taken at the next run
@@ -1542,6 +1552,7 @@ struct Engine {
     // stabilize=A: the low band (ping-pong history, current blur, scratch), the
     // previous frame's depth, and the buffer the stabilised map goes to.
     std::unique_ptr<Buffer> stab_hist[2], stab_full[2], stab_low, stab_tmp, stab_out, stab_depth;
+    std::unique_ptr<Buffer> stab_guide[2];
     int stab_cur = 0, stab_w = 0, stab_h = 0;
     long long stab_frame = -1;
     std::atomic<int> stabilize_request{-1};  // re_set_stabilize: thousandths, taken at the next run
@@ -1597,10 +1608,16 @@ struct Engine {
             else if (key == "uncover_radius") options.uncover_radius = std::min(std::max(std::stoi(value), 1), 48);
             else if (key == "uncover_pass1") options.uncover_pass1 = std::stoi(value) != 0;
             else if (key == "noise_static") options.noise_static = std::stoi(value) != 0;
+            else if (key == "noise_motion") {
+                options.noise_motion = std::stoi(value);
+                if (options.noise_motion != 0 && options.noise_motion != 1 && options.noise_motion != 2 && options.noise_motion != 4)
+                    throw std::runtime_error("noise_motion needs 0, 1, 2 or 4");
+            }
             else if (key == "uncover_extra_radius") options.uncover_extra_radius = std::min(std::max(std::stoi(value), 0), 48);
             else if (key == "stabilize") options.stabilize = std::min(std::max(std::stof(value), 0.0f), 0.95f);
             else if (key == "stabilize_radius") options.stabilize_radius = std::min(std::max(std::stoi(value), 1), 24);
             else if (key == "stabilize_clamp") options.stabilize_clamp = std::min(std::max(std::stof(value), 0.001f), 1.0f);
+            else if (key == "stabilize_guided") options.stabilize_guided = std::stoi(value) != 0;
             else if (key == "stabilize_still") options.stabilize_still = std::min(std::max(std::stof(value), 0.0f), 0.95f);
             else if (key == "stabilize_still_clamp") options.stabilize_still_clamp = std::min(std::max(std::stof(value), 0.001f), 1.0f);
             else if (key == "input_temporal") options.input_temporal = std::stof(value);
@@ -2014,6 +2031,7 @@ struct Engine {
                 // frame numbers alone must not carry pre-cut guides/ages
                 // into this frame's fill or first-pass fallback.
                 uncover_frame = -1;
+                noise_frame = -1;
             }
             const bool nv_consecutive = nv_frame >= 0 && nv_frame == job_frame - 1 && nv_w == frame_w && nv_h == frame_h;
             nv_history = nv_consecutive && nv_mv != nullptr;
@@ -2047,8 +2065,44 @@ struct Engine {
                                      : use_history ? hist_cur->data.get() : nullptr;
         net->front->noise_seed = nvidia ? (options.noise_static ? 0u : nv_seed) : temporal ? temporal_seed : 0;
         net->front->noise_function = nvidia;  // the original's noise from the first frame on
-        net->head70->keep_native = (temporal && use_history) || (nvidia && nv_history);  // the blend's input
+        net->front->noise_override = nullptr;
+        // Include optional noise transport in the engine's reported GPU time.
         HIP_CHECK(hipEventRecord(start, stream));
+        if (nvidia && options.noise_motion > 0) {
+            const int S = options.noise_motion, hw = W*S, hh = H*S;
+            const size_t hp = size_t(hw)*hh, px = size_t(W)*H, fpx = size_t(frame_w)*frame_h;
+            for (auto& b : noise_field)
+                if (!b || b->count < hp*3) { b.reset(new Buffer(hp*3)); noise_frame = -1; }
+            if (!noise_parents || noise_parents->count < hp) noise_parents.reset(new Buffer(hp));
+            if (!noise_groups || noise_groups->count < hp*8) noise_groups.reset(new Buffer(hp*8));
+            if (!noise_output || noise_output->count < px*3) noise_output.reset(new Buffer(px*3));
+            if (!noise_depth || noise_depth->count < fpx) { noise_depth.reset(new Buffer(fpx)); noise_frame = -1; }
+            const int to = noise_cur ^ 1;
+            const bool carry = noise_frame == job_frame-1 && nv_mv && job_depth_valid &&
+                noise_W == W && noise_H == H && noise_fw == frame_w && noise_fh == frame_h && noise_sw == sw && noise_sh == sh;
+            if (carry) {
+                HIP_CHECK(hipMemsetAsync(noise_groups->data, 0, hp*sizeof(motion_noise::Group), stream));
+                hipLaunchKernelGGL(motion_noise::route, dim3((hp+255)/256), dim3(256), 0, stream,
+                    nv_mv, job_depth->data.get(), noise_depth->data.get(), frame_w, frame_h, sw, sh, hw, hh, S, nv_ms,
+                    reinterpret_cast<int*>(noise_parents->data.get()), reinterpret_cast<motion_noise::Group*>(noise_groups->data.get()), nv_seed);
+                hipLaunchKernelGGL(motion_noise::split, dim3((hp+255)/256), dim3(256), 0, stream,
+                    reinterpret_cast<const float3*>(noise_field[noise_cur]->data.get()), reinterpret_cast<float3*>(noise_field[to]->data.get()),
+                    reinterpret_cast<const int*>(noise_parents->data.get()), reinterpret_cast<const motion_noise::Group*>(noise_groups->data.get()), int(hp), nv_seed);
+            } else {
+                hipLaunchKernelGGL(motion_noise::initialize, dim3((hp+255)/256), dim3(256), 0, stream,
+                    reinterpret_cast<float3*>(noise_field[to]->data.get()), int(hp), nv_seed);
+            }
+            hipLaunchKernelGGL(motion_noise::reduce, dim3((px+255)/256), dim3(256), 0, stream,
+                reinterpret_cast<const float3*>(noise_field[to]->data.get()), noise_output->data.get(), W, H, S);
+            HIP_CHECK(hipGetLastError());
+            if (job_depth_valid) HIP_CHECK(hipMemcpyAsync(noise_depth->data, job_depth->data, fpx*sizeof(float), hipMemcpyDeviceToDevice, stream));
+            noise_cur = to; noise_frame = job_depth_valid && nv_mv ? job_frame : -1;
+            noise_W = W; noise_H = H; noise_fw = frame_w; noise_fh = frame_h; noise_sw = sw; noise_sh = sh;
+            net->front->noise_override = noise_output->data.get();
+        } else {
+            noise_frame = -1;
+        }
+        net->head70->keep_native = (temporal && use_history) || (nvidia && nv_history);  // the blend's input
         const unsigned char* net_src = reinterpret_cast<const unsigned char*>(raw_input->data.get());
         if (!job_crop && options.luma && options.input_temporal > 0.0f && frame_bpp == 8) {
             const size_t bytes = size_t(frame_pitch)*frame_h;
@@ -2204,7 +2258,21 @@ struct Engine {
                                                reinterpret_cast<float4*>(stab_low->data.get()), frame_w, frame_h, options.stabilize_radius, 1);
                             const int sto = 1 - stab_cur;
                             const int sval = job_frame > 0 && stab_frame == job_frame - 1 && nv_history ? 1 : 0;  // a reset (nv_history off) starts it over
-                            hipLaunchKernelGGL(k_stab_apply, sgrid, sblock, 0, stream,
+                            if (options.stabilize_guided) {
+                                for (auto& b : stab_guide)
+                                    if (!b || b->count < spx*4) { b.reset(new Buffer(spx*4)); stab_frame = -1; }
+                                hipLaunchKernelGGL(stabilize_guided::guide, sgrid, sblock, 0, stream,
+                                    nv_first ? nv_first : net->color->data.get(), reinterpret_cast<float4*>(stab_guide[sto]->data.get()), frame_w, frame_h, W);
+                                const int guided_valid = sval && stab_frame == job_frame-1;
+                                hipLaunchKernelGGL(stabilize_guided::apply, sgrid, sblock, 0, stream,
+                                    reinterpret_cast<const float4*>(maps[next]->data.get()), reinterpret_cast<const float4*>(stab_low->data.get()),
+                                    reinterpret_cast<const float4*>(stab_hist[stab_cur]->data.get()), reinterpret_cast<float4*>(stab_hist[sto]->data.get()),
+                                    reinterpret_cast<float4*>(stab_out->data.get()), nv_mv, job_depth->data.get(), stab_depth->data.get(), frame_w, frame_h, nv_ms,
+                                    options.stabilize, options.stabilize_clamp, guided_valid,
+                                    reinterpret_cast<const float4*>(stab_full[stab_cur]->data.get()), reinterpret_cast<float4*>(stab_full[sto]->data.get()),
+                                    options.stabilize_still, options.stabilize_still_clamp,
+                                    reinterpret_cast<const float4*>(stab_guide[sto]->data.get()), reinterpret_cast<const float4*>(stab_guide[stab_cur]->data.get()));
+                            } else hipLaunchKernelGGL(k_stab_apply, sgrid, sblock, 0, stream,
                                                reinterpret_cast<const float4*>(maps[next]->data.get()),
                                                reinterpret_cast<const float4*>(stab_low->data.get()),
                                                reinterpret_cast<const float4*>(stab_hist[stab_cur]->data.get()),
