@@ -3,6 +3,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 source tools/msvc.sh
 mkdir -p build
+bash tools/build_uncover_extra.sh
 MSYS_NO_PATHCONV=1 "$ROCM_ROOT/bin/hipcc.exe" -std=c++17 -O2 -ffp-contract=off -D_CRT_SECURE_NO_WARNINGS \
   --offload-arch=gfx1201 -I ext/rocWMMA/library/include hip/mvp1/split512_resident_test.hip -o build/split512_resident_test.exe
 MSYS_NO_PATHCONV=1 "$ROCM_ROOT/bin/hipcc.exe" -std=c++17 -O2 -ffp-contract=off -D_CRT_SECURE_NO_WARNINGS \

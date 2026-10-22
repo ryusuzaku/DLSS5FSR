@@ -26,6 +26,7 @@
 #include "c32_resident.h"
 #include "front_resident.h"
 #include "candidate_input_256.hip"
+#include "uncover_extra.hip"
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
@@ -269,6 +270,10 @@ struct OutputOptions {
     // picture leaves there; every further pass edits the game's trail
     // fragments harder (S361h: 1.5x the edit, the trail with it).
     int uncover_pass1 = 0;
+    // Alternative to dropping the extra pass: on uncovered pixels, borrow
+    // only its extra change from settled neighbours on the same surface.
+    // Radius in frame pixels, 0 off. Takes priority over uncover_pass1.
+    int uncover_extra_radius = 0;
     // stabilize=A (transfer=nvidia; ours, not the original's; 0 off, default
     // off): the low-frequency part of the change (a box blur of stabilize_radius
     // pixels) is blended with the previous result's, carried along the motion,
@@ -1587,6 +1592,7 @@ struct Engine {
             else if (key == "uncover") options.uncover = std::min(std::max(std::stoi(value), 0), 16);
             else if (key == "uncover_radius") options.uncover_radius = std::min(std::max(std::stoi(value), 1), 48);
             else if (key == "uncover_pass1") options.uncover_pass1 = std::stoi(value) != 0;
+            else if (key == "uncover_extra_radius") options.uncover_extra_radius = std::min(std::max(std::stoi(value), 0), 48);
             else if (key == "stabilize") options.stabilize = std::min(std::max(std::stof(value), 0.0f), 0.95f);
             else if (key == "stabilize_radius") options.stabilize_radius = std::min(std::max(std::stoi(value), 1), 24);
             else if (key == "stabilize_clamp") options.stabilize_clamp = std::min(std::max(std::stof(value), 0.001f), 1.0f);
@@ -2226,15 +2232,25 @@ struct Engine {
                                            job_depth->data.get(), uncover_depth->data.get(),
                                            uncover_age[uncover_cur]->data.get(), uncover_age[to]->data.get(),
                                            frame_w, frame_h, nv_ms, limit);
-                        if (options.uncover_pass1 && nv_first && nv_pass1) {
+                        if ((options.uncover_pass1 || options.uncover_extra_radius > 0) && nv_first && nv_pass1) {
                             if (!pass1_map || pass1_map->count < px*4) pass1_map.reset(new Buffer(px*4));
                             hipLaunchKernelGGL(k_nv_map, grid, block, 0, stream, nv_pass1, nv_first,
                                                reinterpret_cast<float4*>(pass1_map->data.get()), frame_w, frame_h, W,
                                                job_strength, nv_first);
-                            hipLaunchKernelGGL(k_uncover_pass1, grid, block, 0, stream,
-                                               reinterpret_cast<float4*>(maps[next]->data.get()),
-                                               reinterpret_cast<const float4*>(pass1_map->data.get()),
-                                               uncover_age[to]->data.get(), frame_w, frame_h, limit);
+                            if (options.uncover_extra_radius > 0) {
+                                hipLaunchKernelGGL(k_uncover_extra, grid, block, 0, stream,
+                                                   reinterpret_cast<const float4*>(maps[next]->data.get()),
+                                                   reinterpret_cast<const float4*>(pass1_map->data.get()),
+                                                   uncover_age[to]->data.get(), nv_mv, job_depth->data.get(),
+                                                   reinterpret_cast<float4*>(uncover_tmp->data.get()), frame_w, frame_h,
+                                                   nv_ms, options.uncover_extra_radius, limit);
+                                std::swap(maps[next], uncover_tmp);
+                            } else {
+                                hipLaunchKernelGGL(k_uncover_pass1, grid, block, 0, stream,
+                                                   reinterpret_cast<float4*>(maps[next]->data.get()),
+                                                   reinterpret_cast<const float4*>(pass1_map->data.get()),
+                                                   uncover_age[to]->data.get(), frame_w, frame_h, limit);
+                            }
                         }
                         hipLaunchKernelGGL(k_uncover_fill, grid, block, 0, stream,
                                            reinterpret_cast<const float4*>(maps[next]->data.get()), uncover_age[to]->data.get(),

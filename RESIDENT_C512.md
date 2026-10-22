@@ -1,5 +1,82 @@
 # Resident C512 component check
 
+## Experimental extra-pass residual repair (2026-10-22)
+
+`uncover_extra_radius=R` is an alternative to dropping the extra pass on
+recently uncovered pixels. It borrows only `final-pass change - first-pass
+change` from fully settled neighbours with matching depth and motion. It
+keeps the first-pass picture intact and leaves the current extra edit alone
+when there is insufficient support. This avoids broadening the existing
+full-picture fill, whose radius remains independently controlled.
+
+The option defaults to `0` (off), accepts radii up to 48 frame pixels, and
+takes priority over `uncover_pass1` when positive. It needs `transfer=nvidia`,
+multiple passes, `uncover>0`, motion, depth and consecutive frames. Correction
+fades with the existing age mask and surface speed, with a 0.1 per-channel
+cap. A reset clears its age history too. For a local experiment:
+
+```ini
+passes=2
+uncover=5
+uncover_radius=3
+uncover_pass1=1
+uncover_extra_radius=10
+```
+
+Setting the new radius back to zero restores the existing first-pass
+fallback in this example. Existing output with the new option disabled is
+byte-identical; one pass and missing-depth controls also remain unchanged.
+
+Radii 6 and 10 were explored on clips A–C; radius 10 was selected before
+checking D/E. A common settled target is the mean plain-two-pass result
+12–16 frames after uncovering. Eligible pixels must stay still throughout
+and have late input RGB span below 2/255. The table is mean error to that
+same target, sampled at offsets 0/1/2/4/8, in 1/255 units (lower is better):
+
+| Clip | Eligible frame pairs | Plain two passes | Existing fallback | New radius 10 |
+|---|---:|---:|---:|---:|
+| A | 1 | 8.343 | 7.853 | 8.049 |
+| B | 18 | 5.651 | 5.681 | 5.593 |
+| C | 1 | 7.257 | 7.959 | 7.223 |
+| D | 41 | 5.282 | 5.576 | 5.279 |
+| E | 43 | 6.505 | 6.859 | 6.472 |
+
+The two reserved clips improve about 5.3% and 5.6% relative to the existing
+fallback. Excluding observed HUD rectangles still improves them by 4.8%
+and 7.3% (40/43 frame pairs). Gains over plain two passes are much smaller;
+most benefit is preserving valid extra-pass correction. Mean full-frame edit
+strength retains at least 99.98% of the plain-two-pass value on these clips.
+A/C have very small samples and A favours the existing fallback.
+
+An additional car-crossing sequence at `history=0` also favours the existing
+fallback: errors 3.424 (existing), 3.506 (new) and 3.536 (plain two passes),
+with six eligible frame pairs. Therefore this is an opt-in research option,
+not a universal replacement. The installed game setup was left unchanged.
+These targets are offline diagnostics, not scene ground truth or original
+NVIDIA-kernel validation. A self-difference horizon score also counts the
+edit fading back in; it does not by itself establish a worse visual trail.
+
+`tools/pseq_trail_compare.py` computes multiple horizons and the common
+target, verifies that replay inputs match, and records eligible counts:
+
+```text
+python tools/pseq_trail_compare.py CAPTURE_DIR --replay p2=BASE_PREFIX --replay candidate=TEST_PREFIX --reference p2 --json report.json
+```
+
+Use repeatable `--exclude-rect X0,Y0,X1,Y1` arguments for known guide
+mismatches such as HUD regions. The default 1/4/8-frame scores reproduce
+the earlier comparison tool's results. Empty score objects mean no eligible
+sample, rather than a zero error.
+
+`bash tools/build_uncover_extra.sh` builds the asset-free
+`build/uncover_extra_test.exe`. Six contracts pass: preserving a uniform
+extra correction and first-pass texture, bounded outlier correction, no
+settled support, depth boundaries, motion boundaries and fast motion. Its
+optional `--bench` measured 0.0943 ms for the warm kernel alone at 1280×800,
+10% uncovered, radius 10. This excludes inference, transfers, synchronization
+and presentation. Reset fast/exact and normal engine/harness checks also
+pass, apart from the existing full-preview visibility assertion below.
+
 ## Reset also clears output-repair history (2026-10-22)
 
 `re_reset` now clears the uncovered-pixel history together with network
