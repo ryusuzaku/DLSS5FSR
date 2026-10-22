@@ -1,5 +1,32 @@
 # Resident C512 component check
 
+## Reset also clears output-repair history (2026-10-22)
+
+`re_reset` now clears the uncovered-pixel history together with network
+history. Previously, consecutive frame numbers allowed pre-reset motion,
+depth and ages to activate the first-pass fallback on the first frame after
+a camera cut. That frame could receive a different edit from a fresh engine,
+even though its network history and noise seed had restarted.
+
+The reset frame now initializes a settled age mask; the next frame can use
+guides from the new scene. Continuous playback keeps its existing behavior.
+
+`tools/build_split512_resident.sh` also builds a synthetic API regression:
+
+```text
+build/resident_engine_reset_test.exe <engine.dll> <engine-config.txt>
+```
+
+Use a config with `transfer=nvidia`, `motion=uv`, `external_controls=1`,
+`uncover` greater than zero, and `uncover_pass1=1`. The test runs two passes
+on a moving, nearer synthetic frame, requests a reset, and compares the new
+still background with a fresh engine. It also requires a no-reset control
+to differ, so an inactive temporal path cannot pass accidentally.
+
+Before the fix, 297,500 RGB half values differed from fresh output (maximum
+error 0.012207031). Afterward, fast and exact modes both match byte for byte,
+with zero nonfinite values. A fallback-disabled control also matches.
+
 ## Experimental first-pass fallback (2026-10-21)
 
 The resident engine accepts `uncover_pass1=1` (default `0`) with
@@ -41,10 +68,29 @@ strength retains at least 99.5% of the plain two-pass value on each clip.
 The effect remains experimental and off by default: these are offline
 comparisons, not an in-game quality verdict or NVIDIA-kernel validation.
 
+An additional 2026-10-22 comparison checks one- and eight-frame horizons.
+The fallback improves the one-frame score on all five clips, but at eight
+frames only two improve:
+
+| Clip | Two passes, eight frames | With fallback, eight frames |
+|---|---:|---:|
+| A | 18.07 | 14.61 |
+| B | 12.94 | 12.33 |
+| C | 8.39 | 8.73 |
+| D | 6.45 | 7.05 |
+| E | 10.80 | 11.33 |
+
+These use 2, 29, 8, 41 and 51 qualifying frame pairs. The longer comparison
+shows that the four-frame improvement alone does not establish a lasting
+trail reduction. A variant that fills first-pass and final-pass maps
+separately before blending was also tested and rejected: four of five clips
+worsen relative to the existing fallback at both four and eight frames.
+The additional comparison reproduces the original tool's four-frame scores.
+
 Compatibility checks: original engine 15/15; original full-frame output
 byte-identical to the saved baseline; all 60 small-model frames unchanged
 with the option off at either one or two passes, and unchanged with the
-option on at one pass. The deployed game engine was left unchanged.
+option on at one pass. That initial comparison left the game engine unchanged.
 
 The D3D12/HIP harness passes its default (117/117), crop (123/123), and
 FP16 map/depth (135/135) checks. Its full-frame preview visibility check

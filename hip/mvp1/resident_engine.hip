@@ -1996,7 +1996,13 @@ struct Engine {
             for (int p = 1; p < options.passes; ++p)
                 for (auto& im : nv_more[p-1])
                     if (!im || im->count < fpx*3) { im.reset(new Buffer(fpx*3)); nv_frame = -1; }
-            if (nv_reset.exchange(false)) nv_frame = -1;
+            if (nv_reset.exchange(false)) {
+                nv_frame = -1;
+                // A camera cut also discards the repair mask. Consecutive
+                // frame numbers alone must not carry pre-cut guides/ages
+                // into this frame's fill or first-pass fallback.
+                uncover_frame = -1;
+            }
             const bool nv_consecutive = nv_frame >= 0 && nv_frame == job_frame - 1 && nv_w == frame_w && nv_h == frame_h;
             nv_history = nv_consecutive && nv_mv != nullptr;
             if (nv_history) {

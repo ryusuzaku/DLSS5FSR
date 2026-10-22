@@ -22,6 +22,8 @@ MSYS_NO_PATHCONV=1 "$ROCM_ROOT/bin/hipcc.exe" -std=c++17 -O2 -D_CRT_SECURE_NO_WA
 MSYS_NO_PATHCONV=1 "$ROCM_ROOT/bin/hipcc.exe" -std=c++17 -O2 -D_CRT_SECURE_NO_WARNINGS \
   --offload-arch=gfx1201 -I ext/rocWMMA/library/include hip/mvp1/resident_engine_full_test.hip -o build/resident_engine_full_test.exe
 MSYS_NO_PATHCONV=1 "$ROCM_ROOT/bin/hipcc.exe" -std=c++17 -O2 -D_CRT_SECURE_NO_WARNINGS \
+  --offload-arch=gfx1201 hip/mvp1/resident_engine_reset_test.hip -o build/resident_engine_reset_test.exe
+MSYS_NO_PATHCONV=1 "$ROCM_ROOT/bin/hipcc.exe" -std=c++17 -O2 -D_CRT_SECURE_NO_WARNINGS \
   --offload-arch=gfx1201 hip/mvp1/resident_engine_frame.hip -o build/resident_engine_frame.exe
 MSYS_NO_PATHCONV=1 "$ROCM_ROOT/bin/hipcc.exe" -std=c++17 -O2 -D_CRT_SECURE_NO_WARNINGS \
   --offload-arch=gfx1201 hip/mvp1/resident_engine_seq.hip -o build/resident_engine_seq.exe
