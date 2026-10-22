@@ -1,5 +1,45 @@
 # Resident C512 component check
 
+## Pass switching keeps separate history validity (2026-10-22)
+
+Each extra pass now tracks the frame it actually processed. After F8 skips
+that pass, its next run starts without temporal history; the following frame
+can use its newly generated image. Previously, the first pass's continuous
+frame counter also validated dormant extra-pass images. Switching 2→1→2 or
+3→2→3 could therefore reproject an image from before the pass was disabled.
+Allocating a newly enabled pass also reset the first pass's noise counter;
+allocation now invalidates only the new pass's history. Explicit resets still
+invalidate all pass histories.
+
+The synthetic `resident_engine_pass_switch_test.hip` stores two different old
+images, then converges the active lower passes with identical history0 frames.
+After resuming, output must be independent of the dormant image and match a
+pass enabled for the first time. Both the resumed and subsequent frame are
+checked. A continuous-history control must differ to prove history is exercised.
+Use a `transfer=nvidia`, `motion=uv`, `external_controls=1`, `uncover=0` config:
+
+```text
+resident_engine_pass_switch_test engine.dll config.txt
+```
+
+The previous installed engine changed 296,877 RGB half values on the resumed
+2→1→2 frame at history1 (maximum 0.0390625), and 266,509 on the next frame.
+At history0, dormant images had no effect, but first-use allocation still
+changed 289,598 values through the counter reset. The fixed small model passes
+37 checks in both fast and `RESIDENT_EXACT=1` modes, covering 2→1→2, 3→1→3,
+3→2→3 and history amounts 0/0.5/1; the full model passes the same 37 checks.
+Three normal 60-frame controls remain byte-identical: installed fallback,
+optional residual repair, and history0.
+Another 20-frame continuous three-pass comparison is byte-identical. Original
+engine checks pass 15/15 and the full-frame reference is unchanged. Harness
+default/crop/FP16-map checks pass 117/123/135; full preview retains only the
+previously documented 124/125 visibility failure. The validated engine was
+installed with the game closed after a verified backup; existing model and
+quality settings were preserved.
+
+This addresses transitions between pass counts; it does not establish a fix
+for trails during uninterrupted two-pass playback.
+
 ## Experimental extra-pass residual repair (2026-10-22)
 
 `uncover_extra_radius=R` is an alternative to dropping the extra pass on
@@ -55,6 +95,14 @@ not a universal replacement. The installed game setup was left unchanged.
 These targets are offline diagnostics, not scene ground truth or original
 NVIDIA-kernel validation. A self-difference horizon score also counts the
 edit fading back in; it does not by itself establish a worse visual trail.
+
+A deeper target-choice check on reserved clips D/E (with HUD exclusions) and
+the history0 car sequence found identical settled targets whether they were
+constructed from plain two passes, the existing fallback or residual repair:
+zero changed target channels across 37,717 / 61,070 / 2,622 eligible pixel
+observations, respectively. The three methods have converged on those late
+samples, so selecting plain two passes as the reference does not change these
+comparisons. This does not supply scene ground truth or enlarge the samples.
 
 `tools/pseq_trail_compare.py` computes multiple horizons and the common
 target, verifies that replay inputs match, and records eligible counts:

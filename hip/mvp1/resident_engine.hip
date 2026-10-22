@@ -1521,6 +1521,7 @@ struct Engine {
     // pass saw (W stride) and the composed frame handed to the next pass.
     std::unique_ptr<Buffer> nv_more[2][2], nv_base, nv_pass;
     int nv_more_cur[2] = {0, 0};
+    long long nv_more_frame[2] = {-1, -1};
     int nv_cur = 0, nv_w = 0, nv_h = 0;
     long long nv_frame = -1;
     unsigned nv_seed = 0;
@@ -2001,9 +2002,10 @@ struct Engine {
             if (!nv_feat || nv_feat->count < size_t(W)*H*3) nv_feat.reset(new Buffer(size_t(W)*H*3));
             for (int p = 1; p < options.passes; ++p)
                 for (auto& im : nv_more[p-1])
-                    if (!im || im->count < fpx*3) { im.reset(new Buffer(fpx*3)); nv_frame = -1; }
+                    if (!im || im->count < fpx*3) { im.reset(new Buffer(fpx*3)); nv_more_frame[p-1] = -1; }
             if (nv_reset.exchange(false)) {
                 nv_frame = -1;
+                nv_more_frame[0] = nv_more_frame[1] = -1;
                 // A camera cut also discards the repair mask. Consecutive
                 // frame numbers alone must not carry pre-cut guides/ages
                 // into this frame's fill or first-pass fallback.
@@ -2099,20 +2101,27 @@ struct Engine {
                                    nv_final, net->color->data, pass_frame, pass_pitch, frame_w, frame_h, W, job_strength);
                 auto& im = nv_more[p-1];
                 int& cur = nv_more_cur[p-1];
-                if (nv_history)
+                // F8 may leave this pass dormant while earlier passes keep
+                // running. Only its own immediately preceding image is valid.
+                // First-pass continuity also checks size, motion and resets.
+                const bool pass_history = nv_history && nv_more_frame[p-1] == job_frame - 1;
+                if (pass_history)
                     hipLaunchKernelGGL(k_seq_pre, dim3((W*H+255)/256), dim3(256), 0, stream,
                                        im[cur]->data, nv_mv, job_depth_valid ? job_depth->data : nullptr,
                                        nv_feat->data, frame_w, frame_h, W, H, nv_ms, options.history, pass_frame, pass_pitch, 8);
                 HIP_CHECK(hipGetLastError());
+                net->front->history = pass_history ? nv_feat->data.get() : nullptr;
+                net->head70->keep_native = pass_history;
                 net->front->controls.v[1] = 0.0f;  // the tone is the first pass's alone
                 net->run(pass_frame, frame_w, frame_h, pass_pitch, 8, false, stream, sw, sh, nullptr,
                          options.encoded, nullptr, nullptr, options.reject);
                 hipLaunchKernelGGL(k_seq_post, dim3((frame_w*frame_h+255)/256), dim3(256), 0, stream,
-                                   net->rgb_native->data, nv_history ? net->head70->native_view().data : nullptr,
+                                   net->rgb_native->data, pass_history ? net->head70->native_view().data : nullptr,
                                    hist_row->data, im[cur]->data, nv_mv, im[cur ^ 1]->data,
-                                   frame_w, frame_h, W, net->model.blend*options.history, int(nv_history), nv_ms);
+                                   frame_w, frame_h, W, net->model.blend*options.history, int(pass_history), nv_ms);
                 HIP_CHECK(hipGetLastError());
                 cur ^= 1;
+                nv_more_frame[p-1] = job_frame;
                 nv_final = im[cur]->data;
             }
         }
