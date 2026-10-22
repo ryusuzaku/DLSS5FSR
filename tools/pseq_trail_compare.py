@@ -12,11 +12,17 @@ Reported colour errors and edit strengths use 1/255 units. The horizon
 scores reproduce pseq_trail.py's still-camera/motion masks. Low eligible
 counts limit the evidence; an empty scores object means no eligible sample.
 Edit strength always covers the full frame; exclusions affect comparisons.
+With --echo, compare each replay with its own late output, projecting its
+transient onto the captured input transient. Gain 1 preserves that component;
+above 1 amplifies it. This is an alignment diagnostic, not scene ground truth.
+The edit-matched fields linearly scale each edit to the reference's full-frame
+mean strength; this is an unclipped analytical control, not another GPU run.
 """
 import argparse
 import json
 from pathlib import Path
 import struct
+from functools import lru_cache
 import numpy as np
 from seq_replay import read_frame
 
@@ -29,7 +35,34 @@ def read_rgb8(path):
     return np.frombuffer(data, np.uint8, offset=8).reshape(h, w, 3)
 
 
-def compare(directory, replays, reference, count=60, horizons=(1, 4, 8), settled=(12, 16), span=2.0, exclude=()):
+def echo_terms(input_transient, output_transient):
+    """Additive energy terms: input squared, input/edit dot, edit squared."""
+    g = np.asarray(input_transient, dtype=np.float64)
+    z = np.asarray(output_transient, dtype=np.float64)
+    if g.shape != z.shape:
+        raise ValueError('echo input/output shapes differ')
+    r = z-g
+    return np.array([np.sum(g*g), np.sum(g*r), np.sum(r*r)])
+
+
+def echo_summary(terms, channels, edit_scale=1.0, input_rms_floor=0.25):
+    """Summarize pooled RGB energies; weak input has no reliable direction."""
+    if channels < 1:
+        return {}
+    g2, gr, r2 = terms
+    valid = g2 > channels*input_rms_floor**2
+    gain = 1+gr/g2 if valid else None
+    rms = lambda energy: float(np.sqrt(max(float(energy), 0.0)/channels))
+    return {'input_rms': rms(g2), 'output_rms': rms(g2+2*gr+r2),
+            'coherent_input_gain': float(gain) if valid else None,
+            'edit_transient_rms': rms(r2),
+            'orthogonal_edit_rms': rms(r2-gr*gr/g2) if valid else None,
+            'edit_match_scale': edit_scale,
+            'matched_coherent_input_gain': float(1+edit_scale*(gain-1)) if valid and edit_scale is not None else None,
+            'matched_output_rms': rms(g2+2*edit_scale*gr+edit_scale**2*r2) if edit_scale is not None else None}
+
+
+def compare(directory, replays, reference, count=60, horizons=(1, 4, 8), settled=(12, 16), span=2.0, exclude=(), echo=False):
     files = sorted(Path(directory).glob('*.bin'))[:count]
     if not files:
         raise ValueError('no capture frames')
@@ -56,6 +89,8 @@ def compare(directory, replays, reference, count=60, horizons=(1, 4, 8), settled
             outputs[name].append(out)
             edits[name] += float(np.abs(out.astype(np.float32)-inp).mean())/len(files)
         inputs.append(shared)
+        if echo and not np.array_equal(shared, (pics[-1]+0.5).astype(np.uint8)):
+            raise ValueError(f'echo needs replay input in the capture colour space: frame {i}')
     medians = [float(np.median(m)) for m in mags]
     region = np.ones(mags[0].shape, bool)
     height, width = region.shape
@@ -65,9 +100,16 @@ def compare(directory, replays, reference, count=60, horizons=(1, 4, 8), settled
             raise ValueError(f'exclusion rectangle outside frame: {rect}')
         region[y0:y1, x0:x1] = False
 
+    # The horizon/settled windows reuse frames heavily. Bound these caches
+    # rather than retaining floating-point outputs for every replay/frame.
+    frame_bytes = width*height*3*np.dtype(np.float32).itemsize
+    delta_cache_frames = max(1, min(16, (128*1024**2)//frame_bytes))
+    result_cache_frames = max(1, min(48, (512*1024**2)//frame_bytes))
+    @lru_cache(maxsize=delta_cache_frames)
     def change(name, n):
         return outputs[name][n].astype(np.float32)-inputs[n].astype(np.float32)
 
+    @lru_cache(maxsize=result_cache_frames)
     def result(name, n):
         return np.clip(pics[n]+change(name, n), 0, 255)
 
@@ -103,6 +145,7 @@ def compare(directory, replays, reference, count=60, horizons=(1, 4, 8), settled
     start, end = settled
     offsets = sorted({0, 1, 2, 4, 8} & set(range(start)))
     errors = {name: {str(t): [0., 0.] for t in offsets} for name in replays}
+    echo_acc = {name: {str(t): np.zeros(3, np.float64) for t in offsets} for name in replays} if echo else None
     nu = nb = used = 0
     for n in range(1, len(files)-end):
         mask = masks(n, end)
@@ -117,6 +160,20 @@ def compare(directory, replays, reference, count=60, horizons=(1, 4, 8), settled
         for k in range(n+start, n+end+1):
             target += result(reference, k)/(end-start+1)
         nu += int(unc.sum()); nb += int(bg.sum()); used += 1
+        if echo:
+            # Work on eligible samples only; no full-frame floating-point
+            # output cache is needed. Each method supplies its own late edit.
+            def sampled_result(name, k):
+                delta = outputs[name][k][unc].astype(np.float32)-inputs[k][unc].astype(np.float32)
+                return np.clip(pics[k][unc]+delta, 0, 255)
+            input_target = np.mean([pics[k][unc] for k in range(n+start, n+end+1)], axis=0)
+            own_targets = {name: np.mean([sampled_result(name, k) for k in range(n+start, n+end+1)], axis=0)
+                           for name in replays}
+            for t in offsets:
+                transient = pics[n+t][unc]-input_target
+                for name in replays:
+                    output_transient = sampled_result(name, n+t)-own_targets[name]
+                    echo_acc[name][str(t)] += echo_terms(transient, output_transient)
         for name in replays:
             for t in offsets:
                 d = np.abs(result(name, n+t)-target).mean(axis=2)
@@ -127,6 +184,11 @@ def compare(directory, replays, reference, count=60, horizons=(1, 4, 8), settled
     report['settled_target'] = {'reference': reference, 'start': start, 'end': end,
         'input_span_limit': span, 'frame_pairs': used, 'uncovered_pixels': nu,
         'background_pixels': nb, 'scores': scores}
+    if echo:
+        report['input_echo'] = {'start': start, 'end': end, 'frame_pairs': used,
+            'uncovered_pixels': nu, 'input_rms_floor': 0.25, 'normalization_reference': reference,
+            'scores': {name: {t: echo_summary(terms, nu*3, edits[reference]/edits[name] if edits[name] > 0 else None)
+                              for t, terms in values.items()} for name, values in echo_acc.items()} if used else {}}
     return report
 
 
@@ -142,6 +204,7 @@ def main():
     ap.add_argument('--exclude-rect', action='append', default=[], metavar='X0,Y0,X1,Y1',
                     help='exclude known guide mismatches such as a HUD rectangle; repeatable')
     ap.add_argument('--json', type=Path)
+    ap.add_argument('--echo', action='store_true', help='also measure coherent input-transient gain and edit-matched controls')
     args = ap.parse_args()
     replays = {}
     for spec in args.replay:
@@ -161,7 +224,7 @@ def main():
         ap.error('settled needs positive START:END and input-span must be positive')
     if any(len(rect) != 4 for rect in exclude):
         ap.error('exclude-rect needs X0,Y0,X1,Y1')
-    report = compare(args.directory, replays, args.reference, args.count, horizons, settled, args.input_span, exclude)
+    report = compare(args.directory, replays, args.reference, args.count, horizons, settled, args.input_span, exclude, args.echo)
     text = json.dumps(report, indent=2)+'\n'
     if args.json:
         args.json.parent.mkdir(parents=True, exist_ok=True)

@@ -1,5 +1,97 @@
 # Resident C512 component check
 
+## Continuous history0 diagnosis (2026-10-22)
+
+Six recorded clips were replayed at `history=0`, each for 60 frames with one
+pass, two passes, the installed first-pass fallback, and residual repair10:
+24 runs / 1,440 frames. All use the small model, identical input and public
+controls, and the existing radius3 surface fill. Known HUD rectangles are
+excluded from comparisons. The installed engine and settings were preserved.
+
+The common-target error is measured to the same settled two-pass output at
+12–16 frames, at offsets 0/1/2/4/8, as defined below (1/255 units):
+
+| Clip | Eligible pairs | Two passes | Installed fallback | Residual repair10 |
+|---|---:|---:|---:|---:|
+| A | 1 | 6.539 | 7.239 | 6.666 |
+| B | 18 | 5.814 | 5.832 | 5.769 |
+| C | 1 | 7.935 | 8.666 | 7.865 |
+| D | 40 | 4.957 | 5.195 | 4.945 |
+| E | 43 | 6.164 | 6.599 | 6.129 |
+| Car | 6 | 3.536 | 3.424 | 3.506 |
+
+Residual repair improves five comparisons against the installed fallback,
+but the car clip remains about 2.4% worse. Its improvement over plain two
+passes is small on most clips. A/C each have only one eligible pair. These
+observations do not justify replacing the installed fallback automatically.
+
+The optional `--echo` diagnostic separates an input-aligned transient from
+other time-varying edits. On the same eligible uncovered samples, let `g` be
+current input minus its late input mean, and `z` be current output minus that
+replay's own late output mean. Its coherent gain is `dot(z,g)/dot(g,g)`:
+1 preserves that input component, values above 1 amplify it, values between
+0 and 1 attenuate it, and negative values reverse its direction. The edit
+transient is `r=z-g`; its part perpendicular to `g`
+is reported separately. Terms are pooled by RGB energy, not by averaging
+unstable per-pixel ratios. Gain is null below input RMS 0.25/255.
+
+The edit-matched control scales `r` by reference mean full-frame absolute
+edit divided by candidate mean edit. This is an unclipped linear analysis,
+not a new inference, an intensity setting or a perceptual quality score.
+Each method uses its own late output, so a different settled look is not
+itself classified as a transient. Four-frame results:
+
+| Clip | Two/one-pass edit strength | Matched one-pass coherent gain | Two-pass coherent gain | Two-pass orthogonal RMS / matched one-pass |
+|---|---:|---:|---:|---:|
+| A | 1.50 | 1.129 | 1.331 | 1.08 |
+| B | 1.50 | 0.938 | 0.990 | 1.13 |
+| C | 1.48 | 1.319 | 1.471 | 1.31 |
+| D | 1.49 | 0.794 | 0.802 | 1.11 |
+| E | 1.48 | 0.742 | 0.680 | 1.21 |
+| Car | 1.57 | 0.919 | 0.892 | 1.08 |
+
+Two passes add about 48–57% mean edit. After matching that strength, the
+orthogonal transient is still about 8–31% larger at four frames. The coherent
+gain has mixed direction: two passes can reduce the input-aligned component
+while adding other changes. Thus increased visible instability need not be
+pure amplification of the input trail. This does not identify all independent
+change as an artifact: lighting, real detail and an intentional return from
+fallback can also change. Motion-only eligibility, RGB8 edit rounding and
+small or overlapping samples limit the result; it is not scene ground truth.
+
+```text
+python tools/pseq_trail_compare.py CAPTURE_DIR --replay p1=P1_PREFIX --replay p2=P2_PREFIX --reference p2 --echo --json report.json
+python -m unittest discover -s tests -p test_pseq_echo.py
+```
+
+Echo mode requires replay input bytes to match the capture's colour space;
+it rejects a differently encoded replay. Twelve analytical and small replay
+contracts cover identity, amplification, cancellation, independent change,
+strength matching, energy pooling, weak input, per-method late targets,
+colour mismatch and empty samples. Without `--echo`, existing metrics are
+unchanged, including exact JSON equality with the prior real car-clip report.
+Frame caches budget 128/512 MiB for changes/results (at least one frame each),
+avoiding repeated conversions without retaining all floating-point results.
+
+A separate frozen-frame control used 12 identical 1265×791 inputs, zero
+motion, `history=0`, repair off and controls `1,0,1,1,0.73,1`. A local test DLL
+can hold the front-end noise seed at zero; with its normal seed branch, all
+12 native RGBA16F outputs match the installed DLL byte-for-byte. RMS change
+against frame1, pooled over frames2–11 and RGB (1/255 units):
+
+| Passes | Normal changing seed | Fixed seed0 | Mean edit, normal / fixed |
+|---|---:|---:|---:|
+| 1 | 1.148 | 0 | 5.852 / 5.859 |
+| 2 | 1.794 | 0 | 8.797 / 8.793 |
+
+With a fixed seed, all warm native output files are byte-identical. This
+isolates a real stochastic component even when recurrent history is off.
+Two passes raise this static variation by about 56%, against about 50% more
+edit; after strength matching, the remaining increase is only about 4% on
+this picture. It does not explain every moving-scene transient. The fixed
+seed is a local causal control; its appearance in motion has not been
+validated, and production seed behavior was preserved.
+
 ## Pass switching keeps separate history validity (2026-10-22)
 
 Each extra pass now tracks the frame it actually processed. After F8 skips
