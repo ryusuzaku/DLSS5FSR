@@ -33,7 +33,8 @@ def srgb_enc(v):
 
 
 def read_frame(path):
-    raw = open(path, 'rb').read()
+    with open(path, 'rb') as source:
+        raw = source.read()
     assert raw[:8] == b'D5INP001', path
     w, h, bpp, pitch = struct.unpack_from('<4I', raw, 8)
     rows = np.frombuffer(raw, np.uint8, pitch * h, 36).reshape(h, pitch)[:, :w * bpp]

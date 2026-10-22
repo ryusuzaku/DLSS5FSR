@@ -247,6 +247,9 @@ struct OutputOptions {
     // moves without motion vectors that depth follows late. Less history
     // gives a lighter, quicker and less steady picture.
     float history = 1.0f;
+    // noise_static=1 (transfer=nvidia, ours): hold the network's random
+    // input at seed 0. Default keeps the original per-frame seed counter.
+    int noise_static = 0;
     // uncover=N (transfer=nvidia; ours, not the original's; 0 off): ground
     // that something moving has just uncovered is repaired for N frames. A
     // game's temporal upscaler has no history for such pixels and leaves
@@ -1593,6 +1596,7 @@ struct Engine {
             else if (key == "uncover") options.uncover = std::min(std::max(std::stoi(value), 0), 16);
             else if (key == "uncover_radius") options.uncover_radius = std::min(std::max(std::stoi(value), 1), 48);
             else if (key == "uncover_pass1") options.uncover_pass1 = std::stoi(value) != 0;
+            else if (key == "noise_static") options.noise_static = std::stoi(value) != 0;
             else if (key == "uncover_extra_radius") options.uncover_extra_radius = std::min(std::max(std::stoi(value), 0), 48);
             else if (key == "stabilize") options.stabilize = std::min(std::max(std::stof(value), 0.0f), 0.95f);
             else if (key == "stabilize_radius") options.stabilize_radius = std::min(std::max(std::stoi(value), 1), 24);
@@ -2041,7 +2045,7 @@ struct Engine {
         }
         net->front->history = nvidia ? (nv_history ? nv_feat->data.get() : nullptr)
                                      : use_history ? hist_cur->data.get() : nullptr;
-        net->front->noise_seed = nvidia ? nv_seed : temporal ? temporal_seed : 0;
+        net->front->noise_seed = nvidia ? (options.noise_static ? 0u : nv_seed) : temporal ? temporal_seed : 0;
         net->front->noise_function = nvidia;  // the original's noise from the first frame on
         net->head70->keep_native = (temporal && use_history) || (nvidia && nv_history);  // the blend's input
         HIP_CHECK(hipEventRecord(start, stream));

@@ -1,5 +1,90 @@
 # Resident C512 component check
 
+## Opt-in fixed noise after a motion check (2026-10-22)
+
+`noise_static=1` holds the network's noise input at seed0 in
+`transfer=nvidia`. It defaults to `0`, which keeps the original changing
+seed counter. It affects every pass; it does not change history, intensity,
+repair or the non-NVIDIA transfer modes. The option is read when the engine
+is created, so restart the engine/game between configurations. A DLL built
+with this option is required; an older DLL does not implement the setting.
+
+```ini
+transfer=nvidia
+history=0
+noise_static=1
+```
+
+This is an experimental stability option for A/B testing, not a general
+ghosting fix. The current game installation and settings were left unchanged.
+
+Eight clips were replayed with normal/fixed seeds, two small-model passes,
+history0 and the installed first-pass fallback: 958 native output frames.
+The last recording has 59 frames; the other seven have 60. Previous pixel
+positions are `current + UV motion * frame size`, with bilinear sampling.
+Both-frame HUD exclusions, in-bounds vectors and depth agreement within 5%
+are required. Input RGB mismatch must be at most 1/2/4 levels out of 255;
+2 is the primary result. Initial cold output pairs are omitted.
+
+The metric is RMS change in the edit after carrying the previous edit along
+the motion. Still samples move below 0.5 pixels/frame, moving samples 1–32,
+and the fast subgroup 8–32. At least 64 samples must qualify per frame pair.
+Negative percentages below mean less edit variation with a fixed seed:
+
+| Clip | Still change | Moving change | Moving pixel observations | Mean edit retained |
+|---|---:|---:|---:|---:|
+| A | -23.45% | +0.19% | 6,866,236 | 99.880% |
+| B | -24.66% | -0.19% | 806,145 | 99.778% |
+| C | -24.05% | +0.88% | 828,425 | 99.862% |
+| D | -24.13% | -1.54% | 787,149 | 100.019% |
+| E | -22.14% | +0.10% | 1,307,960 | 100.030% |
+| Car | -27.72% | +0.14% | 8,334,838 | 99.924% |
+| Extra camera clip 1 | -24.25% | -1.85% | 6,995 | 99.998% |
+| Extra camera clip 2 | -26.87% | -0.23% | 8,474,989 | 100.020% |
+
+Still-surface improvement persists at all three input thresholds. Moving
+surfaces are close to neutral; the fast subgroup is mixed, including +2.0%
+in B at the primary threshold. Extra camera clip1 has few qualifying moving
+samples. Counts are correlated pixel observations across frames, not
+independent scene samples. Quiet-input filtering favours surfaces that can
+be aligned confidently; fast turns above 32 pixels/frame, changing lighting,
+reflection changes and many boundaries are not covered. This is not proof
+that every texture remains stable during gameplay or that input ghosts vanish.
+Selected output crops at frames10/25/40 show no obvious broad blur or halo;
+live viewing remains necessary.
+
+`tools/pseq_motion_compare.py` streams native outputs and records sample
+counts, motion-aligned input/result/edit RMS, and edit-strength normalization:
+
+```text
+python tools/pseq_motion_compare.py CAPTURE_DIR --replay dynamic=PREFIX --replay fixed=PREFIX --json motion.json
+python -W error::ResourceWarning -m unittest discover -s tests -p "test_pseq_*.py"
+```
+
+The script documents its native RGBA16F format and requires matching input
+RGB files to reject colour-space mismatches. Eleven new contracts cover
+translation direction, subpixel sampling, both-frame exclusions, depth edges,
+bad vectors, padded/truncated/nonfinite native data, sample counts and a
+screen-fixed pattern that crawls relative to a moving surface. All 23 Python
+contracts pass. The shared capture reader now scopes its file handle.
+
+`resident_engine_noise_test.hip` is a synthetic runtime test built by the
+resident builder. It compares identical configs with `noise_static=0/1`,
+requiring equal cold seed0 output, byte-identical fixed warm frames, varying
+normal warm frames and finite output at one/two passes. It passes six checks
+each for small fast/exact and full fast (18 total). Static-mode pass-switch
+checks pass 37 each in fast/exact; reset checks also pass. Default and fixed
+options each reproduce 60 native moving-clip outputs from the evaluated
+baseline/prototype. Another 60-frame history0.25 control, original15 and
+full-frame reference remain unchanged.
+
+Harness default/crop pass 117/123. Full preview retains its known 124/125
+visibility failure. Map mode initially gave 134/135 because its first-map
+log assertion failed; the installed engine reproduced that result, and the
+candidate control passed 135/135. The shared preview counter can log a
+composed frame first, suppressing the later `map 1` log even while the map
+rendering checks pass. The assertion and shim were not changed in this work.
+
 ## Continuous history0 diagnosis (2026-10-22)
 
 Six recorded clips were replayed at `history=0`, each for 60 frames with one
@@ -88,9 +173,9 @@ With a fixed seed, all warm native output files are byte-identical. This
 isolates a real stochastic component even when recurrent history is off.
 Two passes raise this static variation by about 56%, against about 50% more
 edit; after strength matching, the remaining increase is only about 4% on
-this picture. It does not explain every moving-scene transient. The fixed
-seed is a local causal control; its appearance in motion has not been
-validated, and production seed behavior was preserved.
+this picture. It does not explain every moving-scene transient. This initial
+static experiment did not establish motion quality; the later motion study
+and opt-in setting are described above. Production seed behavior was preserved.
 
 ## Pass switching keeps separate history validity (2026-10-22)
 
